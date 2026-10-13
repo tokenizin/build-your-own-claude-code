@@ -94,24 +94,38 @@ Implemented in `playground/rust` (`agents.rs`) and `playground/python` (`agents.
 
 Disk skills still win on name collision over auto-registered agents.
 
-### P3 — NomadWorks tools (3–5 days)
+### P3 — NomadWorks tools ✅
 
-Register alongside existing tools (or Bash wrappers calling the NomadWorks CLI/plugin):
+Registered on `ToolMode::Base` and `All` (forks included) in Rust (`nomad_tools.rs`) and Python (`nomad_tools.py`):
 
-- `nomadworks_validate`
-- `nomadworks_start_discussion` / `nomadworks_stop_discussion`
-- `nomadflow_run_workflow` / `nomadflow_prompt_workflow`
+| Tool | Playground behavior |
+| --- | --- |
+| `nomadworks_validate` | `mode=phase0` (default) → `scripts/validate-nomadworks.sh`; `mode=strict` → `@neuralnomads/nomadworks` CodeMap walk (truncated) |
+| `nomadworks_start_discussion` / `stop_discussion` | File + `.codenomad/runtime/discussions.json` shim (`NOMAD_SESSION_ID` or `playground-{pid}`); no OpenCode live capture |
+| `nomadflow_run_workflow` | **Synchronous** fork via `workflow_runner` (`/runner`) — not an OpenCode background session |
+| `nomadflow_prompt_workflow` | Returns guidance to call `nomadflow_run_workflow` again |
 
-Until native handlers exist, skills that shell out via `Bash` can bridge the gap for P1.
+Also registers `workflow_runner` (+ `/runner`, `/wr`) as a P2-style forked agent.
 
-### P4 — CodeNomad bridge (2–4 days)
+### P4 — CodeNomad bridge ✅
 
-CodeNomad session adapter:
+**Course repo CLI** (primary adapter):
 
-1. Resolve target project cwd + prompt (+ optional agent/skill).
-2. `exec` `playground/rust/your_program.sh -p "…"` with env from `playground/.env`.
-3. Stream stderr/stdout into the CodeNomad transcript.
-4. Optional: JSON event line protocol later (tool_call / tool_result / final).
+```bash
+./scripts/codenomad-rust-bridge.sh --prompt "/smoke-echo" --cwd "$PWD" --jsonl
+./scripts/codenomad-rust-bridge.sh --agent pma --prompt "In one sentence: what is your role?" --cwd /Users/alexshapiro/starworld --jsonl
+```
+
+Emits NDJSON: `meta` → `stderr`/`stdout` lines → `final` → `exit`. Set `CLAUDE_CODE_PLAYGROUND` if the script is invoked outside this repo.
+
+**CodeNomad HTTP** (streams the same bridge):
+
+| Method | Path | Body |
+| --- | --- | --- |
+| `GET` | `/api/playground/rust/status` | — |
+| `POST` | `/api/playground/rust/run` | `{ "prompt", "cwd"?, "agent"?, "jsonl"? }` → NDJSON stream |
+
+Route: `CodeNomad/packages/server/src/server/routes/playground-rust.ts` (registered in `http-server.ts`). Requires CodeNomad restart to pick up.
 
 ## What not to do
 
@@ -133,6 +147,17 @@ NOMAD_SKILLS_PATH=/Users/alexshapiro/starworld/.opencode/skills \
 
 # P2 — forked NomadWorks role (needs STARWORLD or NOMADWORKS_PATH in playground/.env)
 SKILLS_DEBUG=1 ./your_program.sh -p "/pma In one sentence: what is your role?"
+
+# P3 — validate (model should call nomadworks_validate)
+./your_program.sh -p "Call nomadworks_validate with mode phase0 and quote the PASS/FAIL line."
+
+# P4 — CodeNomad bridge (from course repo root)
+./scripts/codenomad-rust-bridge.sh --jsonl --prompt "/smoke-echo"
+# After CodeNomad restart:
+# curl -sN http://127.0.0.1:9940/api/playground/rust/status
+# curl -sN http://127.0.0.1:9940/api/playground/rust/run \
+#   -H 'content-type: application/json' \
+#   -d '{"prompt":"/smoke-echo","jsonl":true}'
 ```
 
-**Next:** P3 — NomadWorks tools.
+**Integration phases P0–P4 complete** for the Rust playground path. Optional later: richer JSON event protocol (`tool_call` / `tool_result`) from the Rust binary itself.

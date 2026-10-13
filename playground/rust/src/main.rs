@@ -1,5 +1,6 @@
 mod agents;
 mod config;
+mod nomad_tools;
 mod skills;
 
 use async_openai::{Client, config::OpenAIConfig};
@@ -26,9 +27,9 @@ struct Args {
 enum ToolMode {
     /// No tools — smallest prompt (good for slash smoke tests).
     None,
-    /// Read, Write, Bash
+    /// Read, Write, Bash + NomadWorks tools
     Base,
-    /// Read, Write, Bash, Skill
+    /// Read, Write, Bash, Skill + NomadWorks tools
     All,
 }
 
@@ -124,6 +125,9 @@ fn tool_specs(mode: ToolMode) -> Option<Value> {
                     }
                 }));
             }
+
+            // P3: NomadWorks tools available to base + all (including forked agents).
+            tools.extend(nomad_tools::tool_specs());
 
             Some(Value::Array(tools))
         }
@@ -377,7 +381,16 @@ async fn run_agent_loop(
                     ))
                     .await?
                 }
-                other => format!("Unknown tool: {other}"),
+                "nomadflow_run_workflow" => {
+                    Box::pin(handle_nomadflow_run(client, cfg, skills, &fn_args)).await?
+                }
+                other => {
+                    if let Some(out) = nomad_tools::dispatch(other, &fn_args) {
+                        out
+                    } else {
+                        format!("Unknown tool: {other}")
+                    }
+                }
             };
 
             messages.push(json!({
@@ -389,6 +402,71 @@ async fn run_agent_loop(
     }
 
     Err("agent loop exceeded maximum iterations".into())
+}
+
+async fn handle_nomadflow_run(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    args: &Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let task_path = args["task_path"].as_str().unwrap_or("").trim();
+    let instructions = args["instructions"].as_str().unwrap_or("").trim();
+    if task_path.is_empty() || instructions.is_empty() {
+        return Ok(
+            "Error: nomadflow_run_workflow requires task_path and instructions.".into(),
+        );
+    }
+
+    let prompt = nomad_tools::workflow_fork_prompt(task_path, instructions);
+    let runner = skill_by_name(skills, "workflow_runner")
+        .or_else(|| skill_by_name(skills, "runner"));
+
+    let mut fork_messages = if let Some(skill) = runner {
+        agents::build_fork_messages(skill, &prompt)
+    } else {
+        vec![
+            json!({
+                "role": "system",
+                "content": "You are a NomadWorks workflow_runner in a forked playground context."
+            }),
+            json!({ "role": "user", "content": prompt }),
+        ]
+    };
+
+    let fork_cfg = runner
+        .and_then(|s| s.model.as_ref())
+        .map(|m| cfg.with_model(m))
+        .unwrap_or_else(|| cfg.clone());
+    if fork_cfg.model != cfg.model {
+        eprintln!("nomadflow: model {}", fork_cfg.model);
+    }
+
+    let session = format!("sync-{}", uuidish());
+    let answer = Box::pin(run_agent_loop(
+        client,
+        &fork_cfg,
+        &mut fork_messages,
+        skills,
+        ToolMode::Base,
+    ))
+    .await?;
+
+    Ok(format!(
+        "SUCCESS: Workflow completed synchronously (playground shim).\n\
+Session: {session}\n\
+Task: {task_path}\n\
+---\n{answer}"
+    ))
+}
+
+fn uuidish() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{}", nanos, std::process::id())
 }
 
 async fn handle_skill(

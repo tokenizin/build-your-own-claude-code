@@ -28,3 +28,4 @@ If the same fix fails repeatedly: web search + ask the user (HITL), then append 
 
 - **P2 NomadWorks fork args:** Agent `.md` bodies rarely include `$ARGUMENTS`. Slash `/pma …` must append `User request:` when no placeholders, or the fork only sees role text. Shared helper: `fork_user_body` (Rust + Python).
 - **ollama.tokenizin.com 403:** Not CF Access/WAF — Ollama rejects `Host: ollama.tokenizin.com`. Fix: tunnel `originRequest.httpHostHeader: 127.0.0.1:11434` in `starworld/scripts/sync-tunnel-ingress.sh` (then sync). Local reproduce: `curl -H 'Host: ollama.tokenizin.com' http://127.0.0.1:11434/` → 403.
+- **P3 NomadWorks tools:** OpenCode plugin tools need session/client; playground shims validate (phase0/strict), file discussions, and sync `nomadflow_run_workflow` via `workflow_runner` fork. `nomadflow_prompt_workflow` cannot drive background sessions.

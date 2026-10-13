@@ -13,6 +13,7 @@ CORE_ROLES: list[tuple[str, tuple[str, ...]]] = [
     ("tech_lead", ("tech-lead", "tl")),
     ("developer", ("dev",)),
     ("qa_engineer", ("qa",)),
+    ("workflow_runner", ("runner", "wr")),
 ]
 
 _DEFAULT_POLICIES: dict[str, tuple[str, ...]] = {
@@ -33,6 +34,7 @@ _DEFAULT_POLICIES: dict[str, tuple[str, ...]] = {
         "ecosystem.methodology",
     ),
     "qa_engineer": ("starworld", "ecosystem.methodology", "hindsight-memory"),
+    "workflow_runner": ("starworld", "ecosystem.workflow", "ecosystem.methodology"),
 }
 
 _DEFAULT_MODEL = "qwen3.6:latest"

@@ -15,6 +15,7 @@ const CORE_ROLES: &[(&str, &[&str])] = &[
     ("tech_lead", &["tech-lead", "tl"]),
     ("developer", &["dev"]),
     ("qa_engineer", &["qa"]),
+    ("workflow_runner", &["runner", "wr"]),
 ];
 
 /// Policies from `starworld/.nomadworks/nomadworks.yaml` for core roles.
@@ -37,6 +38,7 @@ fn default_policies_for(agent: &str) -> &'static [&'static str] {
             "ecosystem.methodology",
         ],
         "qa_engineer" => &["starworld", "ecosystem.methodology", "hindsight-memory"],
+        "workflow_runner" => &["starworld", "ecosystem.workflow", "ecosystem.methodology"],
         _ => &["starworld", "ecosystem.methodology"],
     }
 }
@@ -44,9 +46,12 @@ fn default_policies_for(agent: &str) -> &'static [&'static str] {
 fn default_model_for(agent: &str) -> Option<&'static str> {
     // Align with NomadWorks capability router defaults (Ollama tags, no provider prefix).
     match agent {
-        "product_manager" | "business_analyst" | "tech_lead" | "developer" | "qa_engineer" => {
-            Some("qwen3.6:latest")
-        }
+        "product_manager"
+        | "business_analyst"
+        | "tech_lead"
+        | "developer"
+        | "qa_engineer"
+        | "workflow_runner" => Some("qwen3.6:latest"),
         _ => None,
     }
 }

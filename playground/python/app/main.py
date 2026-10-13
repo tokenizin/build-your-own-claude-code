@@ -13,6 +13,7 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from app.agents import build_fork_messages, collect_nomadworks_roots
+from app import nomad_tools
 from app.skills import (
     Skill,
     discover_skills,
@@ -151,6 +152,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
             },
         },
     },
+    *nomad_tools.tool_specs(),
+]
+
+BASE_TOOL_SPECS = [
+    t for t in TOOL_SPECS if t["function"]["name"] != "Skill"
 ]
 
 
@@ -239,6 +245,7 @@ def run_agent_loop(
     *,
     tools: list[dict[str, Any]] | None = None,
     model: str | None = None,
+    nomadflow_handler: Callable[[dict[str, Any]], str] | None = None,
 ) -> str:
     active_model = model or MODEL
     for _ in range(40):
@@ -290,8 +297,14 @@ def run_agent_loop(
                 result = execute_bash(fn_args)
             elif fn_name == "Skill":
                 result = skill_handler(fn_args.get("name", ""), fn_args.get("args", "") or "")
+            elif fn_name == "nomadflow_run_workflow":
+                if nomadflow_handler is None:
+                    result = "Error: nomadflow_run_workflow handler not configured"
+                else:
+                    result = nomadflow_handler(fn_args)
             else:
-                result = f"Unknown tool: {fn_name}"
+                dispatched = nomad_tools.dispatch(fn_name, fn_args)
+                result = dispatched if dispatched is not None else f"Unknown tool: {fn_name}"
 
             messages.append(
                 {
@@ -315,13 +328,12 @@ def build_initial_run(
             skill = skill_by_name(skills, inv.skill_name)
             if skill is not None:
                 messages = build_fork_messages(skill, inv.body)
-                base_tools = [t for t in TOOL_SPECS if t["function"]["name"] != "Skill"]
-                return messages, base_tools, skill.model
+                return messages, BASE_TOOL_SPECS, skill.model
 
         messages = [{"role": "user", "content": inv.body} for inv in expanded]
         needs_tools = any("scripts/" in inv.body for inv in expanded)
         if needs_tools:
-            return messages, [t for t in TOOL_SPECS if t["function"]["name"] != "Skill"], None
+            return messages, BASE_TOOL_SPECS, None
         return messages, None, None
 
     messages: list[dict[str, Any]] = []
@@ -360,7 +372,6 @@ def main() -> None:
             body = fork_user_body(skill, skill_args)
             body = wrap_skill_body_for_location(skill, body)
             fork_messages = build_fork_messages(skill, body)
-            base_tools = [t for t in TOOL_SPECS if t["function"]["name"] != "Skill"]
             if skill.model and skill.model != MODEL:
                 print(f"fork `{skill.name}`: model {skill.model}", file=sys.stderr)
             answer = run_agent_loop(
@@ -368,16 +379,59 @@ def main() -> None:
                 fork_messages,
                 skills,
                 skill_handler,
-                tools=base_tools,
+                tools=BASE_TOOL_SPECS,
                 model=skill.model,
+                nomadflow_handler=nomadflow_handler,
             )
             return f"Skill {skill.name} ran in a separate context and returned: {answer}"
 
         body = substitute_arguments(skill.body, skill_args)
         return wrap_skill_body_for_location(skill, body)
 
+    def nomadflow_handler(fn_args: dict[str, Any]) -> str:
+        task_path = (fn_args.get("task_path") or "").strip()
+        instructions = (fn_args.get("instructions") or "").strip()
+        if not task_path or not instructions:
+            return "Error: nomadflow_run_workflow requires task_path and instructions."
+        prompt = nomad_tools.workflow_fork_prompt(task_path, instructions)
+        runner = skill_by_name(skills, "workflow_runner") or skill_by_name(skills, "runner")
+        if runner is not None:
+            fork_messages = build_fork_messages(runner, prompt)
+            model = runner.model
+        else:
+            fork_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a NomadWorks workflow_runner in a forked playground context.",
+                },
+                {"role": "user", "content": prompt},
+            ]
+            model = None
+        if model and model != MODEL:
+            print(f"nomadflow: model {model}", file=sys.stderr)
+        answer = run_agent_loop(
+            client,
+            fork_messages,
+            skills,
+            skill_handler,
+            tools=BASE_TOOL_SPECS,
+            model=model,
+            nomadflow_handler=nomadflow_handler,
+        )
+        session = f"sync-{os.getpid()}-{id(fn_args)}"
+        return (
+            "SUCCESS: Workflow completed synchronously (playground shim).\n"
+            f"Session: {session}\nTask: {task_path}\n---\n{answer}"
+        )
+
     final = run_agent_loop(
-        client, messages, skills, skill_handler, tools=tools, model=active_model
+        client,
+        messages,
+        skills,
+        skill_handler,
+        tools=tools,
+        model=active_model,
+        nomadflow_handler=nomadflow_handler,
     )
     print(final)
 

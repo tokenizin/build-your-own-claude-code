@@ -108,6 +108,13 @@ Official solutions in `solutions/` currently cover early stages only; the playgr
 
 To run StarWorld methodology skills and agents on this Rust agent loop, see [NOMADWORKS_INTEGRATION.md](NOMADWORKS_INTEGRATION.md).
 
+CodeNomad spawn bridge (P4):
+
+```bash
+./scripts/codenomad-rust-bridge.sh --jsonl --prompt "/smoke-echo"
+# or POST http://127.0.0.1:9940/api/playground/rust/run  (after CodeNomad restart)
+```
+
 ## Cursor
 
 - Rule: `.cursor/rules/claude-code-course.mdc`
