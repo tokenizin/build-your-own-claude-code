@@ -1,0 +1,38 @@
+---
+description: Build your own Claude Code course — stages, tools, skills, and local reference
+alwaysApply: true
+---
+
+# Build your own Claude Code (course repo)
+
+This workspace is **Codecrafters course content** (`codecrafters-io/build-your-own-claude-code`), not a single learner checkout.
+
+## Canonical specs
+
+- Stages and slugs: `course-definition.yml`
+- Learner-facing instructions: `stage_descriptions/`
+- Skills extension design: `extension_designs/skills.md`
+
+## Tools the learner implements (final state)
+
+`Read`, `Write`, `Bash`, and `Skill`, with an OpenAI-compatible agent loop and OpenRouter.
+
+## Skills behavior (match stages, then Claude Code)
+
+- Discover `.claude/skills/*/SKILL.md`; catalog = name + description only in system prompt
+- User `/name` and stacked `/a /b args` with `$ARGUMENTS` / `$N` substitution
+- Script skills: prefix invocation with skill folder location when body references `scripts/`
+- Model invokes via `Skill` tool; `context: fork` runs body in a nested agent loop
+
+## Local full-feature reference
+
+`playground/rust/` (preferred on Mac Studio Ultra) and `playground/python/` implement all base tools + skills extension. Run from repo:
+
+```bash
+cd playground/rust && ./your_program.sh -p "..."
+# playground/.env → OLLAMA_BASE_URL=https://ollama.tokenizin.com/v1
+```
+
+Project skills for real Claude Code / testing: `.claude/skills/`.
+
+When editing course content, keep **one source of truth** for behavior in stage descriptions; update both playgrounds when stages change.

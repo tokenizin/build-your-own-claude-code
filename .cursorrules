@@ -1,0 +1,30 @@
+# Build your own Claude Code — agent notes
+
+## Project type
+
+Codecrafters **course definition** repo. Learner code lives on CodeCrafters; this tree has starters, stage copy, and partial solutions.
+
+## Full tools + skills locally
+
+- Preferred reference (Apple Silicon): `playground/rust/` (Read, Write, Bash, Skill, agent loop, skills extension)
+- Python parity: `playground/python/`
+- Run: `cd playground/rust && ./your_program.sh -p "..."` (loads `playground/.env` → Ollama at ollama.tokenizin.com / localhost)
+- Skills: `.claude/skills/` at repo root (walk-up discovery from playground cwd)
+
+## Specs before code changes
+
+Read `stage_descriptions/` and `course-definition.yml` before changing behavior. Skills extension details: `extension_designs/skills.md`.
+
+## Cursor / Claude Code in this repo
+
+- `.claude/settings.json` — permissive tool allow list for local work
+- `.claude/skills/course-map` — navigation skill for this repository
+
+## Debugging loops
+
+If the same fix fails repeatedly: web search + ask the user (HITL), then append a short TLDR of the **working** fix here under Past fixes.
+
+### Past fixes
+
+- **P2 NomadWorks fork args:** Agent `.md` bodies rarely include `$ARGUMENTS`. Slash `/pma …` must append `User request:` when no placeholders, or the fork only sees role text. Shared helper: `fork_user_body` (Rust + Python).
+- **ollama.tokenizin.com 403:** Not CF Access/WAF — Ollama rejects `Host: ollama.tokenizin.com`. Fix: tunnel `originRequest.httpHostHeader: 127.0.0.1:11434` in `starworld/scripts/sync-tunnel-ingress.sh` (then sync). Local reproduce: `curl -H 'Host: ollama.tokenizin.com' http://127.0.0.1:11434/` → 403.

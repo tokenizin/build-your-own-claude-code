@@ -5,3 +5,15 @@ course-definition-tester
 
 .env
 .env.local
+
+# Symlinks created by scripts/link-nomad-skills.sh (machine-local StarWorld paths)
+.claude/skills/task-management
+.claude/skills/project-delivery-management
+.claude/skills/project-state
+.claude/skills/ecosystem-readiness
+.claude/skills/qa-validation-pipeline
+.claude/skills/context-reconcile
+.claude/skills/codenomad-build-restart
+.claude/skills/codenomad-architecture-guide
+.claude/skills/sidecar-management
+.claude/skills/set-agent-model

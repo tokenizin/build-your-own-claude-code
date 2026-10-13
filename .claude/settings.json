@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Bash",
+      "Skill",
+      "Glob",
+      "Grep",
+      "Edit"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}
