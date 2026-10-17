@@ -1,0 +1,8 @@
+{"type": "meta", "cwd": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code", "prompt": "/smoke-echo", "runner": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code/playground/rust/your_program.sh", "agent": null}
+{"type": "stderr", "line": "    Finished `release` profile [optimized] target(s) in 0.08s"}
+{"type": "stderr", "line": "LLM: https://ollama.tokenizin.com/v1"}
+{"type": "stderr", "line": "skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)"}
+{"type": "stderr", "line": "model: gemma4:31b-cloud"}
+{"type": "stdout", "line": "papaya"}
+{"type": "final", "text": "papaya"}
+{"type": "exit", "code": 0}

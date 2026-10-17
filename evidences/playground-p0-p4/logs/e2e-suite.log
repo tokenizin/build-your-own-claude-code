@@ -1,0 +1,80 @@
+=== 2026-10-13T09:17:11Z E2E P0-P4 + persistence ===
+--- cargo test ---
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/main.rs (target/debug/deps/codecrafters_claude_code-cb3a4f1c7d5e5b67)
+
+running 9 tests
+test agents::tests::policy_filename_maps_dots ... ok
+test config::tests::normalize_adds_v1 ... ok
+test agents::tests::parse_policy_list_csv ... ok
+test nomad_tools::tests::slugify_basic ... ok
+test skills::tests::substitute_positional_and_full ... ok
+test skills::tests::fork_slash_collects_remaining_args ... ok
+test skills::tests::extra_path_env_loads_skills ... ok
+test skills::tests::substitute_indexed ... ok
+skills: ignoring duplicate 'alpha' from /private/var/folders/bb/vspw48jd741689jrls7nxv4w0000gp/T/claude-code-skills-prec-66173-1791883031312731000/.opencode/skills/alpha (keeping /private/var/folders/bb/vspw48jd741689jrls7nxv4w0000gp/T/claude-code-skills-prec-66173-1791883031312731000/.claude/skills/alpha)
+test skills::tests::multi_root_precedence_claude_over_opencode ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+--- cargo build --release ---
+   Compiling zerotrie v0.2.5
+   Compiling hyper-util v0.1.21
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling icu_locale_core v2.3.0
+   Compiling icu_provider v2.3.1
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling tokio-rustls v0.26.6
+   Compiling hyper-rustls v0.27.10
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling tower-http v0.6.11
+   Compiling reqwest v0.12.28
+   Compiling reqwest-eventsource v0.6.0
+   Compiling async-openai v0.32.4
+   Compiling codecrafters-claude-code v0.1.0 (/Users/alexshapiro/0-claudecode/build-your-own-claude-code/playground/rust)
+    Finished `release` profile [optimized] target(s) in 34.66s
+--- P0 smoke-echo ---
+    Finished `release` profile [optimized] target(s) in 0.08s
+LLM: https://ollama.tokenizin.com/v1
+skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)
+model: gemma4:31b-cloud
+papaya
+--- P2 pma fork ---
+    Finished `release` profile [optimized] target(s) in 0.07s
+LLM: https://ollama.tokenizin.com/v1
+skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)
+model: qwen3.6:latest (fork override)
+e2e-p2
+--- P3 nomadworks_validate ---
+    Finished `release` profile [optimized] target(s) in 0.08s
+LLM: https://ollama.tokenizin.com/v1
+skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)
+model: gemma4:31b-cloud
+PASS: NomadWorks Phase 0 artifacts present and synced.
+--- P4 bridge jsonl ---
+{"type": "meta", "cwd": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code", "prompt": "/smoke-echo", "runner": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code/playground/rust/your_program.sh", "agent": null}
+{"type": "stderr", "line": "    Finished `release` profile [optimized] target(s) in 0.08s"}
+{"type": "stderr", "line": "LLM: https://ollama.tokenizin.com/v1"}
+{"type": "stderr", "line": "skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)"}
+{"type": "stderr", "line": "model: gemma4:31b-cloud"}
+{"type": "stdout", "line": "papaya"}
+{"type": "final", "text": "papaya"}
+{"type": "exit", "code": 0}
+--- P4 bridge persist ---
+{"type": "meta", "cwd": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code", "prompt": "/smoke-echo", "runner": "/Users/alexshapiro/0-claudecode/build-your-own-claude-code/playground/rust/your_program.sh", "agent": null}
+{"type": "stderr", "line": "    Finished `release` profile [optimized] target(s) in 0.07s"}
+{"type": "stderr", "line": "LLM: https://ollama.tokenizin.com/v1"}
+{"type": "stderr", "line": "skills: 26 loaded from 1 root(s) (+ 1 NomadWorks)"}
+{"type": "stderr", "line": "model: gemma4:31b-cloud"}
+{"type": "stdout", "line": "papaya"}
+{"type": "final", "text": "papaya"}
+{"type": "exit", "code": 0}
+{"ok":true,"runId":"cmv6gxf760000s0pl7hg2ev1r","events":8}
+--- tunnel ---
+tunnel HTTP 200
+=== DONE ===

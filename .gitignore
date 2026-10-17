@@ -6,6 +6,14 @@ course-definition-tester
 .env
 .env.local
 
+# Playground persistence (ZenStack / bun / local secrets)
+playground/persistence/node_modules/
+playground/persistence/generated/
+playground/persistence/zenstack/~schema.prisma
+playground/persistence/.env
+playground/persistence/.env.local
+playground/persistence/bun.lock
+
 # Symlinks created by scripts/link-nomad-skills.sh (machine-local StarWorld paths)
 .claude/skills/task-management
 .claude/skills/project-delivery-management

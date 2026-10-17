@@ -1,14 +1,19 @@
-//! NomadWorks agent roles → `context: fork` skills.
+//! NomadWorks / OpenCode agent roles → `context: fork` skills.
 //!
-//! Discovers `.nomadworks/agents/*.md` (walk-up + `NOMADWORKS_PATH`) and registers
-//! core delivery roles (PMA, BA, tech_lead, developer, qa_engineer) plus aliases
-//! (`pma`, `ba`, …) as forked skills with policy injection.
+//! Discovery modes (`NOMAD_AGENTS` / `PLAYGROUND_AGENTS`, default from
+//! `playground/opencode-rust.json` → usually `opencode`):
+//! - `core` — P2 delivery roles only (pma/ba/tl/dev/qa/runner)
+//! - `opencode` — CodeNomad / StarWorld `opencode.json(c)` agent catalog
+//! - `all` — OpenCode catalog + any remaining `.nomadworks/agents/*.md`
 
+use crate::opencode_config::{
+    self, OpencodeAdapter, discover_opencode_agent_skills, load_adapter,
+};
 use crate::skills::{Skill, parse_frontmatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Core P2 roles and short slash aliases.
+/// Core P2 roles and short slash aliases (used for `core` mode + alias fallback).
 const CORE_ROLES: &[(&str, &[&str])] = &[
     ("product_manager", &["pma"]),
     ("business_analyst", &["ba"]),
@@ -43,16 +48,22 @@ fn default_policies_for(agent: &str) -> &'static [&'static str] {
     }
 }
 
-fn default_model_for(agent: &str) -> Option<&'static str> {
-    // Align with NomadWorks capability router defaults (Ollama tags, no provider prefix).
+fn default_policies_vec(agent: &str) -> Vec<String> {
+    default_policies_for(agent)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn default_model_for(agent: &str, adapter: &OpencodeAdapter) -> Option<String> {
     match agent {
         "product_manager"
         | "business_analyst"
         | "tech_lead"
         | "developer"
         | "qa_engineer"
-        | "workflow_runner" => Some("qwen3.6:latest"),
-        _ => None,
+        | "workflow_runner" => Some(adapter.default_fork_model.clone()),
+        _ => Some(adapter.default_fork_model.clone()),
     }
 }
 
@@ -100,7 +111,6 @@ pub fn collect_nomadworks_roots() -> Vec<PathBuf> {
         }
     }
 
-    // Convenience default when developing from the course repo on this machine.
     if roots.is_empty() {
         if let Ok(value) = std::env::var("STARWORLD") {
             let candidate = PathBuf::from(value).join(".nomadworks");
@@ -115,7 +125,6 @@ pub fn collect_nomadworks_roots() -> Vec<PathBuf> {
 }
 
 fn policy_filename(policy_id: &str) -> String {
-    // ecosystem.methodology → ecosystem-methodology.md
     format!("{}.md", policy_id.replace('.', "-"))
 }
 
@@ -161,14 +170,16 @@ pub fn load_policies(policy_ids: &[String], nomad_roots: &[PathBuf]) -> String {
 }
 
 fn parse_policy_list(raw: &str) -> Vec<String> {
-    // Supports: "starworld, ecosystem.methodology" or YAML-ish "- starworld"
     raw.split(|c| c == ',' || c == '\n')
         .map(|s| s.trim().trim_start_matches('-').trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn load_agent_file(path: &Path) -> Option<(String, String, Vec<String>, Option<String>)> {
+fn load_agent_file(
+    path: &Path,
+    adapter: &OpencodeAdapter,
+) -> Option<(String, String, Vec<String>, Option<String>)> {
     let raw = fs::read_to_string(path).ok()?;
     let (fm, _body) = parse_frontmatter(&raw);
     let name = path
@@ -187,20 +198,20 @@ fn load_agent_file(path: &Path) -> Option<(String, String, Vec<String>, Option<S
         .map(|p| parse_policy_list(p))
         .unwrap_or_default();
     if policies.is_empty() {
-        policies = default_policies_for(&name)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        policies = default_policies_vec(&name);
     }
     let model = fm
         .get("model")
         .cloned()
-        .or_else(|| default_model_for(&name).map(|s| s.to_string()));
+        .or_else(|| default_model_for(&name, adapter));
     Some((name, description, policies, model))
 }
 
-/// Discover core NomadWorks agents as forked skills (plus aliases).
-pub fn discover_agent_skills() -> Vec<Skill> {
+fn discover_disk_agent_skills(
+    adapter: &OpencodeAdapter,
+    only_core: bool,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<Skill> {
     let roots = collect_nomadworks_roots();
     if roots.is_empty() {
         return Vec::new();
@@ -221,13 +232,13 @@ pub fn discover_agent_skills() -> Vec<Skill> {
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Some((name, description, policies, model)) = load_agent_file(&path) else {
+            let Some((name, description, policies, model)) = load_agent_file(&path, adapter) else {
                 continue;
             };
-
-            // Only auto-register P2 core roles (avoid flooding catalog with 46 agents).
-            let is_core = CORE_ROLES.iter().any(|(n, _)| *n == name);
-            if !is_core {
+            if skip.contains(&name) {
+                continue;
+            }
+            if only_core && !CORE_ROLES.iter().any(|(n, _)| *n == name) {
                 continue;
             }
 
@@ -253,12 +264,12 @@ pub fn discover_agent_skills() -> Vec<Skill> {
         }
     }
 
-    // Aliases → clones with alternate names.
+    // Aliases for core roles
     let mut extras = Vec::new();
     for (canonical, aliases) in CORE_ROLES {
         if let Some(base) = by_name.get(*canonical) {
             for alias in *aliases {
-                if by_name.contains_key(*alias) {
+                if by_name.contains_key(*alias) || skip.contains(*alias) {
                     continue;
                 }
                 let mut cloned = base.clone();
@@ -279,6 +290,43 @@ pub fn discover_agent_skills() -> Vec<Skill> {
         .collect()
 }
 
+/// Discover agent roles as forked skills (OpenCode catalog and/or disk).
+pub fn discover_agent_skills() -> Vec<Skill> {
+    let adapter = load_adapter();
+    let mode = opencode_config::agent_mode_setting(&adapter);
+
+    match mode.as_str() {
+        "off" => Vec::new(),
+        "core" => discover_disk_agent_skills(&adapter, true, &std::collections::HashSet::new()),
+        "all" => {
+            let mut from_oc =
+                discover_opencode_agent_skills(&adapter, &|name| default_policies_vec(name));
+            let mut skip: std::collections::HashSet<String> =
+                from_oc.iter().map(|s| s.name.clone()).collect();
+            // Also skip alias targets already present
+            for (alias, canonical) in &adapter.aliases {
+                if skip.contains(canonical) {
+                    skip.insert(alias.clone());
+                }
+            }
+            let mut extras = discover_disk_agent_skills(&adapter, false, &skip);
+            from_oc.append(&mut extras);
+            from_oc.sort_by(|a, b| a.name.cmp(&b.name));
+            from_oc
+        }
+        // default: opencode
+        _ => {
+            let from_oc =
+                discover_opencode_agent_skills(&adapter, &|name| default_policies_vec(name));
+            if !from_oc.is_empty() {
+                return from_oc;
+            }
+            // Fallback if OpenCode config missing
+            discover_disk_agent_skills(&adapter, true, &std::collections::HashSet::new())
+        }
+    }
+}
+
 /// Build forked subagent messages: system(policies) + user(role body + args).
 pub fn build_fork_messages(skill: &Skill, body: &str) -> Vec<serde_json::Value> {
     use serde_json::json;
@@ -297,8 +345,9 @@ pub fn build_fork_messages(skill: &Skill, body: &str) -> Vec<serde_json::Value> 
     messages.push(json!({
         "role": "system",
         "content": format!(
-            "You are running as NomadWorks agent/skill `{}` in a forked subagent context. \
-You do not see the parent conversation. Use Read/Write/Bash when needed. \
+            "You are running as NomadWorks/OpenCode agent `{}` in a forked subagent context \
+(Rust playground engine). You do not see the parent conversation. \
+Use Read/Write/Bash and NomadWorks tools when needed. \
 When finished, respond with a concise final answer for the parent agent.",
             skill.name
         ),
@@ -317,7 +366,10 @@ mod tests {
 
     #[test]
     fn policy_filename_maps_dots() {
-        assert_eq!(policy_filename("ecosystem.methodology"), "ecosystem-methodology.md");
+        assert_eq!(
+            policy_filename("ecosystem.methodology"),
+            "ecosystem-methodology.md"
+        );
         assert_eq!(policy_filename("starworld"), "starworld.md");
     }
 

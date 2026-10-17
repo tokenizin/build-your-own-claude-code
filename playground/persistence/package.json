@@ -1,0 +1,24 @@
+{
+  "name": "claude-code-playground-persistence",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "bunx zenstack generate --schema zenstack/schema.zmodel",
+    "db:push": "bunx zenstack db push --schema zenstack/schema.zmodel",
+    "setup": "bash scripts/ensure-pg-proxy.sh && bun run generate && bun run db:push && bun run src/ensure-bucket.ts",
+    "smoke": "bun run src/smoke.ts",
+    "record": "bun run src/record-cli.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@zenstackhq/orm": "^3.9.3",
+    "@zenstackhq/plugin-policy": "^3.9.3",
+    "pg": "^8.14.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.11",
+    "@zenstackhq/cli": "^3.9.3",
+    "bun-types": "latest",
+    "typescript": "^5.8.2"
+  }
+}

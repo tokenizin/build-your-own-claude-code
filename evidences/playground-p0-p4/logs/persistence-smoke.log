@@ -1,0 +1,8 @@
+$ bun run src/smoke.ts
+{
+  "ok": true,
+  "runId": "cmv6gvcyj0001hmpl2yayhaa9",
+  "toolRunCount": 1,
+  "blobsForRun": 1,
+  "configRedacted": true
+}

@@ -1,0 +1,9 @@
+=== python parity ===
+LLM: https://ollama.tokenizin.com/v1
+skills: 26 loaded (+ 1 NomadWorks)
+model: gemma4:31b-cloud
+papaya
+LLM: https://ollama.tokenizin.com/v1
+skills: 26 loaded (+ 1 NomadWorks)
+model: gemma4:31b-cloud
+NomadWorks Phase 0 validation PASSED. All core artifacts are present and synced.

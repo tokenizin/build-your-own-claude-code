@@ -1,0 +1,104 @@
+// ZenStack V3 — playground tool-run + config store.
+// No Prisma plugin: ORM is @zenstackhq/orm (Kysely). Push with `zen db push`.
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+plugin policy {
+    provider = "@zenstackhq/plugin-policy"
+}
+
+plugin typescript {
+    provider = "@core/typescript"
+    output   = "../generated"
+}
+
+/// Snapshot of playground / Ollama / NomadWorks configuration used for a run.
+model PlaygroundConfig {
+    id        String   @id @default(cuid())
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    /// Logical name, e.g. "default", "studio-ollama"
+    name      String   @unique
+    /// Free-form config map (env keys, models, paths) — secrets redacted before save
+    data      Json
+    /// Optional notes
+    note      String?
+
+    runs      ToolRun[]
+
+    @@allow('all', true)
+}
+
+/// One invocation of the playground agent or CodeNomad bridge.
+model ToolRun {
+    id           String   @id @default(cuid())
+    createdAt    DateTime @default(now())
+    finishedAt   DateTime?
+
+    /// smoke-echo | pma-fork | nomadworks_validate | bridge | …
+    kind         String
+    cwd          String
+    prompt       String
+    agent        String?
+    model        String?
+    exitCode     Int?
+    success      Boolean  @default(false)
+
+    /// Final assistant text (truncated if huge)
+    finalText    String?
+
+    configId     String?
+    config       PlaygroundConfig? @relation(fields: [configId], references: [id])
+
+    events       ToolEvent[]
+    blobs        BlobObject[]
+
+    @@index([kind, createdAt])
+    @@index([createdAt])
+    @@allow('all', true)
+}
+
+/// Streamed NDJSON / tool lifecycle events for a run.
+model ToolEvent {
+    id        String   @id @default(cuid())
+    createdAt DateTime @default(now())
+
+    runId     String
+    run       ToolRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+    /// meta | stderr | stdout | final | exit | tool_call | tool_result | bridge_stderr
+    type      String
+    seq       Int      @default(0)
+    payload   Json
+
+    @@index([runId, seq])
+    @@allow('all', true)
+}
+
+/// Pointer to a blob in local MinIO (S3-compatible).
+model BlobObject {
+    id          String   @id @default(cuid())
+    createdAt   DateTime @default(now())
+
+    runId       String?
+    run         ToolRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+    /// e.g. application/x-ndjson, text/plain
+    contentType String   @default("application/octet-stream")
+    /// SHA-256 hex of content
+    sha256      String
+    byteSize    Int
+    /// s3://bucket/key or bucket/key
+    uri         String
+    bucket      String
+    objectKey   String
+    label       String?
+
+    @@unique([bucket, objectKey])
+    @@index([sha256])
+    @@allow('all', true)
+}

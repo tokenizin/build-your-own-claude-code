@@ -1,0 +1,38 @@
+{
+  "$comment": "Rust playground adapter for StarWorld / CodeNomad OpenCode agent settings. StarWorld remains SoT; this file only remaps models + discovery.",
+  "opencodeConfigCandidates": [
+    "${STARWORLD}/CodeNomad/.opencode/opencode.jsonc",
+    "${STARWORLD}/opencode.json",
+    "${STARWORLD}/.opencode/opencode.json"
+  ],
+  "agentMode": "opencode",
+  "defaultForkModel": "qwen3.6:latest",
+  "smallModel": "qwen3:8b",
+  "modelRemap": {
+    "opencode/space-bunny-free": "qwen3.6:latest",
+    "openrouter-fallback/auto": "qwen3.6:latest",
+    "opencode-go/mimo-v2.5": "qwen3.6:latest",
+    "ollama/qwen3:8b": "qwen3:8b",
+    "ollama/qwen3.6:latest": "qwen3.6:latest",
+    "ollama/hermes3:latest": "hermes3:latest",
+    "ollama/ornith-31b-dense:latest": "ornith-31b-dense:latest"
+  },
+  "aliases": {
+    "pma": "product_manager",
+    "ba": "business_analyst",
+    "tl": "tech_lead",
+    "tech-lead": "tech_lead",
+    "dev": "developer",
+    "qa": "qa_engineer",
+    "runner": "workflow_runner",
+    "wr": "workflow_runner"
+  },
+  "coreFallback": [
+    "product_manager",
+    "business_analyst",
+    "tech_lead",
+    "developer",
+    "qa_engineer",
+    "workflow_runner"
+  ]
+}

@@ -112,8 +112,51 @@ CodeNomad spawn bridge (P4):
 
 ```bash
 ./scripts/codenomad-rust-bridge.sh --jsonl --prompt "/smoke-echo"
+# Persist NDJSON → local Neon + MinIO
+./scripts/codenomad-rust-bridge.sh --persist --jsonl --prompt "/smoke-echo"
 # or POST http://127.0.0.1:9940/api/playground/rust/run  (after CodeNomad restart)
 ```
+
+## OpenCode / CodeNomad subagents on Rust
+
+The Rust engine loads the same agent map as CodeNomad’s OpenCode config:
+
+```bash
+# playground/.env (or export)
+STARWORLD=/Users/alexshapiro/starworld
+OPENCODE_CONFIG=$STARWORLD/CodeNomad/.opencode/opencode.jsonc
+NOMAD_AGENTS=opencode   # core | opencode | all | off
+```
+
+Adapter (Ollama model remaps + aliases): `playground/opencode-rust.json`.
+
+```bash
+cd playground/rust
+SKILLS_DEBUG=1 ./your_program.sh -p "/ceo In one sentence: what is your role?"
+./your_program.sh -p "/pma reply with exactly: ok"
+```
+
+### CodeNomad UI — use Rust as chat engine
+
+1. Restart CodeNomad with `CLAUDE_CODE_PLAYGROUND`, `STARWORLD`, `OPENCODE_CONFIG` set (see [NOMADWORKS_INTEGRATION.md](NOMADWORKS_INTEGRATION.md)).
+2. Settings → **Claude Code (Rust)** → enable **Use Rust as chat engine**.
+3. Optional: persist runs, set default agent (`product_manager` / `pma` / `ceo`…).
+4. Chat sends go to `POST /api/playground/rust/run` (session agent or default), not OpenCode.
+
+## Persistence (ZenStack V3 + local Neon / MinIO)
+
+Tool runs and redacted config live in `playground/persistence/`:
+
+- **Postgres:** Docker `neondb-local` via proxy `127.0.0.1:54329` (host `:5432` is often macOS Postgres)
+- **Blobs:** Docker `blob-db-local` (MinIO) bucket `claude-code-playground`
+- **Schema:** `zenstack/schema.zmodel` — ZenStack V3 (`@zenstackhq/orm`); no Prisma client
+
+```bash
+cd playground/persistence
+bun install && bun run setup && bun run smoke
+```
+
+See `playground/persistence/README.md`.
 
 ## Cursor
 

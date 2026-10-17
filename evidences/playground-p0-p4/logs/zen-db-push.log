@@ -1,0 +1,7 @@
+$ bunx zenstack db push --schema zenstack/schema.zmodel
+Environment variables loaded from .env
+Prisma schema loaded from zenstack/~schema.prisma
+Datasource "db": PostgreSQL database "claude_code_playground", schema "public" at "127.0.0.1:54329"
+
+🚀  Your database is now in sync with your Prisma schema. Done in 639ms
+

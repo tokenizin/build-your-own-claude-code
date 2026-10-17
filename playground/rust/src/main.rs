@@ -1,6 +1,7 @@
 mod agents;
 mod config;
 mod nomad_tools;
+mod opencode_config;
 mod skills;
 
 use async_openai::{Client, config::OpenAIConfig};
@@ -529,10 +530,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (client, _active_base) = resolve_client(&cfg).await;
 
     let skills = discover_skills();
+    let fork_agents = skills
+        .iter()
+        .filter(|s| s.context.as_deref() == Some("fork"))
+        .count();
     eprintln!(
-        "skills: {} loaded from {} root(s) (+ {} NomadWorks)",
+        "skills: {} loaded from {} root(s) ({} fork agents, {} NomadWorks root(s))",
         skills.len(),
         collect_skill_roots().len(),
+        fork_agents,
         agents::collect_nomadworks_roots().len()
     );
 

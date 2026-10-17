@@ -1,0 +1,7 @@
+node_modules/
+bun.lock
+.env
+.env.local
+generated/
+zenstack/~schema.prisma
+*.log

@@ -48,7 +48,14 @@ def main() -> int:
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--agent", default="", help="Optional slash role: pma, ba, runner, …")
     parser.add_argument("--jsonl", action="store_true")
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Record NDJSON transcript into local Neon + MinIO (playground/persistence)",
+    )
     args = parser.parse_args()
+    if os.environ.get("PLAYGROUND_PERSIST", "").strip() in ("1", "true", "yes"):
+        args.persist = True
 
     root = repo_root()
     runner = root / "playground" / "rust" / "your_program.sh"
@@ -109,12 +116,51 @@ def main() -> int:
     t_err.join(timeout=5)
 
     final = "\n".join(stdout_lines).rstrip("\n")
+    transcript_lines: list[str] = []
+    if args.jsonl or args.persist:
+        # Rebuild a complete NDJSON transcript for persistence / consumers.
+        meta = {
+            "type": "meta",
+            "cwd": str(cwd),
+            "prompt": prompt,
+            "runner": str(runner),
+            "agent": agent or None,
+        }
+        transcript_lines.append(json.dumps(meta, ensure_ascii=False))
+        for line in stderr_lines:
+            transcript_lines.append(
+                json.dumps({"type": "stderr", "line": line}, ensure_ascii=False)
+            )
+        for line in stdout_lines:
+            transcript_lines.append(
+                json.dumps({"type": "stdout", "line": line}, ensure_ascii=False)
+            )
+        transcript_lines.append(json.dumps({"type": "final", "text": final}, ensure_ascii=False))
+        transcript_lines.append(
+            json.dumps({"type": "exit", "code": code}, ensure_ascii=False)
+        )
+
     if args.jsonl:
         emit({"type": "final", "text": final})
         emit({"type": "exit", "code": code})
-    elif not stdout_lines and final:
-        # already streamed; nothing else
-        pass
+
+    if args.persist:
+        persist_dir = root / "playground" / "persistence"
+        record_cli = persist_dir / "src" / "record-cli.ts"
+        if record_cli.is_file():
+            try:
+                subprocess.run(
+                    ["bun", "run", str(record_cli), "--kind", "bridge"],
+                    cwd=str(persist_dir),
+                    input="\n".join(transcript_lines) + "\n",
+                    text=True,
+                    check=False,
+                    env=os.environ.copy(),
+                )
+            except FileNotFoundError:
+                print("WARN: bun not found; skip persistence", file=sys.stderr)
+        else:
+            print(f"WARN: persistence recorder missing: {record_cli}", file=sys.stderr)
 
     return code if code is not None else 1
 
