@@ -1,6 +1,7 @@
 mod agents;
 mod catalog;
 mod config;
+mod delegation;
 mod inputs;
 mod nomad_tools;
 mod opencode_config;
@@ -108,7 +109,7 @@ fn apply_agent_flag(prompt: &str, agent: Option<&str>, skills: &[Skill]) -> (Str
     }
 }
 
-fn tool_specs(mode: ToolMode) -> Option<Value> {
+fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8) -> Option<Value> {
     match mode {
         ToolMode::None => None,
         ToolMode::Base | ToolMode::All => {
@@ -197,6 +198,12 @@ fn tool_specs(mode: ToolMode) -> Option<Value> {
             // P3: NomadWorks tools available to base + all (including forked agents).
             tools.extend(nomad_tools::tool_specs());
 
+            // Delegation to NomadWorks subagents (OpenCode's `task` tool).
+            let agents = delegation::task_agents(skills);
+            if depth < delegation::MAX_TASK_DEPTH && !agents.is_empty() {
+                tools.push(delegation::task_tool_spec(&agents));
+            }
+
             Some(Value::Array(tools))
         }
     }
@@ -279,7 +286,7 @@ fn assistant_text(message: &Value) -> String {
 
 /// Returns initial messages, tool mode, and optional per-run model override.
 /// Slash invokes skip the catalog; tools are omitted unless a skill body references
-/// `scripts/` (keeps `/smoke-echo` lean). Forked agents get policies + Base tools.
+/// `scripts/` (keeps `/smoke-echo` lean). Forked agents get policies + all tools.
 fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
     if let Some(invocations) = expand_slash_invocation(prompt, skills) {
         if invocations.len() == 1 && invocations[0].fork {
@@ -288,7 +295,8 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
                 let messages = agents::build_fork_messages(skill, &inv.body);
                 return InitialRun {
                     messages,
-                    tool_mode: ToolMode::Base,
+                    // Agents (pma, product_manager, …) delegate, so they need Skill + Task.
+                    tool_mode: ToolMode::All,
                     model_override: skill.model.clone(),
                     agent: Some(skill.name.clone()),
                 };
@@ -428,8 +436,9 @@ async fn run_agent_loop(
     skills: &[Skill],
     tool_mode: ToolMode,
     top: Option<&TopLevel<'_>>,
+    depth: u8,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let tools = tool_specs(tool_mode);
+    let tools = tool_specs(tool_mode, skills, depth);
 
     for _ in 0..40 {
         let mut request = json!({
@@ -515,19 +524,18 @@ async fn run_agent_loop(
         }
 
         for call in &tool_calls {
-            let fn_name = call["function"]["name"].as_str().unwrap_or("");
-            let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
-            let fn_args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            // Models name tools OpenCode-style and send arguments as a string or an
+            // object, under varying keys; normalize before running anything.
+            let fn_name = delegation::canonical_tool_name(call["function"]["name"].as_str().unwrap_or(""));
+            let fn_args = delegation::apply_aliases(fn_name, delegation::parse_arguments(&call["function"]["arguments"]));
             let call_id = call["id"].as_str().unwrap_or("");
 
             if let Some(top) = top {
-                let input = serde_json::from_str::<Value>(args_str)
-                    .unwrap_or_else(|_| Value::String(args_str.to_string()));
                 top.emitter.emit(json!({
                     "type": "tool",
                     "id": call_id,
                     "name": fn_name,
-                    "input": input,
+                    "input": fn_args,
                 }));
             }
 
@@ -542,17 +550,21 @@ async fn run_agent_loop(
                         skills,
                         fn_args["name"].as_str().unwrap_or(""),
                         fn_args["args"].as_str().unwrap_or(""),
+                        depth,
                     ))
                     .await?
                 }
                 "nomadflow_run_workflow" => {
-                    Box::pin(handle_nomadflow_run(client, cfg, skills, &fn_args)).await?
+                    Box::pin(handle_nomadflow_run(client, cfg, skills, &fn_args, depth)).await?
+                }
+                "Task" if depth < delegation::MAX_TASK_DEPTH => {
+                    Box::pin(handle_task(client, cfg, skills, &fn_args, depth)).await
                 }
                 other => {
                     if let Some(out) = nomad_tools::dispatch(other, &fn_args) {
                         out
                     } else {
-                        format!("Unknown tool: {other}")
+                        delegation::unknown_tool_message(other, tools.as_ref())
                     }
                 }
             };
@@ -578,11 +590,74 @@ async fn run_agent_loop(
     Err("agent loop exceeded maximum iterations".into())
 }
 
+/// The Task tool: run a NomadWorks subagent in its own context and return its
+/// answer with a task_id (OpenCode's format). A known task_id resumes that
+/// subagent's conversation. Failures become tool output, so the caller can react.
+async fn handle_task(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    args: &Value,
+    depth: u8,
+) -> String {
+    let agents = delegation::task_agents(skills);
+    let requested = args["subagent_type"].as_str().unwrap_or("").trim();
+    let prompt = args["prompt"].as_str().unwrap_or("").trim();
+    if requested.is_empty() || prompt.is_empty() {
+        return "Error: Task requires subagent_type and prompt.".into();
+    }
+    let Some(skill) = delegation::find_agent(&agents, requested) else {
+        let names: Vec<&str> = agents.iter().map(|s| s.name.as_str()).collect();
+        return format!("Error: unknown subagent_type `{requested}`. Available: {}", names.join(", "));
+    };
+
+    let resumed = args["task_id"]
+        .as_str()
+        .and_then(delegation::load_task)
+        .filter(|record| record.agent == skill.name);
+    let (task_id, mut messages) = match resumed {
+        Some(record) => {
+            let mut messages = record.messages;
+            messages.push(json!({ "role": "user", "content": prompt }));
+            (args["task_id"].as_str().unwrap_or_default().to_string(), messages)
+        }
+        // The subagent's own role prompt (its agent .md) plus the delegated task.
+        None => {
+            let body = wrap_skill_body_for_location(skill, &fork_user_body(skill, prompt));
+            (delegation::new_task_id(), agents::build_fork_messages(skill, &body))
+        }
+    };
+
+    let task_cfg = match &skill.model {
+        Some(model) => cfg.with_model(model),
+        None => cfg.clone(),
+    };
+    eprintln!("task `{}` ({task_id}): model {}", skill.name, task_cfg.model);
+    let outcome = Box::pin(run_agent_loop(
+        client,
+        &task_cfg,
+        &mut messages,
+        skills,
+        ToolMode::All,
+        None,
+        depth + 1,
+    ))
+    .await;
+    match outcome {
+        Ok(answer) => {
+            delegation::save_task(&task_id, delegation::TaskRecord { agent: skill.name.clone(), messages });
+            delegation::task_result(&task_id, &answer)
+        }
+        Err(err) => format!("Error: subagent {} failed: {err}", skill.name),
+    }
+}
+
 async fn handle_nomadflow_run(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
     skills: &[Skill],
     args: &Value,
+    depth: u8,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let task_path = args["task_path"].as_str().unwrap_or("").trim();
     let instructions = args["instructions"].as_str().unwrap_or("").trim();
@@ -617,13 +692,15 @@ async fn handle_nomadflow_run(
     }
 
     let session = format!("sync-{}", uuidish());
+    // The workflow runner delegates to the team, so it gets Skill + Task too.
     let answer = Box::pin(run_agent_loop(
         client,
         &fork_cfg,
         &mut fork_messages,
         skills,
-        ToolMode::Base,
+        ToolMode::All,
         None,
+        depth + 1,
     ))
     .await?;
 
@@ -650,6 +727,7 @@ async fn handle_skill(
     skills: &[Skill],
     name: &str,
     skill_args: &str,
+    depth: u8,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let Some(skill) = skill_by_name(skills, name) else {
         return Ok(format!("Unknown skill: {name}"));
@@ -673,6 +751,7 @@ async fn handle_skill(
             skills,
             ToolMode::Base,
             None,
+            depth + 1,
         ))
         .await?;
         return Ok(format!(
@@ -818,6 +897,7 @@ async fn main() -> std::process::ExitCode {
         &skills,
         initial.tool_mode,
         top.as_ref(),
+        0,
     )
     .await
     {

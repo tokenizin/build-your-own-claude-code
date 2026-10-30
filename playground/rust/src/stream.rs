@@ -130,7 +130,11 @@ impl StreamAccumulator {
                 if let Some(name) = call["function"]["name"].as_str() {
                     slot.name.push_str(name);
                 }
-                if let Some(args) = call["function"]["arguments"].as_str() {
+                // Arguments arrive as string fragments (OpenAI) or, from some
+                // Ollama models, as one whole JSON object.
+                if call["function"]["arguments"].is_object() {
+                    slot.arguments = call["function"]["arguments"].to_string();
+                } else if let Some(args) = call["function"]["arguments"].as_str() {
                     slot.arguments.push_str(args);
                 }
             }
@@ -259,6 +263,18 @@ pub async fn stream_chat(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn object_arguments_are_kept() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Write","arguments":{"filePath":"a.md","content":"x"}}}]}}]}"#,
+        )
+        .unwrap();
+        let message = acc.into_message();
+        let args = message["tool_calls"][0]["function"]["arguments"].as_str().unwrap().to_string();
+        assert!(args.contains("\"filePath\":\"a.md\""));
+    }
 
     #[test]
     fn rejections_do_not_fall_back() {
