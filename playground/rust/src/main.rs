@@ -1,11 +1,14 @@
 mod agents;
+mod catalog;
 mod config;
+mod inputs;
 mod nomad_tools;
 mod opencode_config;
 mod skills;
+mod stream;
 
 use async_openai::{Client, config::OpenAIConfig};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::LlmConfig;
 use serde_json::{Value, json};
 use skills::{
@@ -14,14 +17,55 @@ use skills::{
 };
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use stream::{Emitter, StreamError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// Print only the final answer (default).
+    Text,
+    /// NDJSON events on stdout (meta, delta, tool, tool_result, final, error).
+    StreamJson,
+}
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(short = 'p', long)]
-    prompt: String,
+    /// Prompt text (required unless --catalog).
+    #[arg(short = 'p', long, required_unless_present = "catalog")]
+    prompt: Option<String>,
+
+    /// Print a JSON catalog of models, agents and commands, then exit.
+    #[arg(long)]
+    catalog: bool,
+
+    /// Model for the main run (wins over a fork agent's own model).
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Run as this agent (same as prefixing the prompt with `/NAME`).
+    #[arg(long)]
+    agent: Option<String>,
+
+    /// Attach an image to the user message (repeatable).
+    #[arg(long = "image", value_name = "PATH")]
+    images: Vec<PathBuf>,
+
+    /// JSON file with prior turns: [{"role":"user"|"assistant","content":"..."}].
+    #[arg(long, value_name = "PATH")]
+    history: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    output_format: OutputFormat,
+}
+
+/// Top-level stream-json output context; nested runs get `None`.
+struct TopLevel<'a> {
+    emitter: &'a Emitter,
+    base_url: String,
+    stream: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +83,29 @@ struct InitialRun {
     tool_mode: ToolMode,
     /// Per-fork model override (NomadWorks agent roles).
     model_override: Option<String>,
+    /// Fork agent name when the run starts as a single forked agent.
+    agent: Option<String>,
+}
+
+/// Apply `--agent`: `/NAME <prompt>` unless the prompt already starts with `/`.
+/// Returns the effective prompt and an optional stderr warning.
+fn apply_agent_flag(prompt: &str, agent: Option<&str>, skills: &[Skill]) -> (String, Option<String>) {
+    let Some(agent) = agent.map(str::trim).filter(|a| !a.is_empty()) else {
+        return (prompt.to_string(), None);
+    };
+    if prompt.trim_start().starts_with('/') {
+        return (
+            prompt.to_string(),
+            Some(format!("--agent {agent} ignored: prompt already starts with '/'")),
+        );
+    }
+    match skill_by_name(skills, agent) {
+        Some(skill) if catalog::is_agent(skill) => (format!("/{agent} {prompt}"), None),
+        _ => (
+            prompt.to_string(),
+            Some(format!("unknown agent `{agent}` — running without an agent")),
+        ),
+    }
 }
 
 fn tool_specs(mode: ToolMode) -> Option<Value> {
@@ -223,6 +290,7 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
                     messages,
                     tool_mode: ToolMode::Base,
                     model_override: skill.model.clone(),
+                    agent: Some(skill.name.clone()),
                 };
             }
         }
@@ -241,6 +309,7 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
             messages,
             tool_mode,
             model_override: None,
+            agent: None,
         };
     }
 
@@ -254,6 +323,7 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
         messages,
         tool_mode: ToolMode::All,
         model_override: None,
+        agent: None,
     }
 }
 
@@ -276,6 +346,40 @@ async fn probe_base(base_url: &str, api_key: &str) -> bool {
     {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
+    }
+}
+
+async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(api_key)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("GET {url}: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}"));
+    }
+    let body: Value =
+        serde_json::from_str(&text).map_err(|e| format!("GET {url}: invalid JSON: {e}"))?;
+    catalog::parse_model_list(&body).map_err(|e| format!("GET {url}: {e}"))
+}
+
+/// List models from the primary base, then the fallback. Returns (base used, result).
+async fn list_models(cfg: &LlmConfig) -> (String, Result<Vec<String>, String>) {
+    let primary = fetch_models(&cfg.base_url, &cfg.api_key).await;
+    if primary.is_ok() || cfg.fallback_base_url == cfg.base_url {
+        return (cfg.base_url.clone(), primary);
+    }
+    match fetch_models(&cfg.fallback_base_url, &cfg.api_key).await {
+        Ok(list) => (cfg.fallback_base_url.clone(), Ok(list)),
+        Err(fallback_err) => (
+            cfg.base_url.clone(),
+            Err(format!("{}; fallback: {fallback_err}", primary.unwrap_err())),
+        ),
     }
 }
 
@@ -309,6 +413,7 @@ async fn run_agent_loop(
     messages: &mut Vec<Value>,
     skills: &[Skill],
     tool_mode: ToolMode,
+    top: Option<&TopLevel<'_>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let tools = tool_specs(tool_mode);
 
@@ -322,19 +427,49 @@ async fn run_agent_loop(
             request["tools"] = tools.clone();
         }
 
-        let response: Value = client
-            .chat()
-            .create_byot(request)
-            .await
-            .map_err(|err| format_api_error(err))?;
+        // stream-json top level: try SSE streaming first (deltas emitted live).
+        let mut streamed: Option<Value> = None;
+        if let Some(top) = top.filter(|t| t.stream) {
+            match stream::stream_chat(&top.base_url, &cfg.api_key, &request, top.emitter).await {
+                Ok(message) => streamed = Some(message),
+                Err(StreamError::BeforeData(err)) => {
+                    eprintln!("stream: {err} — falling back to non-streaming request");
+                }
+                Err(StreamError::Mid(err)) => {
+                    return Err(format!("stream interrupted: {err}").into());
+                }
+            }
+        }
 
-        let choice = response["choices"]
-            .as_array()
-            .and_then(|a| a.first())
-            .ok_or("no choices in response")?;
-
-        let message = &choice["message"];
+        let was_streamed = streamed.is_some();
+        let message = match streamed {
+            Some(message) => message,
+            None => {
+                let response: Value = client
+                    .chat()
+                    .create_byot(request)
+                    .await
+                    .map_err(|err| format_api_error(err))?;
+                response["choices"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .ok_or("no choices in response")?["message"]
+                    .clone()
+            }
+        };
+        let message = &message;
         let text = assistant_text(message);
+
+        if let Some(top) = top {
+            // Non-streamed step: emit the whole step text. Streamed step: content deltas are
+            // already out; emit the reasoning-fallback text only if no content streamed.
+            let streamed_content = message["content"]
+                .as_str()
+                .is_some_and(|c| !c.trim().is_empty());
+            if !was_streamed || !streamed_content {
+                top.emitter.delta(&text);
+            }
+        }
         let mut assistant = json!({
             "role": "assistant",
             "content": if text.is_empty() {
@@ -368,6 +503,17 @@ async fn run_agent_loop(
             let fn_args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
             let call_id = call["id"].as_str().unwrap_or("");
 
+            if let Some(top) = top {
+                let input = serde_json::from_str::<Value>(args_str)
+                    .unwrap_or_else(|_| Value::String(args_str.to_string()));
+                top.emitter.emit(json!({
+                    "type": "tool",
+                    "id": call_id,
+                    "name": fn_name,
+                    "input": input,
+                }));
+            }
+
             let result = match fn_name {
                 "Read" => execute_read(&fn_args),
                 "Write" => execute_write(&fn_args),
@@ -393,6 +539,16 @@ async fn run_agent_loop(
                     }
                 }
             };
+
+            if let Some(top) = top {
+                top.emitter.emit(json!({
+                    "type": "tool_result",
+                    "id": call_id,
+                    "name": fn_name,
+                    "output": stream::truncate_chars(&result, 2000),
+                    "isError": stream::is_error_output(&result),
+                }));
+            }
 
             messages.push(json!({
                 "role": "tool",
@@ -450,6 +606,7 @@ async fn handle_nomadflow_run(
         &mut fork_messages,
         skills,
         ToolMode::Base,
+        None,
     ))
     .await?;
 
@@ -498,6 +655,7 @@ async fn handle_skill(
             &mut fork_messages,
             skills,
             ToolMode::Base,
+            None,
         ))
         .await?;
         return Ok(format!(
@@ -523,17 +681,19 @@ for on-machine use.\n\n{text}"
     Box::from(text)
 }
 
+fn stream_enabled() -> bool {
+    env::var("LLM_STREAM").map(|v| v.trim() != "0").unwrap_or(true)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+
     let args = Args::parse();
     let cfg = LlmConfig::from_env();
-    let (client, _active_base) = resolve_client(&cfg).await;
 
     let skills = discover_skills();
-    let fork_agents = skills
-        .iter()
-        .filter(|s| s.context.as_deref() == Some("fork"))
-        .count();
+    let fork_agents = skills.iter().filter(|s| catalog::is_agent(s)).count();
     eprintln!(
         "skills: {} loaded from {} root(s) ({} fork agents, {} NomadWorks root(s))",
         skills.len(),
@@ -542,21 +702,156 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agents::collect_nomadworks_roots().len()
     );
 
-    let initial = build_initial_run(&args.prompt, &skills);
-    let run_cfg = match &initial.model_override {
-        Some(model) => {
-            eprintln!("model: {model} (fork override)");
-            cfg.with_model(model)
+    if args.catalog {
+        let (base, listed) = list_models(&cfg).await;
+        if let Err(err) = &listed {
+            eprintln!("catalog: model listing failed: {err}");
         }
-        None => {
-            eprintln!("model: {}", cfg.model);
-            cfg
+        let catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed);
+        println!("{catalog}");
+        return ExitCode::SUCCESS;
+    }
+
+    let stream_mode = args.output_format == OutputFormat::StreamJson;
+    let emitter = Emitter;
+    let fail = |code: u8, message: String| {
+        eprintln!("Error: {message}");
+        if stream_mode {
+            emitter.emit(json!({ "type": "error", "message": message }));
         }
+        ExitCode::from(code)
+    };
+
+    let history = match &args.history {
+        None => Vec::new(),
+        Some(path) => match fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --history {}: {e}", path.display()))
+            .and_then(|text| inputs::parse_history(&text))
+        {
+            Ok(history) => history,
+            Err(err) => return fail(2, err),
+        },
+    };
+
+    let prompt = args.prompt.clone().unwrap_or_default();
+    let (prompt, agent_warning) = apply_agent_flag(&prompt, args.agent.as_deref(), &skills);
+    if let Some(warning) = agent_warning {
+        eprintln!("warning: {warning}");
+    }
+
+    let (client, active_base) = resolve_client(&cfg).await;
+
+    let initial = build_initial_run(&prompt, &skills);
+    let run_cfg = if let Some(model) = &args.model {
+        eprintln!("model: {model} (--model)");
+        cfg.with_model(model)
+    } else if let Some(model) = &initial.model_override {
+        eprintln!("model: {model} (fork override)");
+        cfg.with_model(model)
+    } else {
+        eprintln!("model: {}", cfg.model);
+        cfg
     };
 
     let mut messages = initial.messages;
-    let final_text =
-        run_agent_loop(&client, &run_cfg, &mut messages, &skills, initial.tool_mode).await?;
-    println!("{final_text}");
-    Ok(())
+    if !args.images.is_empty() {
+        let loaded = inputs::load_images(&args.images);
+        inputs::attach_images_to_messages(&mut messages, &loaded, &mut |w| {
+            eprintln!("warning: {w}")
+        });
+    }
+    inputs::insert_history(&mut messages, history);
+
+    let top = stream_mode.then(|| TopLevel {
+        emitter: &emitter,
+        base_url: active_base.clone(),
+        stream: stream_enabled(),
+    });
+    if stream_mode {
+        emitter.emit(json!({
+            "type": "meta",
+            "model": run_cfg.model,
+            "agent": initial.agent,
+            "baseUrl": active_base,
+        }));
+    }
+
+    match run_agent_loop(
+        &client,
+        &run_cfg,
+        &mut messages,
+        &skills,
+        initial.tool_mode,
+        top.as_ref(),
+    )
+    .await
+    {
+        Ok(final_text) => {
+            if stream_mode {
+                emitter.emit(json!({ "type": "final", "text": final_text, "model": run_cfg.model }));
+            } else {
+                println!("{final_text}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            if stream_mode {
+                fail(1, err.to_string())
+            } else {
+                // Same stderr shape as the previous `main() -> Result` (Debug of the error).
+                eprintln!("Error: {err:?}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(name: &str, fork: bool) -> Skill {
+        Skill {
+            name: name.into(),
+            description: String::new(),
+            body: "role body".into(),
+            directory: PathBuf::from("/tmp"),
+            context: fork.then(|| "fork".to_string()),
+            policies: Vec::new(),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn agent_flag_prefixes_prompt() {
+        let skills = vec![skill("pma", true), skill("plain", false)];
+        assert_eq!(
+            apply_agent_flag("do it", Some("pma"), &skills),
+            ("/pma do it".to_string(), None)
+        );
+        let (p, w) = apply_agent_flag("/plain x", Some("pma"), &skills);
+        assert_eq!(p, "/plain x");
+        assert!(w.is_some());
+        let (p, w) = apply_agent_flag("x", Some("nope"), &skills);
+        assert_eq!(p, "x");
+        assert!(w.unwrap().contains("unknown agent"));
+        let (p, w) = apply_agent_flag("x", Some("plain"), &skills);
+        assert_eq!(p, "x");
+        assert!(w.is_some());
+        assert_eq!(apply_agent_flag("x", None, &skills), ("x".to_string(), None));
+    }
+
+    #[test]
+    fn args_require_prompt_unless_catalog() {
+        assert!(Args::try_parse_from(["prog"]).is_err());
+        assert!(Args::try_parse_from(["prog", "--catalog"]).is_ok());
+        let a = Args::try_parse_from([
+            "prog", "-p", "hi", "--image", "a.png", "--image", "b.jpg", "--output-format",
+            "stream-json", "--model", "m", "--agent", "pma",
+        ])
+        .unwrap();
+        assert_eq!(a.images.len(), 2);
+        assert_eq!(a.output_format, OutputFormat::StreamJson);
+        assert_eq!(a.prompt.as_deref(), Some("hi"));
+    }
 }
