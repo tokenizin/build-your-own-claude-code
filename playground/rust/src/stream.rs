@@ -174,8 +174,16 @@ impl StreamAccumulator {
 pub enum StreamError {
     /// Failed before any response data arrived — caller may fall back to non-streaming.
     BeforeData(String),
+    /// The endpoint refused the request (auth, credits, rate limit): a non-streaming
+    /// retry would be refused too, so the caller should stop.
+    Rejected(String),
     /// Failed after data arrived (deltas may already be emitted).
     Mid(String),
+}
+
+/// Statuses where retrying without streaming can't help (401/402/403/429).
+pub fn is_rejection(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403 | 429)
 }
 
 /// POST `{base}/chat/completions` with `stream: true`, emitting content deltas as they arrive.
@@ -204,10 +212,12 @@ pub async fn stream_chat(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(StreamError::BeforeData(format!(
-            "stream request failed: {status} {}",
-            truncate_chars(&text, 300)
-        )));
+        let message = format!("{status} {}", truncate_chars(&text, 300));
+        return Err(if is_rejection(status.as_u16()) {
+            StreamError::Rejected(message)
+        } else {
+            StreamError::BeforeData(format!("stream request failed: {message}"))
+        });
     }
 
     let mut lines = SseLineBuffer::default();
@@ -249,6 +259,16 @@ pub async fn stream_chat(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rejections_do_not_fall_back() {
+        assert!(is_rejection(429));
+        assert!(is_rejection(401));
+        assert!(!is_rejection(400));
+        assert!(!is_rejection(404));
+        assert!(!is_rejection(500));
+    }
+
     use super::*;
 
     #[test]

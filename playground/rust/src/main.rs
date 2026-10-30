@@ -327,11 +327,25 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
     }
 }
 
+/// How long async-openai may keep retrying 429/5xx responses. Its default is
+/// 15 minutes, and Ollama's "credits used up" 429 looks like a rate limit to
+/// it, so a run sat silent for 15 minutes before failing.
+fn retry_window() -> std::time::Duration {
+    let secs = env::var("LLM_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(20);
+    std::time::Duration::from_secs(secs)
+}
+
 fn make_client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
     let config = OpenAIConfig::new()
         .with_api_base(base_url)
         .with_api_key(api_key);
-    Client::with_config(config)
+    let backoff = backoff::ExponentialBackoffBuilder::new()
+        .with_max_elapsed_time(Some(retry_window()))
+        .build();
+    Client::with_config(config).with_backoff(backoff)
 }
 
 async fn probe_base(base_url: &str, api_key: &str) -> bool {
@@ -434,6 +448,9 @@ async fn run_agent_loop(
                 Ok(message) => streamed = Some(message),
                 Err(StreamError::BeforeData(err)) => {
                     eprintln!("stream: {err} — falling back to non-streaming request");
+                }
+                Err(StreamError::Rejected(err)) => {
+                    return Err(format_api_error(err));
                 }
                 Err(StreamError::Mid(err)) => {
                     return Err(format!("stream interrupted: {err}").into());
@@ -669,8 +686,26 @@ async fn handle_skill(
     Ok(body)
 }
 
+/// Credit/quota exhaustion (Ollama cloud: "usage credits … monthly max reached").
+fn is_quota_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["usage credits", "monthly max", "insufficient_quota", "quota", "add usage credits", "billing"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
 fn format_api_error(err: impl std::fmt::Display) -> Box<dyn std::error::Error> {
     let text = err.to_string();
+    if is_quota_error(&text) {
+        return Box::from(format!(
+            "The model endpoint has no credits left for this model (cloud models such as \
+*-cloud use ollama.com credits). Pick a local model in the model picker, or raise the \
+limit at https://ollama.com/settings.\n\n{text}"
+        ));
+    }
+    if text.contains("429") {
+        return Box::from(format!("The model endpoint is rate limiting requests; try again shortly.\n\n{text}"));
+    }
     if text.contains("403") || text.contains("error sending request") {
         return Box::from(format!(
             "Ollama endpoint rejected the request. If using https://ollama.tokenizin.com, \
@@ -808,6 +843,17 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn quota_errors_get_a_plain_message() {
+        let raw = r#"429 Too Many Requests {"error":{"message":"usage credits auto reload monthly max reached, increase your monthly max or add usage credits at https://ollama.com/settings","type":"api_error"}}"#;
+        assert!(is_quota_error(raw));
+        let msg = format_api_error(raw).to_string();
+        assert!(msg.starts_with("The model endpoint has no credits left"));
+        assert!(!is_quota_error("429 Too Many Requests slow down"));
+        assert!(format_api_error("429 Too Many Requests slow down").to_string().contains("rate limiting"));
+    }
+
     use super::*;
 
     fn skill(name: &str, fork: bool) -> Skill {

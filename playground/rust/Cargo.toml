@@ -12,6 +12,8 @@ serde_json = "1.0.149"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 base64 = "0.22"
+# Same version async-openai uses; lets us bound its 429 retries.
+backoff = "0.4"
 
 [profile.release]
 lto = true
