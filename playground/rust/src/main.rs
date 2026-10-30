@@ -505,11 +505,21 @@ async fn run_agent_loop(
             },
         });
 
-        let tool_calls = message
+        let mut tool_calls = message
             .get("tool_calls")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+
+        // The model wrote its tool call into the text (common for local models,
+        // and always when the call was cut off): run it as a real call.
+        if tool_calls.is_empty() && tools.is_some() {
+            if let Some((before, calls)) = delegation::extract_text_tool_calls(&text) {
+                eprintln!("tools: recovered {} tool call(s) written as text", calls.len());
+                assistant["content"] = if before.is_empty() { Value::Null } else { Value::String(before) };
+                tool_calls = calls;
+            }
+        }
 
         if !tool_calls.is_empty() {
             assistant["tool_calls"] = Value::Array(tool_calls.clone());
@@ -604,7 +614,11 @@ async fn handle_task(
     let requested = args["subagent_type"].as_str().unwrap_or("").trim();
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
     if requested.is_empty() || prompt.is_empty() {
-        return "Error: Task requires subagent_type and prompt.".into();
+        let names: Vec<&str> = agents.iter().map(|s| s.name.as_str()).collect();
+        return format!(
+            "Error: Task requires subagent_type (one of: {}) and prompt.",
+            names.join(", ")
+        );
     }
     let Some(skill) = delegation::find_agent(&agents, requested) else {
         let names: Vec<&str> = agents.iter().map(|s| s.name.as_str()).collect();

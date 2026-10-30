@@ -125,9 +125,9 @@ pub fn apply_aliases(tool: &str, args: Value) -> Value {
         "Bash" => &[("command", &["cmd", "script", "shell"])],
         "Skill" => &[("name", &["skill", "skill_name"]), ("args", &["arguments", "input"])],
         "Task" => &[
-            ("subagent_type", &["subagentType", "agent", "subagent", "agent_type", "role"]),
-            ("prompt", &["instructions", "task", "message", "input"]),
-            ("description", &["title", "summary"]),
+            ("subagent_type", &["subagentType", "agent", "subagent", "agent_type", "role", "subagent_name"]),
+            ("prompt", &["instructions", "task", "message", "input", "subagent_prompt", "subagent_instructions"]),
+            ("description", &["title", "summary", "subagent_description"]),
             ("task_id", &["taskId", "session_id", "sessionId"]),
         ],
         "nomadflow_run_workflow" => &[
@@ -183,6 +183,101 @@ pub fn unknown_tool_message(name: &str, tools: Option<&Value>) -> String {
     } else {
         format!("Unknown tool: {name}. Use one of: {}.", names.join(", "))
     }
+}
+
+// ---------------------------------------------------------------- tool calls written as text
+
+/// Some local models write a tool call into the reply text instead of the
+/// `tool_calls` field — always when the call is cut off by the token limit,
+/// since the endpoint can't parse an unfinished call. Recognized:
+///
+/// - XML (Qwen3-Coder / Nemotron): `<function=NAME><parameter=KEY>value</parameter>…</function>`,
+///   closing tags optional
+/// - Hermes: `<tool_call>{"name": …, "arguments": {…}}</tool_call>`
+/// - bare `<parameter=subagent_…>` blocks with no function tag: a Task call
+///
+/// Returns the text before the first call and the calls in OpenAI shape.
+pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
+    let first = ["<tool_call>", "<function=", "<parameter="]
+        .iter()
+        .filter_map(|tag| text.find(tag))
+        .min()?;
+    let before = text[..first].trim_end().to_string();
+    let rest = &text[first..];
+
+    let mut calls = Vec::new();
+    // Hermes JSON blocks.
+    for chunk in rest.split("<tool_call>").skip(1) {
+        let body = chunk.split("</tool_call>").next().unwrap_or("").trim();
+        if !body.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(body) {
+            if let Some(name) = v["name"].as_str() {
+                let args = if v["arguments"].is_null() { v["parameters"].clone() } else { v["arguments"].clone() };
+                calls.push(openai_call(name, parse_arguments(&args), calls.len()));
+            }
+        }
+    }
+    if calls.is_empty() {
+        // XML blocks, one per <function=…>; parameters before any function tag mean Task.
+        let mut pieces: Vec<(Option<String>, &str)> = Vec::new();
+        let mut cursor = rest;
+        if !cursor.starts_with("<function=") && !cursor.contains("<function=") {
+            pieces.push((None, cursor));
+        } else {
+            while let Some(start) = cursor.find("<function=") {
+                let after = &cursor[start + "<function=".len()..];
+                let name_end = after.find('>').unwrap_or(after.len());
+                let name = after[..name_end].trim().to_string();
+                let body_start = (name_end + 1).min(after.len());
+                let body = &after[body_start..];
+                let body_end = body.find("<function=").unwrap_or(body.len());
+                pieces.push((Some(name), &body[..body_end]));
+                cursor = &body[body_end..];
+            }
+        }
+        for (name, body) in pieces {
+            let params = xml_parameters(body);
+            if params.is_empty() {
+                continue;
+            }
+            let name = match name {
+                Some(n) if !n.is_empty() => n,
+                _ if params.keys().any(|k| k.contains("subagent") || k == "prompt") => "Task".to_string(),
+                _ => continue,
+            };
+            calls.push(openai_call(&name, Value::Object(params), calls.len()));
+        }
+    }
+    if calls.is_empty() { None } else { Some((before, calls)) }
+}
+
+fn xml_parameters(body: &str) -> Map<String, Value> {
+    let mut params = Map::new();
+    for chunk in body.split("<parameter=").skip(1) {
+        let Some(key_end) = chunk.find('>') else { continue };
+        let key = chunk[..key_end].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = &chunk[key_end + 1..];
+        for closer in ["</parameter>", "</function>", "</tool_call>"] {
+            if let Some(pos) = value.find(closer) {
+                value = &value[..pos];
+            }
+        }
+        params.insert(key.to_string(), Value::String(value.trim().to_string()));
+    }
+    params
+}
+
+fn openai_call(name: &str, args: Value, index: usize) -> Value {
+    json!({
+        "id": format!("text_call_{index}"),
+        "type": "function",
+        "function": { "name": name, "arguments": args.to_string() }
+    })
 }
 
 // ---------------------------------------------------------------- task memory
@@ -312,6 +407,35 @@ mod tests {
         let spec = task_tool_spec(&agents);
         assert_eq!(spec["function"]["name"], "Task");
         assert_eq!(spec["function"]["parameters"]["properties"]["subagent_type"]["enum"], json!(["business_analyst", "tech-lead"]));
+    }
+
+    #[test]
+    fn text_tool_calls_xml_hermes_and_truncated() {
+        // Qwen3-Coder / Nemotron XML, complete.
+        let xml = "Delegating now.\n<tool_call>\n<function=Task>\n<parameter=subagent_type>\nba\n</parameter>\n<parameter=prompt>\nWrite the spec\n</parameter>\n</function>\n</tool_call>";
+        let (before, calls) = extract_text_tool_calls(xml).unwrap();
+        assert_eq!(before, "Delegating now.");
+        assert_eq!(calls[0]["function"]["name"], "Task");
+        let args = parse_arguments(&calls[0]["function"]["arguments"]);
+        assert_eq!(args["subagent_type"], "ba");
+        assert_eq!(args["prompt"], "Write the spec");
+
+        // What the PMA produced: bare parameters, invented keys, cut off mid-prompt.
+        let cut = "Audit module\n<parameter=subagent_description>\nAnalyze the module\n<parameter=subagent_prompt>\nCreate a 5-page report covering:\n\nModule";
+        let (_, calls) = extract_text_tool_calls(cut).unwrap();
+        assert_eq!(calls[0]["function"]["name"], "Task");
+        let args = apply_aliases("Task", parse_arguments(&calls[0]["function"]["arguments"]));
+        assert_eq!(args["description"], "Analyze the module");
+        assert!(args["prompt"].as_str().unwrap().starts_with("Create a 5-page report"));
+
+        // Hermes JSON.
+        let hermes = r#"<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>"#;
+        let (_, calls) = extract_text_tool_calls(hermes).unwrap();
+        assert_eq!(calls[0]["function"]["name"], "bash");
+
+        // Plain text is left alone.
+        assert!(extract_text_tool_calls("Here is the summary. No tools needed.").is_none());
+        assert!(extract_text_tool_calls("<parameter=x>y").is_none());
     }
 
     #[test]

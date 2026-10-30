@@ -56,10 +56,10 @@ impl LlmConfig {
         );
         let max_tokens = env_first(
             &["OLLAMA_MAX_TOKENS", "LLM_MAX_TOKENS", "OPENROUTER_MAX_TOKENS"],
-            "2048",
+            "8192",
         )
         .parse()
-        .unwrap_or(2048);
+        .unwrap_or(8192);
 
         Self {
             base_url: normalize_v1_base(&base_url),
