@@ -2,6 +2,7 @@ mod agents;
 mod catalog;
 mod config;
 mod delegation;
+mod file_lease;
 mod inputs;
 mod nomad_tools;
 mod opencode_config;
@@ -549,9 +550,12 @@ async fn run_agent_loop(
                 }));
             }
 
+            let file_path = fn_args["file_path"].as_str().unwrap_or("");
             let result = match fn_name {
-                "Read" => execute_read(&fn_args),
-                "Write" => execute_write(&fn_args),
+                "Read" => file_lease::with_lease(file_path, call_id, || execute_read(&fn_args))
+                    .unwrap_or_else(|err| format!("Error: {err}")),
+                "Write" => file_lease::with_lease(file_path, call_id, || execute_write(&fn_args))
+                    .unwrap_or_else(|err| format!("Error: {err}")),
                 "Bash" => execute_bash(&fn_args),
                 "Skill" => {
                     Box::pin(handle_skill(
