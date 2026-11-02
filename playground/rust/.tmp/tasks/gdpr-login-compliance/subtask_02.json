@@ -1,0 +1,36 @@
+{
+  "id": "gdpr-login-compliance-02",
+  "seq": "02",
+  "title": "GDPR Implementation Plan",
+  "status": "completed",
+  "depends_on": [
+    "01"
+  ],
+  "parallel": false,
+  "suggested_agent": "developer",
+  "context_files": [
+    "tasks/discussions/DISCUSSION-001-gdpr-compliance-review.md",
+    "docs/features/auth/GDPR_SPECIFICATION.md",
+    ".tmp/tasks/gdpr-login-compliance/subtask_01.json"
+  ],
+  "reference_files": [
+    "docs/features/auth/SPECIFICATION.md",
+    "src/app/api/auth/sessions/route.ts",
+    "src/lib/auth.ts",
+    "src/app/api/user/data-deletion/route.ts"
+  ],
+  "acceptance_criteria": [
+    "docs/features/auth/GDPR_IMPLEMENTATION_PLAN.md exists",
+    "Plan covers /auth/forgive endpoint implementation",
+    "Plan covers encryption at rest (AES-256-GCM, Bcrypt/Argon2 cost \u2265 12)",
+    "Plan covers consent toggle UI and backend",
+    "Plan covers data minimization schema changes",
+    "Plan has phased approach: foundation \u2192 core \u2192 logic \u2192 ui \u2192 polish \u2192 qa"
+  ],
+  "deliverables": [
+    "docs/features/auth/GDPR_IMPLEMENTATION_PLAN.md"
+  ],
+  "started_at": null,
+  "completed_at": "2025-10-31T15:55:00Z",
+  "completion_summary": "Created docs/features/auth/GDPR_IMPLEMENTATION_PLAN.md with phased rollout plan for /auth/forgive, encryption, consent toggles, and data minimization."
+}

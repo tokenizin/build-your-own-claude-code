@@ -1,0 +1,21 @@
+{
+  "active": {
+    "playground-14984": {
+      "agent": "playground",
+      "appendedMessageIDs": [],
+      "filePath": "tasks/discussions/DISCUSSION-001-gdpr-compliance-review.md",
+      "id": "DISCUSSION-001",
+      "status": "active",
+      "title": "GDPR compliance review"
+    },
+    "playground-19949": {
+      "agent": "playground",
+      "appendedMessageIDs": [],
+      "filePath": "tasks/discussions/DISCUSSION-001-gdpr-compliance-review.md",
+      "id": "DISCUSSION-001",
+      "status": "active",
+      "title": "GDPR compliance review"
+    }
+  },
+  "version": 1
+}

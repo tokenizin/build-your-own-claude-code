@@ -1,0 +1,36 @@
+{
+  "id": "gdpr-login-compliance-03",
+  "seq": "03",
+  "title": "GDPR Test Plan",
+  "status": "completed",
+  "depends_on": [
+    "01",
+    "02"
+  ],
+  "parallel": false,
+  "suggested_agent": "qa_engineer",
+  "context_files": [
+    "tasks/discussions/DISCUSSION-001-gdpr-compliance-review.md",
+    "docs/features/auth/GDPR_SPECIFICATION.md",
+    "docs/features/auth/GDPR_IMPLEMENTATION_PLAN.md"
+  ],
+  "reference_files": [
+    "tests/e2e/tokidapp-api.spec.ts",
+    "src/app/api/auth/sessions/route.ts",
+    "src/lib/auth.ts"
+  ],
+  "acceptance_criteria": [
+    "docs/features/auth/GDPR_TEST_PLAN.md exists",
+    "Test plan covers data minimization (form inspection, API payload tests)",
+    "Test plan covers encryption verification (DB row inspection, TLS scan)",
+    "Test plan covers consent flow tests (UI E2E, backend seed validation)",
+    "Test plan covers right-to-be-forgotten E2E tests",
+    "Test plan has pass/fail criteria and verification commands"
+  ],
+  "deliverables": [
+    "docs/features/auth/GDPR_TEST_PLAN.md"
+  ],
+  "started_at": null,
+  "completed_at": "2025-10-31T15:55:00Z",
+  "completion_summary": "Created docs/features/auth/GDPR_TEST_PLAN.md with test cases for data minimization, encryption, consent flows, and right-to-be-forgotten."
+}

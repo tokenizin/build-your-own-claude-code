@@ -1,0 +1,25 @@
+{
+  "id": "gdpr-login-compliance",
+  "name": "GDPR Login Compliance",
+  "status": "active",
+  "objective": "Implement GDPR-compliant login feature with data minimization, encryption, consent flows, and right-to-be-forgotten",
+  "context_files": [
+    "tasks/discussions/DISCUSSION-001-gdpr-compliance-review.md",
+    "docs/features/auth/GDPR_SPECIFICATION.md"
+  ],
+  "reference_files": [
+    "docs/features/auth/SPECIFICATION.md",
+    "src/app/api/auth/sessions/route.ts",
+    "src/lib/auth.ts"
+  ],
+  "exit_criteria": [
+    "GDPR_DATA_ARCHITECTURE.md written",
+    "GDPR_IMPLEMENTATION_PLAN.md written",
+    "GDPR_TEST_PLAN.md written",
+    "All deliverables reviewed and linked from GDPR_SPECIFICATION.md"
+  ],
+  "subtask_count": 3,
+  "completed_count": 4,
+  "created_at": "2025-10-31T15:00:00Z",
+  "completed_at": null
+}
