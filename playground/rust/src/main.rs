@@ -477,13 +477,23 @@ async fn run_agent_loop(
                     .create_byot(request)
                     .await
                     .map_err(|err| format_api_error(err))?;
-                response["choices"]
+                let mut message = response["choices"]
                     .as_array()
                     .and_then(|a| a.first())
                     .ok_or("no choices in response")?["message"]
-                    .clone()
+                    .clone();
+                if response["usage"].is_object() {
+                    message["usage"] = response["usage"].clone();
+                }
+                message
             }
         };
+        // Token usage for this step, for CodeNomad's context meter.
+        if let Some(top) = top {
+            if let Some(event) = stream::usage_event(&message["usage"], &cfg.model) {
+                top.emitter.emit(event);
+            }
+        }
         let message = &message;
         let text = assistant_text(message);
 

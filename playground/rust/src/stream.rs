@@ -6,6 +6,24 @@ use std::io::Write;
 /// Writes one JSON object per line to stdout, flushed after each line.
 pub struct Emitter;
 
+/// `{"type":"usage"}` event from an OpenAI-style `usage` object, or None when
+/// the endpoint reported nothing. `input` excludes cached prompt tokens, which
+/// go in `cacheRead` (OpenCode's convention, so the context meter adds them once).
+pub fn usage_event(usage: &Value, model: &str) -> Option<Value> {
+    let prompt = usage["prompt_tokens"].as_u64()?;
+    let output = usage["completion_tokens"].as_u64().unwrap_or(0);
+    let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0).min(prompt);
+    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
+    Some(json!({
+        "type": "usage",
+        "model": model,
+        "input": prompt - cached,
+        "output": output,
+        "reasoning": reasoning,
+        "cacheRead": cached,
+    }))
+}
+
 impl Emitter {
     pub fn emit(&self, event: Value) {
         let mut out = std::io::stdout().lock();
@@ -80,6 +98,8 @@ pub enum SseEvent {
 #[derive(Default)]
 pub struct StreamAccumulator {
     content: String,
+    /// `usage` from the final chunk (sent when `stream_options.include_usage` is honoured).
+    usage: Option<Value>,
     reasoning: String,
     tool_calls: Vec<PartialToolCall>,
     pub done: bool,
@@ -106,6 +126,9 @@ impl StreamAccumulator {
                 .map(str::to_string)
                 .unwrap_or_else(|| err.to_string());
             return Err(msg);
+        }
+        if chunk["usage"].is_object() {
+            self.usage = Some(chunk["usage"].clone());
         }
         let delta = &chunk["choices"][0]["delta"];
         let text = delta["content"].as_str().unwrap_or("").to_string();
@@ -171,6 +194,9 @@ impl StreamAccumulator {
         if !calls.is_empty() {
             message["tool_calls"] = Value::Array(calls);
         }
+        if let Some(usage) = self.usage {
+            message["usage"] = usage;
+        }
         message
     }
 }
@@ -201,6 +227,9 @@ pub async fn stream_chat(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut body = request.clone();
     body["stream"] = Value::Bool(true);
+    // Ask for token usage in the last chunk. A server that rejects this answers
+    // 400 before any data, and the caller retries without streaming.
+    body["stream_options"] = json!({ "include_usage": true });
     let payload = serde_json::to_vec(&body).map_err(|e| StreamError::BeforeData(e.to_string()))?;
 
     let client = reqwest::Client::new();
@@ -259,6 +288,32 @@ pub async fn stream_chat(
         return Err(StreamError::BeforeData("empty stream response".into()));
     }
     Ok(acc.into_message())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn final_chunk_usage_reaches_the_message() {
+        let mut acc = StreamAccumulator::default();
+        acc.feed_line(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        acc.feed_line(r#"data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":200}}}"#).unwrap();
+        let message = acc.into_message();
+        assert_eq!(message["content"], "hi");
+        let event = usage_event(&message["usage"], "qwen3:8b").unwrap();
+        assert_eq!(event["input"], 1000);
+        assert_eq!(event["cacheRead"], 200);
+        assert_eq!(event["output"], 30);
+        assert_eq!(event["model"], "qwen3:8b");
+    }
+
+    #[test]
+    fn no_usage_no_event() {
+        assert!(usage_event(&Value::Null, "m").is_none());
+        let acc = StreamAccumulator::default();
+        assert!(acc.into_message().get("usage").is_none());
+    }
 }
 
 #[cfg(test)]
