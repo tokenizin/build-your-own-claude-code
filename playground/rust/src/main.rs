@@ -444,7 +444,8 @@ async fn run_agent_loop(
     for _ in 0..40 {
         let mut request = json!({
             "model": cfg.model,
-            "messages": messages,
+            // One system message, first: strict chat templates reject any other layout.
+            "messages": inputs::merge_system_messages(messages),
             "max_tokens": cfg.max_tokens,
         });
         if let Some(tools) = &tools {

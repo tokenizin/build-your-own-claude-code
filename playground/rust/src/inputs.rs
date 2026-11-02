@@ -138,6 +138,69 @@ pub fn insert_history(messages: &mut Vec<Value>, history: Vec<Value>) {
     messages.splice(at..at, history);
 }
 
+/// Text of a message `content` (a string, or OpenAI content parts).
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Messages for a request with every system message merged into one, first.
+///
+/// Strict chat templates (Qwen 3.x, and others) reject a request whose system
+/// message isn't the very first message ("System message must be at the
+/// beginning"). Agent runs build several (policies + role), so merge them;
+/// the model sees the same text in the same order.
+pub fn merge_system_messages(messages: &[Value]) -> Vec<Value> {
+    let system: Vec<String> = messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("system"))
+        .map(|m| content_text(&m["content"]))
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    let rest = messages.iter().filter(|m| m["role"].as_str() != Some("system")).cloned();
+    if system.is_empty() {
+        return rest.collect();
+    }
+    std::iter::once(serde_json::json!({ "role": "system", "content": system.join("\n\n") }))
+        .chain(rest)
+        .collect()
+}
+
+#[cfg(test)]
+mod system_merge_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn several_system_messages_become_one_first() {
+        let merged = merge_system_messages(&[
+            json!({"role":"system","content":"policies"}),
+            json!({"role":"system","content":"role"}),
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"assistant","content":"ok"}),
+            json!({"role":"system","content":[{"type":"text","text":"late note"}]}),
+            json!({"role":"user","content":"next"}),
+        ]);
+        let roles: Vec<_> = merged.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(merged[0]["content"], "policies\n\nrole\n\nlate note");
+        assert_eq!(merged[3]["content"], "next");
+    }
+
+    #[test]
+    fn no_system_messages_unchanged() {
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        assert_eq!(merge_system_messages(&messages), messages);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
