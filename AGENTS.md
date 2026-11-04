@@ -11,6 +11,7 @@
 
 - This repo is the Codecrafters “Build your own Claude Code” course definition (stages + starters); learner solutions live on CodeCrafters, not as a complete checkout here.
 - Local full reference agents live in `playground/rust/` (preferred) and `playground/python/` (parity): Read, Write, Bash, Skill, agent loop, skills extension including `context: fork`.
+- The Rust agent loop for skills runs in this course repo’s `playground/rust/`, not inside NomadWorks — NomadWorks/StarWorld supply skills, agents, and policies; the playground is the runtime.
 - Both `your_program.sh` runners auto-load `playground/.env` (gitignored); inference is OpenAI-compatible Ollama (`OLLAMA_BASE_URL` / fallback / model).
 - Skill discovery walks up from cwd across `.claude/skills`, `.opencode/skills`, and `.agents/skills` (plus optional `*_SKILLS_PATH` extras), first-wins on name collisions, and by default stops at the git root (`SKILLS_SCOPE=all` to include home trees).
 - StarWorld (`/Users/alexshapiro/starworld`) is the source of truth for OpenCode skills, NomadWorks agents/policies, and tasks; this course repo keeps adapters, symlinks, and docs only.
