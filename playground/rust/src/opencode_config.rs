@@ -20,18 +20,23 @@ pub struct OpencodeAdapter {
     pub agent_mode: String,
 }
 
+/// The model an agent runs on when its own model is one this endpoint cannot serve. Chosen by timing the
+/// Product Manager (its real prompt and tools) on every usable model of the endpoint: see
+/// `evidences/TASK-2026-11-05-001/model-benchmark/`.
+pub const DEFAULT_ORCHESTRATOR_MODEL: &str = "qwen2.5:14b";
+
 impl Default for OpencodeAdapter {
     fn default() -> Self {
         let mut model_remap = HashMap::new();
         model_remap.insert(
             "opencode/space-bunny-free".into(),
-            "qwen3.6:latest".into(),
+            DEFAULT_ORCHESTRATOR_MODEL.into(),
         );
         model_remap.insert(
             "openrouter-fallback/auto".into(),
-            "qwen3.6:latest".into(),
+            DEFAULT_ORCHESTRATOR_MODEL.into(),
         );
-        model_remap.insert("opencode-go/mimo-v2.5".into(), "qwen3.6:latest".into());
+        model_remap.insert("opencode-go/mimo-v2.5".into(), DEFAULT_ORCHESTRATOR_MODEL.into());
 
         let mut aliases = HashMap::new();
         for (a, c) in [
@@ -48,7 +53,7 @@ impl Default for OpencodeAdapter {
         }
 
         Self {
-            default_fork_model: "qwen3.6:latest".into(),
+            default_fork_model: DEFAULT_ORCHESTRATOR_MODEL.into(),
             small_model: Some("qwen3:8b".into()),
             model_remap,
             aliases,
@@ -491,7 +496,8 @@ mod tests {
         );
         assert_eq!(
             remap_model(&a, Some("opencode/space-bunny-free")).as_deref(),
-            Some("qwen3.6:latest")
+            Some(DEFAULT_ORCHESTRATOR_MODEL)
         );
+        assert_eq!(DEFAULT_ORCHESTRATOR_MODEL, "qwen2.5:14b");
     }
 }

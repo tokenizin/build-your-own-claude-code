@@ -6,12 +6,12 @@
     "${STARWORLD}/.opencode/opencode.json"
   ],
   "agentMode": "opencode",
-  "defaultForkModel": "qwen3.6:latest",
+  "defaultForkModel": "qwen2.5:14b",
   "smallModel": "qwen3:8b",
   "modelRemap": {
-    "opencode/space-bunny-free": "qwen3.6:latest",
-    "openrouter-fallback/auto": "qwen3.6:latest",
-    "opencode-go/mimo-v2.5": "qwen3.6:latest",
+    "opencode/space-bunny-free": "qwen2.5:14b",
+    "openrouter-fallback/auto": "qwen2.5:14b",
+    "opencode-go/mimo-v2.5": "qwen2.5:14b",
     "ollama/qwen3:8b": "qwen3:8b",
     "ollama/qwen3.6:latest": "qwen3.6:latest",
     "ollama/hermes3:latest": "hermes3:latest",
