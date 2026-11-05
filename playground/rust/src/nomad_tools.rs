@@ -2,8 +2,8 @@
 //!
 //! - `nomadworks_validate` — Phase 0 artifact check or strict CodeMap walk
 //! - `nomadworks_start_discussion` / `stop_discussion` — file + registry (no OpenCode session API)
-//! - `nomadflow_run_workflow` — synchronous nested fork (OpenCode session spawn is P4)
-//! - `nomadflow_prompt_workflow` — explains sync model / follow-up via run_workflow again
+//! - `nomadflow_run_workflow` / `nomadflow_prompt_workflow` — a workflow session of its own (a Workflow
+//!   Runner orchestrating the team) that ends in a handover; handled in main (they run the model)
 
 use serde_json::{Value, json};
 use std::fs;
@@ -100,7 +100,7 @@ pub fn tool_specs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "nomadflow_run_workflow",
-                "description": "Run a task lifecycle synchronously via a forked workflow_runner context (playground shim; not an OpenCode background session).",
+                "description": "Run a task lifecycle in a workflow session of its own: a Workflow Runner orchestrates the team and ends by filing a handover (outcome, requirements, plan, evidence, open issues) that you evaluate. Returns the session_id and the handover. To send the workflow back or continue it, call this (or nomadflow_prompt_workflow) again with the same session_id. Runs to completion before returning.",
                 "parameters": {
                     "type": "object",
                     "required": ["task_path", "instructions"],
@@ -111,7 +111,11 @@ pub fn tool_specs() -> Vec<Value> {
                         },
                         "instructions": {
                             "type": "string",
-                            "description": "Detailed instructions for the workflow runner"
+                            "description": "Detailed instructions for the workflow runner (with session_id: what to fix or do next)"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "A session_id from an earlier run, to continue that workflow with its context instead of starting a new one"
                         }
                     }
                 }
@@ -121,18 +125,18 @@ pub fn tool_specs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "nomadflow_prompt_workflow",
-                "description": "Follow-up to a workflow. Playground runs workflows synchronously — prefer nomadflow_run_workflow again with updated instructions.",
+                "description": "Send a follow-up to a workflow session from nomadflow_run_workflow — e.g. to send its handover back with what to fix. The workflow resumes with its earlier context, works on it, and files a new handover revision.",
                 "parameters": {
                     "type": "object",
                     "required": ["session_id", "text"],
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session id from nomadflow_run_workflow (informational in playground)"
+                            "description": "Session id from nomadflow_run_workflow"
                         },
                         "text": {
                             "type": "string",
-                            "description": "Follow-up message"
+                            "description": "The follow-up: what to fix, change or do next"
                         }
                     }
                 }
@@ -146,9 +150,8 @@ pub fn dispatch(name: &str, args: &Value) -> Option<String> {
         "nomadworks_validate" => Some(execute_validate(args)),
         "nomadworks_start_discussion" => Some(execute_start_discussion(args)),
         "nomadworks_stop_discussion" => Some(execute_stop_discussion()),
-        "nomadflow_prompt_workflow" => Some(execute_prompt_workflow(args)),
-        // run_workflow needs async fork — handled in main
-        "nomadflow_run_workflow" => None,
+        // Workflow sessions run the model, so main handles them.
+        "nomadflow_run_workflow" | "nomadflow_prompt_workflow" => None,
         _ => None,
     }
 }
@@ -474,35 +477,35 @@ fn append_discussion_message(path: &Path, speaker: &str, text: &str) -> Result<(
     write_discussion_md(path, &fm, &next)
 }
 
-fn execute_prompt_workflow(args: &Value) -> String {
-    let session = args["session_id"].as_str().unwrap_or("");
-    let text = args["text"].as_str().unwrap_or("");
-    format!(
-        "FAIL: Playground workflows are synchronous (no OpenCode background session).\n\
-Session '{session}' is not a live runner.\n\
-Call nomadflow_run_workflow again with updated instructions instead.\n\
-Follow-up text was:\n{text}"
-    )
-}
-
-/// User body for a synchronous workflow_runner fork.
-pub fn workflow_fork_prompt(task_path: &str, instructions: &str) -> String {
-    let worktree = resolve_worktree();
-    let abs = if Path::new(task_path).is_absolute() {
-        PathBuf::from(task_path)
-    } else {
-        worktree.join(task_path)
+/// User body for a new workflow session: the task, the instructions, and the duty to hand over.
+pub fn workflow_fork_prompt(worktree: &Path, task_path: &str, instructions: &str, session_id: &str) -> String {
+    // Only the worktree's own files: the task path comes from a model.
+    let task_body = match crate::handover::locate_task_file(worktree, task_path) {
+        Some(file) => fs::read_to_string(&file).unwrap_or_else(|e| format!("[could not read task file {}: {e}]", file.display())),
+        None => format!("[task file `{task_path}` not found in the worktree, or outside it]"),
     };
-    let task_body = fs::read_to_string(&abs).unwrap_or_else(|e| {
-        format!("[could not read task file {}: {e}]", abs.display())
-    });
     format!(
-        "You are the NomadWorks workflow_runner in a forked playground session.\n\
+        "You are the NomadWorks workflow_runner in a workflow session of your own.\n\
+Workflow session id: {session_id}\n\
 Task File: {task_path}\n\n\
 ## Task file contents\n\n{task_body}\n\n\
 ## Instructions\n\n{instructions}\n\n\
-Execute the appropriate lifecycle for this task. Use Read/Write/Bash and \
-nomadworks_validate when needed. When finished, respond with a concise final summary."
+Execute the appropriate lifecycle for this task. Use Read/Write/Bash, nomadworks_validate and the Task tool to orchestrate the team.\n\n\
+## Handover (required)\n\n\
+When the lifecycle is finished — or you cannot continue — call the `handover` tool exactly once. It is what the Product Manager evaluates: \
+the objective, the requirements and how each came out, your plan with owners and results, the evidence (files, commands, test results), \
+open issues and next actions, and whether the work is verified. Rules: outcome `completed` only if every requirement is met, every plan item is done, \
+the work is verified (builds and tests pass) and nothing is left open; otherwise use `partial`, `blocked` or `failed` and say why. \
+A handover that breaks the rules is rejected with the reasons — fix it and call again. Finish with a short closing note after filing it."
+    )
+}
+
+/// The follow-up when the Product Manager sends a workflow back.
+pub fn bounce_prompt(revision: &str, instructions: &str) -> String {
+    let which = if revision.is_empty() { String::new() } else { format!(" (revision {revision})") };
+    format!(
+        "The Product Manager reviewed your handover{which} and sent the workflow back:\n\n{instructions}\n\n\
+Address it, keep the task file up to date, and file a new handover with the `handover` tool when you are done."
     )
 }
 

@@ -3,6 +3,7 @@ mod catalog;
 mod config;
 mod delegation;
 mod file_lease;
+mod handover;
 mod inputs;
 mod nomad_tools;
 mod opencode_config;
@@ -20,6 +21,8 @@ use skills::{
 };
 use std::env;
 use std::fs;
+use std::io::Write as _;
+use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use stream::{Emitter, StreamError};
@@ -131,7 +134,7 @@ fn apply_agent_flag(prompt: &str, agent: Option<&str>, skills: &[Skill]) -> (Str
     }
 }
 
-fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8) -> Option<Value> {
+fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool) -> Option<Value> {
     match mode {
         ToolMode::None => None,
         ToolMode::Base | ToolMode::All => {
@@ -219,6 +222,11 @@ fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8) -> Option<Value> {
 
             // P3: NomadWorks tools available to base + all (including forked agents).
             tools.extend(nomad_tools::tool_specs());
+
+            // A workflow session reports back through its handover.
+            if workflow {
+                tools.push(handover::tool_spec());
+            }
 
             // Delegation to NomadWorks subagents (OpenCode's `task` tool).
             let agents = delegation::task_agents(skills);
@@ -454,6 +462,24 @@ async fn resolve_client(cfg: &LlmConfig) -> (Client<OpenAIConfig>, String) {
 /// Saves a task's conversation after each completed step.
 type Checkpoint<'a> = &'a dyn Fn(&[Value]);
 
+/// A workflow (orchestrator) session: where its handover goes, and the one it filed.
+struct WorkflowScope {
+    session_id: String,
+    task_path: String,
+    worktree: PathBuf,
+    agent: String,
+    filed: Mutex<Option<handover::Filed>>,
+}
+
+/// What a delegated run adds to the plain loop.
+struct RunScope<'a> {
+    /// Called with the conversation after every completed tool step, so a task
+    /// that is stopped or fails can be resumed from where it got to.
+    checkpoint: Option<Checkpoint<'a>>,
+    /// Set for a workflow session: it gets the `handover` tool and must file one.
+    workflow: Option<&'a WorkflowScope>,
+}
+
 // One more argument than clippy likes; bundling them is a refactor of every call site.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
@@ -464,11 +490,11 @@ async fn run_agent_loop(
     tool_mode: ToolMode,
     top: Option<&TopLevel<'_>>,
     depth: u8,
-    // Called with the conversation after every completed tool step, so a task
-    // that is stopped or fails can be resumed from where it got to.
-    checkpoint: Option<Checkpoint<'_>>,
+    scope: Option<&RunScope<'_>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let tools = tool_specs(tool_mode, skills, depth);
+    let workflow = scope.and_then(|s| s.workflow);
+    let checkpoint = scope.and_then(|s| s.checkpoint);
+    let tools = tool_specs(tool_mode, skills, depth, workflow.is_some());
 
     for _ in 0..40 {
         let mut request = json!({
@@ -596,8 +622,12 @@ async fn run_agent_loop(
             }
             let call = &calls[idx];
             emit_tool(top, call);
-            let result =
-                Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth)).await?;
+            let result = if matches!(call.name.as_str(), "nomadflow_run_workflow" | "nomadflow_prompt_workflow") {
+                // A failing workflow is a result the caller can react to, not the end of this run.
+                Box::pin(handle_nomadflow(client, cfg, skills, top, call, depth)).await
+            } else {
+                Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth, workflow)).await?
+            };
             emit_tool_result(top, call, &result);
             outputs[idx] = Some(result);
             idx += 1;
@@ -665,6 +695,7 @@ async fn execute_call(
     tools: Option<&Value>,
     call: &PreparedCall,
     depth: u8,
+    workflow: Option<&WorkflowScope>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fn_args = &call.args;
     let file_path = fn_args["file_path"].as_str().unwrap_or("");
@@ -691,7 +722,7 @@ async fn execute_call(
             ))
             .await?
         }
-        "nomadflow_run_workflow" => Box::pin(handle_nomadflow_run(client, cfg, skills, fn_args, depth)).await?,
+        "handover" => file_handover(workflow, fn_args),
         other => {
             if let Some(out) = nomad_tools::dispatch(other, fn_args) {
                 out
@@ -772,13 +803,147 @@ fn consistent_prefix(messages: &[Value]) -> Vec<Value> {
     if complete { messages.to_vec() } else { messages[..pos].to_vec() }
 }
 
+/// One delegated agent to run: a `Task` subagent, or a workflow's orchestrator.
+struct Delegation<'a> {
+    skill: &'a Skill,
+    task_id: String,
+    messages: Vec<Value>,
+    description: String,
+    /// "subagent" | "orchestrator" (reported to the UI).
+    mode: &'static str,
+    resumed: bool,
+    call_id: &'a str,
+    /// Saved with the conversation (a workflow remembers its task path and handover).
+    meta: Option<Value>,
+    workflow: Option<&'a WorkflowScope>,
+}
+
+/// Runs a delegated agent to its answer, in its own context.
+///
+/// Progress is saved after every step, and also when the run fails, so the same
+/// id can pick it up again. With protocol 2 it reports its own live events
+/// (`task.start`, text, tool calls, `task.end`). Returns the answer or the error,
+/// and the conversation as it ended.
+async fn run_delegated(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    depth: u8,
+    d: Delegation<'_>,
+) -> (Result<String, String>, Vec<Value>) {
+    let Delegation { skill, task_id, mut messages, description, mode, resumed, call_id, meta, workflow } = d;
+    let task_cfg = match &skill.model {
+        Some(model) => cfg.with_model(model),
+        None => cfg.clone(),
+    };
+    eprintln!("{mode} `{}` ({task_id}): model {}", skill.name, task_cfg.model);
+
+    // Protocol 2: this run's events are stamped with its id and go to the UI live.
+    let scoped = top.filter(|t| t.protocol2).map(|t| t.emitter.scoped(&task_id, call_id));
+    let child_top = top.zip(scoped.as_ref()).map(|(t, emitter)| TopLevel {
+        emitter,
+        base_url: t.base_url.clone(),
+        stream: t.stream,
+        protocol2: true,
+    });
+    if let Some(emitter) = &scoped {
+        emitter.emit(json!({
+            "type": "task.start",
+            "agent": skill.name,
+            "description": description,
+            "model": task_cfg.model,
+            "mode": mode,
+            "resumed": resumed,
+        }));
+    }
+
+    let agent_name = skill.name.clone();
+    let save_as = task_id.clone();
+    let save_meta = meta.clone();
+    let checkpoint = move |msgs: &[Value]| {
+        delegation::save_task(
+            &save_as,
+            delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec(), meta: save_meta.clone() },
+        )
+    };
+    let scope = RunScope { checkpoint: Some(&checkpoint), workflow };
+    let mut outcome = Box::pin(run_agent_loop(
+        client,
+        &task_cfg,
+        &mut messages,
+        skills,
+        ToolMode::All,
+        child_top.as_ref(),
+        depth + 1,
+        Some(&scope),
+    ))
+    .await
+    .map_err(|e| e.to_string());
+
+    // A workflow is not finished until it has filed its handover: remind it, twice at most.
+    if let Some(w) = workflow {
+        let mut reminders = 0;
+        while outcome.is_ok() && handover_missing(w) {
+            if reminders == 2 {
+                outcome = Err("the workflow ended without filing a handover, even after two reminders".into());
+                break;
+            }
+            reminders += 1;
+            messages.push(json!({ "role": "user", "content": HANDOVER_REMINDER }));
+            outcome = Box::pin(run_agent_loop(
+                client,
+                &task_cfg,
+                &mut messages,
+                skills,
+                ToolMode::All,
+                child_top.as_ref(),
+                depth + 1,
+                Some(&scope),
+            ))
+            .await
+            .map_err(|e| e.to_string());
+        }
+    }
+
+    match &outcome {
+        Ok(answer) => {
+            delegation::save_task(&task_id, delegation::TaskRecord { agent: skill.name.clone(), messages: messages.clone(), meta });
+            if let Some(emitter) = &scoped {
+                // A workflow that ended blocked or failed is reported as failed; partial still ran to its handover.
+                let filed = workflow.and_then(|w| w.filed.lock().ok().and_then(|f| f.as_ref().map(|h| (h.outcome, h.display_path.clone(), h.revision))));
+                let failed = matches!(filed, Some((handover::Outcome::Blocked | handover::Outcome::Failed, _, _)));
+                let mut end = json!({
+                    "type": "task.end",
+                    "status": if failed { "failed" } else { "completed" },
+                    "summary": stream::truncate_chars(answer, 500),
+                });
+                if let Some((outcome, path, revision)) = filed {
+                    end["handover"] = json!({ "outcome": outcome.as_str(), "path": path, "revision": revision });
+                    if failed {
+                        end["error"] = json!(format!("workflow {}", outcome.as_str()));
+                    }
+                }
+                emitter.emit(end);
+            }
+        }
+        Err(err) => {
+            // Keep what the run got to, so the same id can pick it up again.
+            delegation::save_task(
+                &task_id,
+                delegation::TaskRecord { agent: skill.name.clone(), messages: consistent_prefix(&messages), meta },
+            );
+            if let Some(emitter) = &scoped {
+                emitter.emit(json!({ "type": "task.end", "status": "failed", "error": err }));
+            }
+        }
+    }
+    (outcome, messages)
+}
+
 /// The Task tool: run a NomadWorks subagent in its own context and return its
 /// answer with a task_id (OpenCode's format). A known task_id resumes that
 /// subagent's conversation. Failures become tool output, so the caller can react.
-///
-/// Progress is checkpointed after every step, and also when the task fails, so
-/// the same `task_id` can resume it. With protocol 2 the task also reports its
-/// own live events (`task.start`, text, tool calls, `task.end`).
 async fn handle_task(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
@@ -808,7 +973,7 @@ async fn handle_task(
         .and_then(delegation::load_task)
         .filter(|record| record.agent == skill.name);
     let was_resumed = resumed.is_some();
-    let (task_id, mut messages) = match resumed {
+    let (task_id, messages) = match resumed {
         Some(record) => {
             let mut messages = record.messages;
             messages.push(json!({ "role": "user", "content": prompt }));
@@ -821,144 +986,277 @@ async fn handle_task(
         }
     };
 
-    let task_cfg = match &skill.model {
-        Some(model) => cfg.with_model(model),
-        None => cfg.clone(),
-    };
-    eprintln!("task `{}` ({task_id}): model {}", skill.name, task_cfg.model);
-
-    // Protocol 2: this task's events are stamped with its id and go to the UI live.
-    let scoped = top.filter(|t| t.protocol2).map(|t| t.emitter.scoped(&task_id, call_id));
-    let child_top = top.zip(scoped.as_ref()).map(|(t, emitter)| TopLevel {
-        emitter,
-        base_url: t.base_url.clone(),
-        stream: t.stream,
-        protocol2: true,
-    });
-    if let Some(emitter) = &scoped {
-        emitter.emit(json!({
-            "type": "task.start",
-            "agent": skill.name,
-            "description": args["description"].as_str().unwrap_or(""),
-            "model": task_cfg.model,
-            "mode": "subagent",
-            "resumed": was_resumed,
-        }));
-    }
-
-    let agent_name = skill.name.clone();
-    let save_as = task_id.clone();
-    let checkpoint = move |msgs: &[Value]| {
-        delegation::save_task(&save_as, delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec() })
-    };
-    let outcome = Box::pin(run_agent_loop(
+    let (outcome, _) = run_delegated(
         client,
-        &task_cfg,
-        &mut messages,
+        cfg,
         skills,
-        ToolMode::All,
-        child_top.as_ref(),
-        depth + 1,
-        Some(&checkpoint),
-    ))
+        top,
+        depth,
+        Delegation {
+            skill,
+            task_id: task_id.clone(),
+            messages,
+            description: args["description"].as_str().unwrap_or("").to_string(),
+            mode: "subagent",
+            resumed: was_resumed,
+            call_id,
+            meta: None,
+            workflow: None,
+        },
+    )
     .await;
     match outcome {
-        Ok(answer) => {
-            delegation::save_task(&task_id, delegation::TaskRecord { agent: skill.name.clone(), messages });
-            if let Some(emitter) = &scoped {
-                emitter.emit(json!({
-                    "type": "task.end",
-                    "status": "completed",
-                    "summary": stream::truncate_chars(&answer, 500),
-                }));
-            }
-            delegation::task_result(&task_id, &answer)
+        Ok(answer) => delegation::task_result(&task_id, &answer),
+        Err(err) => format!(
+            "Error: subagent {} failed: {err}\n\ntask_id: {task_id} (progress was saved; pass this task_id to continue)",
+            skill.name
+        ),
+    }
+}
+
+// ---------------------------------------------------------------- workflows (orchestrator sessions)
+
+const HANDOVER_REMINDER: &str = "You have not filed your handover. Call the `handover` tool now with the outcome of this \
+workflow. If you could not finish, file it anyway with outcome `partial`, `blocked` or `failed` and say why in open_issues. \
+Do not answer in plain text instead: the handover is what the Product Manager evaluates.";
+
+fn handover_missing(w: &WorkflowScope) -> bool {
+    w.filed.lock().map(|f| f.is_none()).unwrap_or(true)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests run in their own worktree; the process-wide current directory is shared between them.
+    static TEST_WORKTREE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn workflow_worktree() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_WORKTREE.with(|t| t.borrow().clone()) {
+        return path;
+    }
+    nomad_tools::resolve_worktree()
+}
+
+/// One line per workflow event in `.codenomad/runtime/workflow-events.ndjson`
+/// (git-ignored runtime state). Best effort; the stream and the handover file are the record.
+fn log_workflow_event(worktree: &Path, event: Value) {
+    let dir = worktree.join(".codenomad").join("runtime");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut event = event;
+    event["ts"] = json!(handover::now_iso());
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(dir.join("workflow-events.ndjson")) {
+        let _ = writeln!(file, "{event}");
+    }
+}
+
+/// The `handover` tool: validate, then write the file. Problems come back together so they can be fixed in one go.
+fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
+    let Some(w) = workflow else {
+        return "Error: the handover tool is only available inside a workflow session (started with nomadflow_run_workflow).".into();
+    };
+    let args = handover::apply_aliases(args.clone());
+    let parsed = match handover::Handover::from_args(&args) {
+        Ok(h) => h,
+        Err(errors) => {
+            let list = errors.iter().map(|e| format!("- {e}")).collect::<Vec<_>>().join("\n");
+            return format!("Error: handover rejected. Fix these and call handover again:\n{list}");
         }
-        Err(err) => {
-            // Keep what the task got to, so the same task_id can pick it up again.
-            delegation::save_task(
-                &task_id,
-                delegation::TaskRecord { agent: skill.name.clone(), messages: consistent_prefix(&messages) },
+    };
+    match handover::file(&w.worktree, &w.task_path, &w.session_id, &w.agent, &parsed) {
+        Err(err) => format!("Error: could not file the handover: {err}"),
+        Ok(filed) => {
+            let mut note = format!(
+                "Handover filed: {} (revision {}, outcome {}, verification {}).",
+                filed.display_path,
+                filed.revision,
+                filed.outcome.as_str(),
+                filed.verification
             );
-            if let Some(emitter) = &scoped {
-                emitter.emit(json!({ "type": "task.end", "status": "failed", "error": err.to_string() }));
+            for warning in &filed.warnings {
+                note.push_str(&format!("\nWarning: {warning}"));
             }
-            format!(
-                "Error: subagent {} failed: {err}\n\ntask_id: {task_id} (progress was saved; pass this task_id to continue)",
-                skill.name
-            )
+            note.push_str("\nYou can now finish with a short closing note; the Product Manager reads the handover.");
+            if let Ok(mut slot) = w.filed.lock() {
+                *slot = Some(filed);
+            }
+            note
         }
     }
 }
 
-async fn handle_nomadflow_run(
+/// `nomadflow_run_workflow` / `nomadflow_prompt_workflow`: run a task lifecycle in a workflow session of its own
+/// (a Workflow Runner orchestrating the team), ending in a handover for the Product Manager to evaluate.
+///
+/// The session has an id (`wf_…`). Passing it back — to either tool — resumes that session with the
+/// instructions as a follow-up (a bounce-back), and records the reason in the handover's review log.
+/// Runs synchronously: the Product Manager's communication with agents is synchronous, and the agent is one
+/// process per message, so a "background" session would end with it.
+async fn handle_nomadflow(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
     skills: &[Skill],
-    args: &Value,
+    top: Option<&TopLevel<'_>>,
+    call: &PreparedCall,
     depth: u8,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let task_path = args["task_path"].as_str().unwrap_or("").trim();
-    let instructions = args["instructions"].as_str().unwrap_or("").trim();
-    if task_path.is_empty() || instructions.is_empty() {
-        return Ok(
-            "Error: nomadflow_run_workflow requires task_path and instructions.".into(),
+) -> String {
+    let args = &call.args;
+    let tool = call.name.as_str();
+    let text_of = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let Some(instructions) = text_of("instructions").or_else(|| text_of("text")) else {
+        return format!("Error: {tool} requires {}.", if tool == "nomadflow_run_workflow" { "task_path and instructions" } else { "session_id and text" });
+    };
+
+    let requested_session = text_of("session_id");
+    let record = requested_session.as_deref().and_then(delegation::load_task);
+    if tool == "nomadflow_prompt_workflow" && record.is_none() {
+        return format!(
+            "Error: unknown workflow session `{}`. Start one with nomadflow_run_workflow, or pass the session_id it returned.",
+            requested_session.as_deref().unwrap_or("")
+        );
+    }
+    let previous_meta = record.as_ref().and_then(|r| r.meta.clone());
+    let meta_str = |key: &str| previous_meta.as_ref().and_then(|m| m[key].as_str()).map(str::to_string);
+    let Some(task_path) = text_of("task_path").or_else(|| meta_str("task_path")) else {
+        return "Error: nomadflow_run_workflow requires task_path and instructions.".into();
+    };
+
+    let fallback;
+    let runner = match skill_by_name(skills, "workflow_runner").or_else(|| skill_by_name(skills, "runner")) {
+        Some(skill) => skill,
+        None => {
+            fallback = Skill {
+                name: "workflow_runner".into(),
+                description: "NomadWorks workflow runner (built in)".into(),
+                body: String::new(),
+                directory: PathBuf::from("."),
+                context: Some("fork".into()),
+                policies: Vec::new(),
+                model: None,
+            };
+            &fallback
+        }
+    };
+
+    let worktree = workflow_worktree();
+    let resumed = record.is_some();
+    let session_id = match (&requested_session, resumed) {
+        (Some(id), _) if delegation::load_task(id).is_some() => id.clone(),
+        _ => delegation::new_id("wf"),
+    };
+    let messages = match record {
+        Some(record) => {
+            let mut messages = record.messages;
+            let revision = meta_str("revision").unwrap_or_default();
+            messages.push(json!({ "role": "user", "content": nomad_tools::bounce_prompt(&revision, &instructions) }));
+            // The reason it was sent back goes in the handover's own review log.
+            if let Some(path) = meta_str("handover_path") {
+                if let Err(err) = handover::record_bounce(&worktree.join(&path), &session_id, &instructions) {
+                    eprintln!("nomadflow: could not record the review: {err}");
+                }
+            }
+            messages
+        }
+        None => agents::build_fork_messages(runner, &nomad_tools::workflow_fork_prompt(&worktree, &task_path, &instructions, &session_id)),
+    };
+
+    let scope = WorkflowScope {
+        session_id: session_id.clone(),
+        task_path: task_path.clone(),
+        worktree: worktree.clone(),
+        agent: runner.name.clone(),
+        filed: Mutex::new(None),
+    };
+    let task_id = handover::task_id_of(&task_path);
+    log_workflow_event(
+        &worktree,
+        json!({ "event": "workflow:started", "session_id": session_id, "task": task_path, "task_id": task_id, "resumed": resumed }),
+    );
+
+    let base_meta = json!({
+        "task_path": task_path,
+        "handover_path": meta_str("handover_path"),
+        "revision": meta_str("revision"),
+    });
+    let (outcome, messages) = run_delegated(
+        client,
+        cfg,
+        skills,
+        top,
+        depth,
+        Delegation {
+            skill: runner,
+            task_id: session_id.clone(),
+            messages,
+            description: format!("Workflow {task_id}"),
+            mode: "orchestrator",
+            resumed,
+            call_id: &call.id,
+            meta: Some(base_meta),
+            workflow: Some(&scope),
+        },
+    )
+    .await;
+
+    let filed = scope.filed.lock().ok().and_then(|mut f| f.take());
+    if let Some(filed) = &filed {
+        // The session now knows its handover, for the next bounce.
+        delegation::save_task(
+            &session_id,
+            delegation::TaskRecord {
+                agent: runner.name.clone(),
+                messages: consistent_prefix(&messages),
+                meta: Some(json!({
+                    "task_path": task_path,
+                    "handover_path": filed.display_path,
+                    "revision": filed.revision.to_string(),
+                    "outcome": filed.outcome.as_str(),
+                })),
+            },
+        );
+        log_workflow_event(
+            &worktree,
+            json!({
+                "event": "handover:filed", "session_id": session_id, "task": task_path,
+                "outcome": filed.outcome.as_str(), "revision": filed.revision,
+                "path": filed.display_path, "verification": filed.verification, "open_issues": filed.open_issues,
+            }),
         );
     }
 
-    let prompt = nomad_tools::workflow_fork_prompt(task_path, instructions);
-    let runner = skill_by_name(skills, "workflow_runner")
-        .or_else(|| skill_by_name(skills, "runner"));
-
-    let mut fork_messages = if let Some(skill) = runner {
-        agents::build_fork_messages(skill, &prompt)
-    } else {
-        vec![
-            json!({
-                "role": "system",
-                "content": "You are a NomadWorks workflow_runner in a forked playground context."
-            }),
-            json!({ "role": "user", "content": prompt }),
-        ]
-    };
-
-    let fork_cfg = runner
-        .and_then(|s| s.model.as_ref())
-        .map(|m| cfg.with_model(m))
-        .unwrap_or_else(|| cfg.clone());
-    if fork_cfg.model != cfg.model {
-        eprintln!("nomadflow: model {}", fork_cfg.model);
+    let continue_hint = format!("session_id: {session_id} (pass it to nomadflow_prompt_workflow or nomadflow_run_workflow to send this workflow back or continue it)");
+    match (outcome, filed) {
+        (Ok(answer), Some(filed)) => {
+            log_workflow_event(&worktree, json!({ "event": format!("workflow:{}", filed.outcome.as_str()), "session_id": session_id, "task": task_path }));
+            let headline = match filed.outcome {
+                handover::Outcome::Completed => "SUCCESS: Workflow completed".to_string(),
+                handover::Outcome::Partial => "PARTIAL: Workflow ended with work left".to_string(),
+                handover::Outcome::Blocked => "BLOCKED: Workflow cannot continue without a decision".to_string(),
+                handover::Outcome::Failed => "Error: Workflow failed".to_string(),
+            };
+            let warnings = if filed.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", filed.warnings.iter().map(|w| format!("warning: {w}")).collect::<Vec<_>>().join("\n"))
+            };
+            format!(
+                "{headline} — handover filed (revision {}, verification {}, {} open issue(s)).\n{continue_hint}\ntask: {task_path}\nhandover: {}{warnings}\n\n\
+<handover>\n{}\n</handover>\n\n<workflow_result>\n{answer}\n</workflow_result>",
+                filed.revision,
+                filed.verification,
+                filed.open_issues,
+                filed.display_path,
+                filed.markdown.trim_end()
+            )
+        }
+        (Ok(answer), None) => format!("Error: workflow ended without a handover.\n{continue_hint}\n\n{answer}"),
+        (Err(err), _) => {
+            log_workflow_event(&worktree, json!({ "event": "workflow:errored", "session_id": session_id, "task": task_path, "error": err }));
+            format!("Error: workflow did not finish: {err}\n\n{continue_hint}; progress was saved")
+        }
     }
-
-    let session = format!("sync-{}", uuidish());
-    // The workflow runner delegates to the team, so it gets Skill + Task too.
-    let answer = Box::pin(run_agent_loop(
-        client,
-        &fork_cfg,
-        &mut fork_messages,
-        skills,
-        ToolMode::All,
-        None,
-        depth + 1,
-        None,
-    ))
-    .await?;
-
-    Ok(format!(
-        "SUCCESS: Workflow completed synchronously (playground shim).\n\
-Session: {session}\n\
-Task: {task_path}\n\
----\n{answer}"
-    ))
-}
-
-fn uuidish() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}-{}", nanos, std::process::id())
 }
 
 async fn handle_skill(
@@ -1444,5 +1742,294 @@ mod tests {
 
         let failed = run.events.iter().find(|e| e["type"] == "task.end" && e["status"] == "failed").expect("failed end event");
         assert_eq!(failed["task_id"], id);
+    }
+
+    // ------------------------------------------------------------ workflow sessions and handover
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An OpenAI-compatible endpoint whose replies come from `reply(request) -> assistant message`.
+    async fn scripted_model(reply: impl Fn(&Value) -> Value + Send + Sync + 'static) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let reply = Arc::new(reply);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 16384];
+                    let body_start = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break pos + 4; }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..body_start]).to_lowercase();
+                    let want: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                    while buf.len() < body_start + want {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req: Value = serde_json::from_slice(&buf[body_start..]).unwrap_or(json!({}));
+                    let message = reply(&req);
+                    let body = json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                        "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }] }).to_string();
+                    let out = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    fn call_message(id: &str, name: &str, args: Value) -> Value {
+        json!({ "role": "assistant", "content": null,
+            "tool_calls": [{ "id": id, "type": "function", "function": { "name": name, "arguments": args.to_string() } }] })
+    }
+
+    fn text_message(text: &str) -> Value {
+        json!({ "role": "assistant", "content": text })
+    }
+
+    fn valid_handover(summary: &str) -> Value {
+        json!({
+            "outcome": "completed", "objective": "Ship the export", "summary": summary,
+            "requirements": [{ "id": "R1", "text": "Exports CSV", "status": "met", "evidence": "export.spec" }],
+            "plan": [{ "id": "P1", "title": "Build", "owner": "developer", "status": "done", "result": "merged" }],
+            "evidence": [{ "kind": "test", "ref": "npm test", "result": "58 passed" }],
+            "open_issues": [], "next_actions": [],
+            "verification": { "status": "verified", "notes": "green" }
+        })
+    }
+
+    fn system_text(req: &Value) -> String {
+        req["messages"].as_array().map(|m| m.iter().filter(|x| x["role"] == "system").map(|x| x["content"].to_string()).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+    }
+
+    fn last_message(req: &Value) -> Value {
+        req["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or(json!({}))
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Runner { Happy, RejectedFirst, NeverFiles, Failing }
+
+    fn new_worktree(name: &str) -> PathBuf {
+        let wt = std::env::temp_dir().join(format!("wf-{name}-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(wt.join("tasks/todo/TASK-9")).unwrap();
+        fs::write(wt.join("tasks/todo/TASK-9/TASK-9.md"), "# TASK-9\n\n# Post Implementation Task Updates\n").unwrap();
+        TEST_WORKTREE.with(|t| *t.borrow_mut() = Some(wt.clone()));
+        wt
+    }
+
+    /// The Product Manager asks for `parent_call` once, then reports "PMA DONE".
+    /// The workflow runner behaves as `runner` says. Counts the runner's requests.
+    async fn flow(wt: &Path, runner: Runner, parent_call: Value, runner_requests: Arc<AtomicUsize>) -> Run {
+        let _ = wt;
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            let content = last["content"].as_str().unwrap_or("").to_string();
+            if system.contains("workflow_runner") {
+                runner_requests.fetch_add(1, Ordering::SeqCst);
+                return match (last["role"].as_str().unwrap_or(""), runner) {
+                    ("tool", _) if content.contains("Handover filed") => text_message("closing note"),
+                    ("tool", _) if content.contains("handover rejected") => call_message("h2", "handover", valid_handover("fixed after rejection")),
+                    (_, Runner::NeverFiles) => text_message("I am done, no tool needed"),
+                    (_, Runner::RejectedFirst) => {
+                        let mut bad = valid_handover("x");
+                        bad["open_issues"] = json!(["a leftover"]);
+                        call_message("h1", "handover", bad)
+                    }
+                    (_, Runner::Failing) => call_message("h1", "handover", json!({
+                        "outcome": "failed", "objective": "Ship the export", "summary": "Build is broken",
+                        "requirements": [{ "id": "R1", "text": "Exports CSV", "status": "unmet" }],
+                        "plan": [{ "id": "P1", "title": "Build", "owner": "developer", "status": "failed" }],
+                        "evidence": [], "open_issues": ["compile error in export.ts"], "next_actions": ["fix the compile error"],
+                        "verification": { "status": "failed" }
+                    })),
+                    (_, Runner::Happy) if content.contains("sent the workflow back") => call_message("h3", "handover", valid_handover("fixed the header")),
+                    (_, Runner::Happy) => call_message("h1", "handover", valid_handover("export shipped")),
+                };
+            }
+            // the Product Manager
+            let answered = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool"));
+            if answered { text_message("PMA DONE") } else {
+                let name = parent_call["name"].as_str().unwrap_or("nomadflow_run_workflow");
+                call_message("wf1", name, parent_call["args"].clone())
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("workflow_runner", true)];
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        let started = std::time::Instant::now();
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, Some(&top), 0, None).await.map_err(|e| e.to_string());
+        let events = sink.lock().unwrap().clone();
+        Run { answer, messages, events, elapsed: started.elapsed() }
+    }
+
+    fn run_call(args: Value) -> Value {
+        json!({ "name": "nomadflow_run_workflow", "args": args })
+    }
+
+    fn workflow_result(run: &Run) -> String {
+        run.messages.iter().find(|m| m["role"] == "tool").and_then(|m| m["content"].as_str()).unwrap_or_default().to_string()
+    }
+
+    fn session_of(result: &str) -> String {
+        result.split("session_id: ").nth(1).unwrap().split_whitespace().next().unwrap().to_string()
+    }
+
+    const TASK: &str = "tasks/todo/TASK-9/TASK-9.md";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_session_ends_in_a_handover_the_manager_can_read() {
+        let wt = new_worktree("happy");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "do it" })), requests).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+
+        let result = workflow_result(&run);
+        assert!(result.starts_with("SUCCESS: Workflow completed — handover filed (revision 1, verification verified, 0 open issue(s))."), "{result}");
+        assert!(result.contains("handover: tasks/todo/TASK-9/HANDOVER.md"));
+        assert!(result.contains("<handover>") && result.contains("**Outcome: completed**"));
+        assert!(result.contains("export shipped"));
+        assert!(!result.contains("warning:"), "the task file has its Post Implementation section");
+        let session = session_of(&result);
+        assert!(session.starts_with("wf_"));
+
+        // The file is with the task, and the session can be continued.
+        let file = fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap();
+        assert!(file.contains(&format!("session_id: {session}")) && file.contains("revision: 1"));
+        let saved = delegation::load_task(&session).expect("the workflow session is kept");
+        assert_eq!(saved.meta.as_ref().unwrap()["handover_path"], "tasks/todo/TASK-9/HANDOVER.md");
+
+        // The orchestrator reports as its own task, in orchestrator mode, ending with its handover.
+        let start = run.events.iter().find(|e| e["type"] == "task.start").expect("task.start");
+        assert_eq!(start["mode"], "orchestrator");
+        assert_eq!(start["agent"], "workflow_runner");
+        assert_eq!(start["task_id"], session.as_str());
+        let end = run.events.iter().find(|e| e["type"] == "task.end").expect("task.end");
+        assert_eq!(end["status"], "completed");
+        assert_eq!(end["handover"]["outcome"], "completed");
+        assert_eq!(end["handover"]["revision"], 1);
+
+        // And the engine's own event log has the workflow's course.
+        let log = fs::read_to_string(wt.join(".codenomad/runtime/workflow-events.ndjson")).unwrap();
+        let names: Vec<String> = log.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["event"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names, ["workflow:started", "handover:filed", "workflow:completed"]);
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handover_that_breaks_the_rules_is_rejected_and_the_runner_fixes_it() {
+        let wt = new_worktree("rejected");
+        let run = flow(&wt, Runner::RejectedFirst, run_call(json!({ "task_path": TASK, "instructions": "do it" })), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        let result = workflow_result(&run);
+        assert!(result.starts_with("SUCCESS: Workflow completed"), "{result}");
+        assert!(result.contains("fixed after rejection"));
+        // Only the accepted one was filed.
+        let file = fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap();
+        assert!(file.contains("revision: 1") && !file.contains("a leftover"));
+        // The runner was told why, in the tool result it saw.
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_that_never_files_a_handover_fails_without_ending_the_managers_run() {
+        let wt = new_worktree("never");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::NeverFiles, run_call(json!({ "task_path": TASK, "instructions": "do it" })), requests.clone()).await;
+        // Before Phase 5 a failing workflow's `?` ended the whole run; now the manager gets a result.
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        let result = workflow_result(&run);
+        assert!(result.starts_with("Error: workflow did not finish: the workflow ended without filing a handover, even after two reminders"), "{result}");
+        assert!(result.contains("session_id: wf_") && result.contains("progress was saved"));
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "the first try and two reminders");
+        assert!(stream::is_error_output(&result), "the card is flagged as an error");
+        let end = run.events.iter().find(|e| e["type"] == "task.end").unwrap();
+        assert_eq!(end["status"], "failed");
+        assert!(!wt.join("tasks/todo/TASK-9/HANDOVER.md").exists());
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_workflow_hands_over_its_failure() {
+        let wt = new_worktree("failed");
+        let run = flow(&wt, Runner::Failing, run_call(json!({ "task_path": TASK, "instructions": "do it" })), Arc::new(AtomicUsize::new(0))).await;
+        let result = workflow_result(&run);
+        assert!(result.starts_with("Error: Workflow failed — handover filed"), "{result}");
+        assert!(result.contains("compile error in export.ts") && result.contains("fix the compile error"));
+        assert!(stream::is_error_output(&result));
+        let end = run.events.iter().find(|e| e["type"] == "task.end").unwrap();
+        assert_eq!(end["status"], "failed");
+        assert_eq!(end["handover"]["outcome"], "failed");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sending_a_workflow_back_resumes_the_same_session_and_logs_the_review() {
+        let wt = new_worktree("bounce");
+        let first = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "do it" })), Arc::new(AtomicUsize::new(0))).await;
+        let session = session_of(&workflow_result(&first));
+
+        // The Product Manager sends it back through nomadflow_prompt_workflow.
+        let second = flow(
+            &wt,
+            Runner::Happy,
+            json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": session, "text": "The CSV header is wrong, fix it." } }),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        assert_eq!(second.answer.as_deref(), Ok("PMA DONE"));
+        let result = workflow_result(&second);
+        assert!(result.starts_with("SUCCESS: Workflow completed — handover filed (revision 2"), "{result}");
+        assert_eq!(session_of(&result), session, "the same session");
+        assert!(result.contains("fixed the header"));
+
+        let start = second.events.iter().find(|e| e["type"] == "task.start").unwrap();
+        assert_eq!(start["resumed"], true);
+        assert_eq!(start["task_id"], session.as_str());
+
+        // The review of revision 1 is in the file, and survived the new revision.
+        let file = fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap();
+        assert!(file.contains("revision: 2"));
+        assert!(file.contains(&format!("sent back (revision 1, session {session}): The CSV header is wrong, fix it.")), "{file}");
+
+        // It really continued: the saved conversation holds both rounds.
+        let saved = delegation::load_task(&session).unwrap();
+        let handovers = saved.messages.iter().filter(|m| m["tool_calls"][0]["function"]["name"] == "handover").count();
+        assert_eq!(handovers, 2);
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_ups_to_unknown_sessions_and_missing_arguments_are_clear_errors() {
+        let wt = new_worktree("errors");
+        let run = flow(&wt, Runner::Happy, json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": "wf_nope", "text": "hi" } }), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&run).starts_with("Error: unknown workflow session `wf_nope`"), "{}", workflow_result(&run));
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK })), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(workflow_result(&run), "Error: nomadflow_run_workflow requires task_path and instructions.");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn the_handover_tool_belongs_to_workflow_sessions_only() {
+        assert!(file_handover(None, &valid_handover("x")).starts_with("Error: the handover tool is only available inside a workflow session"));
+        let with = tool_specs(ToolMode::All, &[], 0, true).unwrap();
+        let without = tool_specs(ToolMode::All, &[], 0, false).unwrap();
+        let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "handover");
+        assert!(has(&with) && !has(&without));
     }
 }

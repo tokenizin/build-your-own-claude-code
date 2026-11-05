@@ -84,6 +84,7 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "write" | "Write" | "write_file" => "Write",
         "bash" | "Bash" | "shell" | "sh" => "Bash",
         "skill" | "Skill" => "Skill",
+        "handover" | "Handover" | "file_handover" | "submit_handover" => "handover",
         "nomadflow_validate" | "nomadworks_validate" | "nomad_validate" => "nomadworks_validate",
         other => other,
     }
@@ -133,6 +134,11 @@ pub fn apply_aliases(tool: &str, args: Value) -> Value {
         "nomadflow_run_workflow" => &[
             ("task_path", &["taskPath", "task_file", "taskFile", "path", "file_path", "filePath", "task"]),
             ("instructions", &["prompt", "instruction", "description", "message"]),
+            ("session_id", &["sessionId", "workflow_session", "workflowSession"]),
+        ],
+        "nomadflow_prompt_workflow" => &[
+            ("session_id", &["sessionId", "workflow_session", "workflowSession", "id"]),
+            ("text", &["message", "prompt", "instructions", "instruction", "follow_up", "followUp"]),
         ],
         _ => &[],
     };
@@ -286,6 +292,8 @@ fn openai_call(name: &str, args: Value, index: usize) -> Value {
 pub struct TaskRecord {
     pub agent: String,
     pub messages: Vec<Value>,
+    /// What the kind of task needs to find again on resume (a workflow session: its task path and handover).
+    pub meta: Option<Value>,
 }
 
 fn memory() -> &'static Mutex<HashMap<String, TaskRecord>> {
@@ -307,9 +315,14 @@ fn safe_id(task_id: &str) -> bool {
 }
 
 pub fn new_task_id() -> String {
+    new_id("task")
+}
+
+/// A fresh id with the given prefix (`task`, `wf` for workflow sessions).
+pub fn new_id(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("task_{:x}{:x}", nanos, std::process::id())
+    format!("{prefix}_{:x}{:x}", nanos, std::process::id())
 }
 
 pub fn load_task(task_id: &str) -> Option<TaskRecord> {
@@ -317,13 +330,14 @@ pub fn load_task(task_id: &str) -> Option<TaskRecord> {
         return None;
     }
     if let Some(record) = memory().lock().ok()?.get(task_id) {
-        return Some(TaskRecord { agent: record.agent.clone(), messages: record.messages.clone() });
+        return Some(TaskRecord { agent: record.agent.clone(), messages: record.messages.clone(), meta: record.meta.clone() });
     }
     let path = store_dir()?.join(format!("{task_id}.json"));
     let parsed: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
     Some(TaskRecord {
         agent: parsed["agent"].as_str()?.to_string(),
         messages: parsed["messages"].as_array()?.clone(),
+        meta: parsed.get("meta").filter(|m| !m.is_null()).cloned(),
     })
 }
 
@@ -336,6 +350,9 @@ pub fn save_task(task_id: &str, record: TaskRecord) {
             let mut doc = Map::new();
             doc.insert("agent".into(), Value::String(record.agent.clone()));
             doc.insert("messages".into(), Value::Array(record.messages.clone()));
+            if let Some(meta) = &record.meta {
+                doc.insert("meta".into(), meta.clone());
+            }
             let _ = fs::write(dir.join(format!("{task_id}.json")), Value::Object(doc).to_string());
         }
     }
@@ -450,11 +467,12 @@ mod tests {
         // SAFETY: tests in this module don't run concurrently with other env readers of this key.
         unsafe { std::env::set_var("CODENOMAD_TASK_STORE", &dir) };
         let id = new_task_id();
-        save_task(&id, TaskRecord { agent: "ba".into(), messages: vec![json!({"role": "user", "content": "hi"})] });
+        save_task(&id, TaskRecord { agent: "ba".into(), messages: vec![json!({"role": "user", "content": "hi"})], meta: Some(json!({"task_path": "t.md"})) });
         memory().lock().unwrap().remove(&id);
         let loaded = load_task(&id).expect("loaded from disk");
         assert_eq!(loaded.agent, "ba");
         assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.meta, Some(json!({"task_path": "t.md"})), "meta survives the disk round trip");
         assert!(load_task("../etc/passwd").is_none());
         unsafe { std::env::remove_var("CODENOMAD_TASK_STORE") };
         let _ = fs::remove_dir_all(dir);
