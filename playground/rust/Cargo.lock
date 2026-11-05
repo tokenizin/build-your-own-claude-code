@@ -232,6 +232,7 @@ dependencies = [
  "backoff",
  "base64 0.22.1",
  "clap",
+ "futures-util",
  "regex",
  "reqwest",
  "serde_json",

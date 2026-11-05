@@ -10,6 +10,7 @@ mod skills;
 mod stream;
 
 use async_openai::{Client, config::OpenAIConfig};
+use futures_util::StreamExt;
 use clap::{Parser, ValueEnum};
 use config::LlmConfig;
 use serde_json::{Value, json};
@@ -68,6 +69,26 @@ struct TopLevel<'a> {
     emitter: &'a Emitter,
     base_url: String,
     stream: bool,
+    /// Protocol 2 (`NOMAD_PROTOCOL=2`): delegated tasks emit their own events,
+    /// stamped with `task_id`, plus `task.start` / `task.end`. Off by default
+    /// because a protocol-1 reader would fold a child's text and tool calls into
+    /// the parent's reply.
+    protocol2: bool,
+}
+
+/// `NOMAD_PROTOCOL=2` opts in to task-scoped events.
+fn protocol2_enabled() -> bool {
+    env::var("NOMAD_PROTOCOL").map(|v| v.trim() == "2").unwrap_or(false)
+}
+
+/// How many Task calls of one assistant turn run at once (`NOMAD_MAX_PARALLEL`, default 3).
+/// One local model endpoint is the real bottleneck, so the default stays small.
+fn max_parallel() -> usize {
+    env::var("NOMAD_MAX_PARALLEL")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, 16)
 }
 
 #[derive(Clone, Copy)]
@@ -430,6 +451,11 @@ async fn resolve_client(cfg: &LlmConfig) -> (Client<OpenAIConfig>, String) {
     (make_client(&cfg.base_url, &cfg.api_key), cfg.base_url.clone())
 }
 
+/// Saves a task's conversation after each completed step.
+type Checkpoint<'a> = &'a dyn Fn(&[Value]);
+
+// One more argument than clippy likes; bundling them is a refactor of every call site.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
@@ -438,6 +464,9 @@ async fn run_agent_loop(
     tool_mode: ToolMode,
     top: Option<&TopLevel<'_>>,
     depth: u8,
+    // Called with the conversation after every completed tool step, so a task
+    // that is stopped or fails can be resumed from where it got to.
+    checkpoint: Option<Checkpoint<'_>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let tools = tool_specs(tool_mode, skills, depth);
 
@@ -545,83 +574,217 @@ async fn run_agent_loop(
             return Ok(text);
         }
 
-        for call in &tool_calls {
-            // Models name tools OpenCode-style and send arguments as a string or an
-            // object, under varying keys; normalize before running anything.
-            let fn_name = delegation::canonical_tool_name(call["function"]["name"].as_str().unwrap_or(""));
-            let fn_args = delegation::apply_aliases(fn_name, delegation::parse_arguments(&call["function"]["arguments"]));
-            let call_id = call["id"].as_str().unwrap_or("");
+        // Normalize every call first: models name tools OpenCode-style and send
+        // arguments as a string or an object, under varying keys.
+        let calls: Vec<PreparedCall> = tool_calls.iter().map(PreparedCall::from_value).collect();
+        let mut outputs: Vec<Option<String>> = vec![None; calls.len()];
+        let batchable = |c: &PreparedCall| c.name == "Task" && depth < delegation::MAX_TASK_DEPTH;
 
-            if let Some(top) = top {
-                top.emitter.emit(json!({
-                    "type": "tool",
-                    "id": call_id,
-                    "name": fn_name,
-                    "input": fn_args,
-                }));
+        // Calls run in the order the model wrote them, except that a run of
+        // consecutive Task calls is one concurrent batch. Any other tool is a
+        // barrier, so "Write the spec, then Task a reviewer" keeps its order.
+        let mut idx = 0;
+        while idx < calls.len() {
+            if batchable(&calls[idx]) {
+                let mut end = idx;
+                while end < calls.len() && batchable(&calls[end]) {
+                    end += 1;
+                }
+                run_task_batch(client, cfg, skills, top, &calls[idx..end], &mut outputs[idx..end], depth).await;
+                idx = end;
+                continue;
             }
+            let call = &calls[idx];
+            emit_tool(top, call);
+            let result =
+                Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth)).await?;
+            emit_tool_result(top, call, &result);
+            outputs[idx] = Some(result);
+            idx += 1;
+        }
 
-            let file_path = fn_args["file_path"].as_str().unwrap_or("");
-            let result = match fn_name {
-                "Read" => file_lease::with_lease(file_path, call_id, || execute_read(&fn_args))
-                    .unwrap_or_else(|err| format!("Error: {err}")),
-                "Write" => file_lease::with_lease(file_path, call_id, || execute_write(&fn_args))
-                    .unwrap_or_else(|err| format!("Error: {err}")),
-                "Bash" => execute_bash(&fn_args),
-                "Skill" => {
-                    Box::pin(handle_skill(
-                        client,
-                        cfg,
-                        skills,
-                        fn_args["name"].as_str().unwrap_or(""),
-                        fn_args["args"].as_str().unwrap_or(""),
-                        depth,
-                    ))
-                    .await?
-                }
-                "nomadflow_run_workflow" => {
-                    Box::pin(handle_nomadflow_run(client, cfg, skills, &fn_args, depth)).await?
-                }
-                "Task" if depth < delegation::MAX_TASK_DEPTH => {
-                    Box::pin(handle_task(client, cfg, skills, &fn_args, depth)).await
-                }
-                other => {
-                    if let Some(out) = nomad_tools::dispatch(other, &fn_args) {
-                        out
-                    } else {
-                        delegation::unknown_tool_message(other, tools.as_ref())
-                    }
-                }
-            };
-
-            if let Some(top) = top {
-                top.emitter.emit(json!({
-                    "type": "tool_result",
-                    "id": call_id,
-                    "name": fn_name,
-                    "output": stream::truncate_chars(&result, 2000),
-                    "isError": stream::is_error_output(&result),
-                }));
-            }
-
+        // Results go into the history in call order, whatever order they finished in.
+        for (call, output) in calls.iter().zip(outputs) {
             messages.push(json!({
                 "role": "tool",
-                "tool_call_id": call_id,
-                "content": result,
+                "tool_call_id": call.id,
+                "content": output.unwrap_or_default(),
             }));
+        }
+        if let Some(save) = checkpoint {
+            save(messages);
         }
     }
 
     Err("agent loop exceeded maximum iterations".into())
 }
 
+/// A tool call with its name and arguments normalized.
+struct PreparedCall {
+    id: String,
+    name: String,
+    args: Value,
+}
+
+impl PreparedCall {
+    fn from_value(call: &Value) -> Self {
+        let name = delegation::canonical_tool_name(call["function"]["name"].as_str().unwrap_or("")).to_string();
+        let args = delegation::apply_aliases(&name, delegation::parse_arguments(&call["function"]["arguments"]));
+        PreparedCall { id: call["id"].as_str().unwrap_or("").to_string(), name, args }
+    }
+}
+
+fn emit_tool(top: Option<&TopLevel<'_>>, call: &PreparedCall) {
+    if let Some(top) = top {
+        top.emitter.emit(json!({
+            "type": "tool",
+            "id": call.id,
+            "name": call.name,
+            "input": call.args,
+        }));
+    }
+}
+
+fn emit_tool_result(top: Option<&TopLevel<'_>>, call: &PreparedCall, result: &str) {
+    if let Some(top) = top {
+        top.emitter.emit(json!({
+            "type": "tool_result",
+            "id": call.id,
+            "name": call.name,
+            "output": stream::truncate_chars(result, 2000),
+            "isError": stream::is_error_output(result),
+        }));
+    }
+}
+
+/// Runs one non-Task tool call. (Task calls go through `run_task_batch`.)
+async fn execute_call(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    tools: Option<&Value>,
+    call: &PreparedCall,
+    depth: u8,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let fn_args = &call.args;
+    let file_path = fn_args["file_path"].as_str().unwrap_or("");
+    Ok(match call.name.as_str() {
+        "Read" => file_lease::with_lease(file_path, &call.id, || execute_read(fn_args))
+            .unwrap_or_else(|err| format!("Error: {err}")),
+        "Write" => file_lease::with_lease(file_path, &call.id, || execute_write(fn_args))
+            .unwrap_or_else(|err| format!("Error: {err}")),
+        // Off the async thread: a long command must not stall the other tasks of this turn.
+        "Bash" => {
+            let args = fn_args.clone();
+            tokio::task::spawn_blocking(move || execute_bash(&args))
+                .await
+                .unwrap_or_else(|err| format!("Error: bash did not complete: {err}"))
+        }
+        "Skill" => {
+            Box::pin(handle_skill(
+                client,
+                cfg,
+                skills,
+                fn_args["name"].as_str().unwrap_or(""),
+                fn_args["args"].as_str().unwrap_or(""),
+                depth,
+            ))
+            .await?
+        }
+        "nomadflow_run_workflow" => Box::pin(handle_nomadflow_run(client, cfg, skills, fn_args, depth)).await?,
+        other => {
+            if let Some(out) = nomad_tools::dispatch(other, fn_args) {
+                out
+            } else {
+                delegation::unknown_tool_message(other, tools)
+            }
+        }
+    })
+}
+
+/// Which calls of a batch try to resume a `task_id` an earlier call of the same
+/// batch already uses. Two concurrent resumes of one transcript would overwrite
+/// each other's progress, so the later ones are refused.
+fn duplicate_resumes(calls: &[PreparedCall]) -> Vec<bool> {
+    let mut seen = std::collections::HashSet::new();
+    calls
+        .iter()
+        .map(|call| match call.args["task_id"].as_str().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => !seen.insert(id.to_string()),
+            None => false,
+        })
+        .collect()
+}
+
+/// Runs a run of consecutive Task calls concurrently (at most `max_parallel()`
+/// at a time). Every card is announced up front, so the UI shows the whole
+/// dispatch at once; each result is reported the moment its task finishes.
+async fn run_task_batch(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    calls: &[PreparedCall],
+    outputs: &mut [Option<String>],
+    depth: u8,
+) {
+    for call in calls {
+        emit_tool(top, call);
+    }
+    let duplicate = duplicate_resumes(calls);
+    let jobs = calls.iter().enumerate().map(move |(i, call)| {
+        let duplicate = duplicate[i];
+        async move {
+            let output = if duplicate {
+                format!(
+                    "Error: task_id `{}` is already being continued by another Task call in this \
+turn. Resume it in a later turn, after that call has returned.",
+                    call.args["task_id"].as_str().unwrap_or("")
+                )
+            } else {
+                handle_task(client, cfg, skills, top, &call.id, &call.args, depth).await
+            };
+            (i, output)
+        }
+    });
+    let mut running = futures_util::stream::iter(jobs).buffer_unordered(max_parallel());
+    while let Some((i, output)) = running.next().await {
+        emit_tool_result(top, &calls[i], &output);
+        outputs[i] = Some(output);
+    }
+}
+
+/// The longest prefix of `messages` that is a valid conversation: if the last
+/// assistant tool call was not fully answered (the run stopped mid-step), drop it.
+fn consistent_prefix(messages: &[Value]) -> Vec<Value> {
+    let last_calls = messages
+        .iter()
+        .rposition(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|c| !c.is_empty()));
+    let Some(pos) = last_calls else { return messages.to_vec() };
+    let answered: std::collections::HashSet<&str> = messages[pos + 1..]
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["tool_call_id"].as_str())
+        .collect();
+    let complete = messages[pos]["tool_calls"]
+        .as_array()
+        .is_some_and(|calls| calls.iter().all(|c| answered.contains(c["id"].as_str().unwrap_or(""))));
+    if complete { messages.to_vec() } else { messages[..pos].to_vec() }
+}
+
 /// The Task tool: run a NomadWorks subagent in its own context and return its
 /// answer with a task_id (OpenCode's format). A known task_id resumes that
 /// subagent's conversation. Failures become tool output, so the caller can react.
+///
+/// Progress is checkpointed after every step, and also when the task fails, so
+/// the same `task_id` can resume it. With protocol 2 the task also reports its
+/// own live events (`task.start`, text, tool calls, `task.end`).
 async fn handle_task(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
     skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    call_id: &str,
     args: &Value,
     depth: u8,
 ) -> String {
@@ -644,6 +807,7 @@ async fn handle_task(
         .as_str()
         .and_then(delegation::load_task)
         .filter(|record| record.agent == skill.name);
+    let was_resumed = resumed.is_some();
     let (task_id, mut messages) = match resumed {
         Some(record) => {
             let mut messages = record.messages;
@@ -662,22 +826,68 @@ async fn handle_task(
         None => cfg.clone(),
     };
     eprintln!("task `{}` ({task_id}): model {}", skill.name, task_cfg.model);
+
+    // Protocol 2: this task's events are stamped with its id and go to the UI live.
+    let scoped = top.filter(|t| t.protocol2).map(|t| t.emitter.scoped(&task_id, call_id));
+    let child_top = top.zip(scoped.as_ref()).map(|(t, emitter)| TopLevel {
+        emitter,
+        base_url: t.base_url.clone(),
+        stream: t.stream,
+        protocol2: true,
+    });
+    if let Some(emitter) = &scoped {
+        emitter.emit(json!({
+            "type": "task.start",
+            "agent": skill.name,
+            "description": args["description"].as_str().unwrap_or(""),
+            "model": task_cfg.model,
+            "mode": "subagent",
+            "resumed": was_resumed,
+        }));
+    }
+
+    let agent_name = skill.name.clone();
+    let save_as = task_id.clone();
+    let checkpoint = move |msgs: &[Value]| {
+        delegation::save_task(&save_as, delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec() })
+    };
     let outcome = Box::pin(run_agent_loop(
         client,
         &task_cfg,
         &mut messages,
         skills,
         ToolMode::All,
-        None,
+        child_top.as_ref(),
         depth + 1,
+        Some(&checkpoint),
     ))
     .await;
     match outcome {
         Ok(answer) => {
             delegation::save_task(&task_id, delegation::TaskRecord { agent: skill.name.clone(), messages });
+            if let Some(emitter) = &scoped {
+                emitter.emit(json!({
+                    "type": "task.end",
+                    "status": "completed",
+                    "summary": stream::truncate_chars(&answer, 500),
+                }));
+            }
             delegation::task_result(&task_id, &answer)
         }
-        Err(err) => format!("Error: subagent {} failed: {err}", skill.name),
+        Err(err) => {
+            // Keep what the task got to, so the same task_id can pick it up again.
+            delegation::save_task(
+                &task_id,
+                delegation::TaskRecord { agent: skill.name.clone(), messages: consistent_prefix(&messages) },
+            );
+            if let Some(emitter) = &scoped {
+                emitter.emit(json!({ "type": "task.end", "status": "failed", "error": err.to_string() }));
+            }
+            format!(
+                "Error: subagent {} failed: {err}\n\ntask_id: {task_id} (progress was saved; pass this task_id to continue)",
+                skill.name
+            )
+        }
     }
 }
 
@@ -730,6 +940,7 @@ async fn handle_nomadflow_run(
         ToolMode::All,
         None,
         depth + 1,
+        None,
     ))
     .await?;
 
@@ -781,6 +992,7 @@ async fn handle_skill(
             ToolMode::Base,
             None,
             depth + 1,
+            None,
         ))
         .await?;
         return Ok(format!(
@@ -856,7 +1068,7 @@ async fn main() -> std::process::ExitCode {
     }
 
     let stream_mode = args.output_format == OutputFormat::StreamJson;
-    let emitter = Emitter;
+    let emitter = Emitter::default();
     let fail = |code: u8, message: String| {
         eprintln!("Error: {message}");
         if stream_mode {
@@ -909,6 +1121,7 @@ async fn main() -> std::process::ExitCode {
         emitter: &emitter,
         base_url: active_base.clone(),
         stream: stream_enabled(),
+        protocol2: protocol2_enabled(),
     });
     if stream_mode {
         emitter.emit(json!({
@@ -916,6 +1129,7 @@ async fn main() -> std::process::ExitCode {
             "model": run_cfg.model,
             "agent": initial.agent,
             "baseUrl": active_base,
+            "protocol": if protocol2_enabled() { 2 } else { 1 },
         }));
     }
 
@@ -927,6 +1141,7 @@ async fn main() -> std::process::ExitCode {
         initial.tool_mode,
         top.as_ref(),
         0,
+        None,
     )
     .await
     {
@@ -1008,5 +1223,226 @@ mod tests {
         assert_eq!(a.images.len(), 2);
         assert_eq!(a.output_format, OutputFormat::StreamJson);
         assert_eq!(a.prompt.as_deref(), Some("hi"));
+    }
+
+    // ------------------------------------------------------------ parallel Task execution
+
+    fn call(id: &str, name: &str, args: Value) -> PreparedCall {
+        PreparedCall { id: id.into(), name: name.into(), args }
+    }
+
+    #[test]
+    fn a_task_id_is_resumed_once_per_batch() {
+        let calls = vec![
+            call("a", "Task", json!({ "task_id": "task_1" })),
+            call("b", "Task", json!({ "task_id": "task_2" })),
+            call("c", "Task", json!({ "task_id": "task_1" })),
+            call("d", "Task", json!({})),
+            call("e", "Task", json!({ "task_id": "  " })),
+        ];
+        assert_eq!(duplicate_resumes(&calls), vec![false, false, true, false, false]);
+    }
+
+    #[test]
+    fn unanswered_tool_calls_are_dropped_from_a_saved_conversation() {
+        let user = json!({ "role": "user", "content": "go" });
+        let asked = json!({ "role": "assistant", "content": null,
+            "tool_calls": [{ "id": "1", "function": {} }, { "id": "2", "function": {} }] });
+        let one = json!({ "role": "tool", "tool_call_id": "1", "content": "ok" });
+        let two = json!({ "role": "tool", "tool_call_id": "2", "content": "ok" });
+
+        // Both answered: kept whole.
+        let all = vec![user.clone(), asked.clone(), one.clone(), two.clone()];
+        assert_eq!(consistent_prefix(&all).len(), 4);
+        // One missing: the dangling assistant turn is cut, nothing before it is lost.
+        let partial = vec![user.clone(), asked.clone(), one.clone()];
+        assert_eq!(consistent_prefix(&partial), vec![user.clone()]);
+        // No tool calls at all: untouched.
+        let plain = vec![user.clone(), json!({ "role": "assistant", "content": "hi" })];
+        assert_eq!(consistent_prefix(&plain).len(), 2);
+    }
+
+    /// A scripted OpenAI-compatible endpoint. The parent (a request with no
+    /// "do-sub-" text) first asks for three Task calls, then — once tool results
+    /// are in — answers. Each subagent waits `delay_ms` before answering, so
+    /// overlap shows up in the wall-clock time. `fail` makes subagent 2 return 400.
+    async fn mock_model(delay_ms: u64, fail: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let body_start;
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            body_start = pos + 4;
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..body_start]).to_lowercase();
+                    let want: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    while buf.len() < body_start + want {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req: Value = serde_json::from_slice(&buf[body_start..]).unwrap_or(json!({}));
+                    let text = req["messages"].to_string();
+                    let has_tool_results = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool"));
+                    let (status, message) = if text.contains("do-sub-") && !has_tool_results {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        let n = text.split("do-sub-").nth(1).and_then(|r| r.chars().next()).unwrap_or('?');
+                        if fail && n == '2' {
+                            ("400 Bad Request", json!({ "error": "boom" }))
+                        } else {
+                            ("200 OK", json!({ "role": "assistant", "content": format!("answer-{n}") }))
+                        }
+                    } else if has_tool_results {
+                        ("200 OK", json!({ "role": "assistant", "content": "ALL DONE" }))
+                    } else {
+                        let tasks: Vec<Value> = (1..=3).map(|n| json!({
+                            "id": format!("call_{n}"), "type": "function",
+                            "function": { "name": "Task", "arguments": json!({
+                                "subagent_type": "worker", "description": format!("job {n}"),
+                                "prompt": format!("do-sub-{n}") }).to_string() }
+                        })).collect();
+                        ("200 OK", json!({ "role": "assistant", "content": null, "tool_calls": tasks }))
+                    };
+                    let payload = if status.starts_with("200") {
+                        json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                            "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }] })
+                    } else { message };
+                    let body = payload.to_string();
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    struct Run {
+        answer: Result<String, String>,
+        messages: Vec<Value>,
+        events: Vec<Value>,
+        elapsed: std::time::Duration,
+    }
+
+    async fn run_parent(base: &str, protocol2: bool) -> Run {
+        let cfg = LlmConfig {
+            base_url: base.into(),
+            fallback_base_url: base.into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            max_tokens: 256,
+        };
+        let client = make_client(base, "k");
+        let skills = vec![skill("worker", true)];
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.into(), stream: false, protocol2 };
+        let mut messages = vec![
+            json!({ "role": "system", "content": "you orchestrate" }),
+            json!({ "role": "user", "content": "plan the work" }),
+        ];
+        let started = std::time::Instant::now();
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, Some(&top), 0, None)
+            .await
+            .map_err(|e| e.to_string());
+        let elapsed = started.elapsed();
+        let events = sink.lock().unwrap().clone();
+        Run { answer, messages, events, elapsed }
+    }
+
+    fn position(events: &[Value], pred: impl Fn(&Value) -> bool) -> Option<usize> {
+        events.iter().position(pred)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn three_task_calls_run_at_the_same_time() {
+        let base = mock_model(400, false).await;
+        let run = run_parent(&base, false).await;
+        assert_eq!(run.answer.as_deref(), Ok("ALL DONE"));
+        // Three 400ms subagents: ~1.2s if serial, ~0.4s if overlapped.
+        assert!(run.elapsed.as_millis() < 900, "tasks ran serially: {:?}", run.elapsed);
+
+        // All three cards are announced before any result comes back.
+        let first_result = position(&run.events, |e| e["type"] == "tool_result").unwrap();
+        let tools_before = run.events[..first_result].iter().filter(|e| e["type"] == "tool").count();
+        assert_eq!(tools_before, 3);
+
+        // History keeps call order, with each answer under its own call id.
+        let tool_msgs: Vec<&Value> = run.messages.iter().filter(|m| m["role"] == "tool").collect();
+        let ids: Vec<&str> = tool_msgs.iter().map(|m| m["tool_call_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["call_1", "call_2", "call_3"]);
+        for (n, m) in tool_msgs.iter().enumerate() {
+            assert!(m["content"].as_str().unwrap().contains(&format!("answer-{}", n + 1)), "{m}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protocol_one_adds_no_child_events() {
+        let base = mock_model(10, false).await;
+        let run = run_parent(&base, false).await;
+        assert!(run.events.iter().all(|e| e.get("task_id").is_none()), "{:?}", run.events);
+        assert!(run.events.iter().all(|e| e["type"] != "task.start" && e["type"] != "task.end"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protocol_two_stamps_each_task() {
+        let base = mock_model(10, false).await;
+        let run = run_parent(&base, true).await;
+        let starts: Vec<&Value> = run.events.iter().filter(|e| e["type"] == "task.start").collect();
+        let ends: Vec<&Value> = run.events.iter().filter(|e| e["type"] == "task.end").collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(ends.len(), 3);
+        let mut parents: Vec<&str> = starts.iter().map(|e| e["parent_call_id"].as_str().unwrap()).collect();
+        parents.sort();
+        assert_eq!(parents, ["call_1", "call_2", "call_3"]);
+        assert!(ends.iter().all(|e| e["status"] == "completed"));
+        // Every child event carries its task id; the parent's own events do not.
+        for e in &run.events {
+            if e["type"] == "task.start" || e["type"] == "task.end" {
+                assert!(e["task_id"].is_string());
+            }
+        }
+        let child_text: Vec<&Value> = run.events.iter().filter(|e| e["type"] == "delta" && e.get("task_id").is_some()).collect();
+        assert_eq!(child_text.len(), 3);
+        assert!(run.events.iter().any(|e| e["type"] == "delta" && e.get("task_id").is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_failing_task_does_not_sink_the_others_and_can_be_resumed() {
+        let base = mock_model(10, true).await;
+        let run = run_parent(&base, true).await;
+        assert_eq!(run.answer.as_deref(), Ok("ALL DONE"), "the parent carries on");
+
+        let results: Vec<String> = run.messages.iter().filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap().to_string()).collect();
+        assert!(results[0].contains("answer-1"));
+        assert!(results[1].starts_with("Error: subagent worker failed"), "{}", results[1]);
+        assert!(results[2].contains("answer-3"));
+
+        // The failure names a task_id, and that task's conversation was saved.
+        let id = results[1].split("task_id: ").nth(1).unwrap().split_whitespace().next().unwrap();
+        let saved = delegation::load_task(id).expect("failed task was checkpointed");
+        assert_eq!(saved.agent, "worker");
+        assert!(saved.messages.iter().any(|m| m["content"].as_str().is_some_and(|c| c.contains("do-sub-2"))));
+
+        let failed = run.events.iter().find(|e| e["type"] == "task.end" && e["status"] == "failed").expect("failed end event");
+        assert_eq!(failed["task_id"], id);
     }
 }

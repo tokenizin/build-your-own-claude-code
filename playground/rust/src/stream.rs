@@ -3,8 +3,39 @@
 use serde_json::{Value, json};
 use std::io::Write;
 
+/// Which delegated task an event belongs to (protocol 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskScope {
+    pub task_id: String,
+    /// The parent's `Task` tool-call id; ties the task to its card.
+    pub parent_call_id: String,
+    /// The delegating task, when this one was delegated by another subagent.
+    pub parent_task_id: Option<String>,
+}
+
 /// Writes one JSON object per line to stdout, flushed after each line.
-pub struct Emitter;
+///
+/// A scoped emitter (see [`Emitter::scoped`]) stamps `task_id`, `parent_call_id`
+/// and, for nested delegation, `parent_task_id` on every event it emits.
+#[derive(Default)]
+pub struct Emitter {
+    scope: Option<TaskScope>,
+    /// Captures events instead of printing them (tests only).
+    #[cfg(test)]
+    pub sink: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
+}
+
+/// `event` with the task scope fields added (unscoped events pass through).
+pub fn stamp(mut event: Value, scope: Option<&TaskScope>) -> Value {
+    if let (Some(scope), Value::Object(map)) = (scope, &mut event) {
+        map.insert("task_id".into(), Value::String(scope.task_id.clone()));
+        map.insert("parent_call_id".into(), Value::String(scope.parent_call_id.clone()));
+        if let Some(parent) = &scope.parent_task_id {
+            map.insert("parent_task_id".into(), Value::String(parent.clone()));
+        }
+    }
+    event
+}
 
 /// `{"type":"usage"}` event from an OpenAI-style `usage` object, or None when
 /// the endpoint reported nothing. `input` excludes cached prompt tokens, which
@@ -25,7 +56,34 @@ pub fn usage_event(usage: &Value, model: &str) -> Option<Value> {
 }
 
 impl Emitter {
+    /// An emitter that records events instead of printing them (tests only).
+    #[cfg(test)]
+    pub fn capturing() -> (Emitter, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (Emitter { scope: None, sink: Some(sink.clone()) }, sink)
+    }
+
+    /// An emitter for one delegated task. Nested tasks record their delegator.
+    pub fn scoped(&self, task_id: &str, parent_call_id: &str) -> Emitter {
+        Emitter {
+            scope: Some(TaskScope {
+                task_id: task_id.to_string(),
+                parent_call_id: parent_call_id.to_string(),
+                parent_task_id: self.scope.as_ref().map(|s| s.task_id.clone()),
+            }),
+            #[cfg(test)]
+            sink: self.sink.clone(),
+        }
+    }
+
     pub fn emit(&self, event: Value) {
+        let event = stamp(event, self.scope.as_ref());
+        #[cfg(test)]
+        if let Some(sink) = &self.sink {
+            sink.lock().expect("event sink").push(event);
+            return;
+        }
+        // One locked write per event keeps lines whole when tasks run concurrently.
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{event}");
         let _ = out.flush();
@@ -318,6 +376,27 @@ mod usage_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_events_carry_task_ids_and_nesting() {
+        let (root, sink) = Emitter::capturing();
+        root.emit(json!({ "type": "delta", "text": "hi" }));
+        let child = root.scoped("task_a", "call_1");
+        child.emit(json!({ "type": "tool", "id": "c" }));
+        let grandchild = child.scoped("task_b", "call_9");
+        grandchild.emit(json!({ "type": "delta", "text": "x" }));
+
+        let events = sink.lock().unwrap().clone();
+        assert!(events[0].get("task_id").is_none(), "root events stay unstamped");
+        assert_eq!(events[1]["task_id"], "task_a");
+        assert_eq!(events[1]["parent_call_id"], "call_1");
+        assert!(events[1].get("parent_task_id").is_none());
+        assert_eq!(events[2]["task_id"], "task_b");
+        assert_eq!(events[2]["parent_task_id"], "task_a");
+        assert_eq!(events[2]["parent_call_id"], "call_9");
+        // Non-object events are left alone.
+        assert_eq!(stamp(json!("x"), None), json!("x"));
+    }
+
 
     #[test]
     fn object_arguments_are_kept() {
