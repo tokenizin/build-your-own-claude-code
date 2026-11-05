@@ -11,6 +11,7 @@ mod opencode_config;
 mod skills;
 mod stream;
 mod tools;
+mod workflows;
 
 use async_openai::{Client, config::OpenAIConfig};
 use futures_util::StreamExt;
@@ -561,11 +562,20 @@ async fn run_agent_loop(
         let message = match streamed {
             Some(message) => message,
             None => {
-                let response: Value = client
-                    .chat()
-                    .create_byot(request)
-                    .await
-                    .map_err(|err| format_api_error(err))?;
+                let mut attempt = 0;
+                let response: Value = loop {
+                    match client.chat().create_byot(request.clone()).await {
+                        Ok(response) => break response,
+                        // A gateway in front of a slow model answers 502/504 when the model took too long (a cold start, a busy
+                        // server): the next try, with the model warm, usually goes through. Anything else is the caller's to see.
+                        Err(err) if attempt < gateway_retries() && is_gateway_error(&err.to_string()) => {
+                            attempt += 1;
+                            eprintln!("model endpoint: {err} — trying again ({attempt}/{})", gateway_retries());
+                            tokio::time::sleep(gateway_backoff(attempt)).await;
+                        }
+                        Err(err) => return Err(format_api_error(err)),
+                    }
+                };
                 let mut message = response["choices"]
                     .as_array()
                     .and_then(|a| a.first())
@@ -899,6 +909,9 @@ struct Delegation<'a> {
     lane: Option<&'a str>,
     /// An explicit model for this run (the Task call's `model`); wins over the agent's own.
     model: Option<String>,
+    /// This process is the run itself (a workflow runner's own process): its events are the process's
+    /// own, not a task's, so there is no `task.start` / `task.end`.
+    inline: bool,
 }
 
 /// Runs a delegated agent to its answer, in its own context.
@@ -915,7 +928,7 @@ async fn run_delegated(
     depth: u8,
     d: Delegation<'_>,
 ) -> (Result<String, String>, Vec<Value>) {
-    let Delegation { skill, task_id, mut messages, description, mode, resumed, call_id, meta, workflow, lane, model } = d;
+    let Delegation { skill, task_id, mut messages, description, mode, resumed, call_id, meta, workflow, lane, model, inline } = d;
     let task_cfg = match model.as_ref().or(skill.model.as_ref()) {
         Some(model) => cfg.with_model(model),
         None => cfg.clone(),
@@ -923,13 +936,16 @@ async fn run_delegated(
     eprintln!("{mode} `{}` ({task_id}): model {}", skill.name, task_cfg.model);
 
     // Protocol 2: this run's events are stamped with its id and go to the UI live.
-    let scoped = top.filter(|t| t.protocol2).map(|t| t.emitter.scoped(&task_id, call_id));
-    let child_top = top.zip(scoped.as_ref()).map(|(t, emitter)| TopLevel {
-        emitter,
-        base_url: t.base_url.clone(),
-        stream: t.stream,
-        protocol2: true,
-    });
+    let scoped = top.filter(|t| t.protocol2 && !inline).map(|t| t.emitter.scoped(&task_id, call_id));
+    let child_top = match (inline, top) {
+        (true, Some(t)) => Some(TopLevel { emitter: t.emitter, base_url: t.base_url.clone(), stream: t.stream, protocol2: t.protocol2 }),
+        _ => top.zip(scoped.as_ref()).map(|(t, emitter)| TopLevel {
+            emitter,
+            base_url: t.base_url.clone(),
+            stream: t.stream,
+            protocol2: true,
+        }),
+    };
     if let Some(emitter) = &scoped {
         emitter.emit(json!({
             "type": "task.start",
@@ -1088,6 +1104,7 @@ async fn handle_task(
             workflow: None,
             lane,
             model: args["model"].as_str().and_then(delegation::endpoint_model),
+            inline: false,
         },
     )
     .await;
@@ -1173,64 +1190,76 @@ fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
     }
 }
 
-/// `nomadflow_run_workflow` / `nomadflow_prompt_workflow`: run a task lifecycle in a workflow session of its own
-/// (a Workflow Runner orchestrating the team), ending in a handover for the Product Manager to evaluate.
-///
-/// The session has an id (`wf_…`). Passing it back — to either tool — resumes that session with the
-/// instructions as a follow-up (a bounce-back), and records the reason in the handover's review log.
-/// Runs synchronously: the Product Manager's communication with agents is synchronous, and the agent is one
-/// process per message, so a "background" session would end with it.
-async fn handle_nomadflow(
-    client: &Client<OpenAIConfig>,
-    cfg: &LlmConfig,
-    skills: &[Skill],
-    top: Option<&TopLevel<'_>>,
-    call: &PreparedCall,
-    depth: u8,
-) -> String {
-    let args = &call.args;
-    let tool = call.name.as_str();
+/// Whether `nomadflow_*` start workflows in the background (`NOMAD_WORKFLOW_MODE=async`), as OpenCode's
+/// NomadWorks plugin does: the call returns at once, the Workflow Runner works in a session of its own
+/// (run by the host in a second process, see `run_workflow_session`), and the Product Manager is told
+/// when it is done. Off by default: without a host that does this, a background session would end with
+/// the process, so the workflow runs inside the call instead.
+fn workflow_async() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TEST_ASYNC.with(|t| t.get()) {
+        return forced;
+    }
+    env::var("NOMAD_WORKFLOW_MODE").map(|v| v.trim().eq_ignore_ascii_case("async")).unwrap_or(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ASYNC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// A workflow session ready to run: the runner, its id and the conversation it starts (or resumes) from.
+struct Prepared {
+    runner: Skill,
+    /// The workflow's id (`wf_…`); the host's session id is `ses_lcl_` + this.
+    session_id: String,
+    task_path: String,
+    resumed: bool,
+    messages: Vec<Value>,
+    previous_meta: Option<Value>,
+    worktree: PathBuf,
+}
+
+/// Reads a `nomadflow_*` call: what to run, and the conversation to run it with. `forced_id` is the id a
+/// new workflow must get (the host and the Product Manager already know it).
+fn prepare_workflow(tool: &str, args: &Value, skills: &[Skill], forced_id: Option<&str>) -> Result<Prepared, String> {
     let text_of = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let Some(instructions) = text_of("instructions").or_else(|| text_of("text")) else {
-        return format!("Error: {tool} requires {}.", if tool == "nomadflow_run_workflow" { "task_path and instructions" } else { "session_id and text" });
+        return Err(format!("Error: {tool} requires {}.", if tool == "nomadflow_run_workflow" { "task_path and instructions" } else { "session_id and text" }));
     };
 
-    let requested_session = text_of("session_id");
+    let requested_session = text_of("session_id").map(|s| workflows::workflow_id(&s));
     let record = requested_session.as_deref().and_then(delegation::load_task);
     if tool == "nomadflow_prompt_workflow" && record.is_none() {
-        return format!(
+        return Err(format!(
             "Error: unknown workflow session `{}`. Start one with nomadflow_run_workflow, or pass the session_id it returned.",
             requested_session.as_deref().unwrap_or("")
-        );
+        ));
     }
     let previous_meta = record.as_ref().and_then(|r| r.meta.clone());
     let meta_str = |key: &str| previous_meta.as_ref().and_then(|m| m[key].as_str()).map(str::to_string);
     let Some(task_path) = text_of("task_path").or_else(|| meta_str("task_path")) else {
-        return "Error: nomadflow_run_workflow requires task_path and instructions.".into();
+        return Err("Error: nomadflow_run_workflow requires task_path and instructions.".into());
     };
 
-    let fallback;
     let runner = match skill_by_name(skills, "workflow_runner").or_else(|| skill_by_name(skills, "runner")) {
-        Some(skill) => skill,
-        None => {
-            fallback = Skill {
-                name: "workflow_runner".into(),
-                description: "NomadWorks workflow runner (built in)".into(),
-                body: String::new(),
-                directory: PathBuf::from("."),
-                context: Some("fork".into()),
-                policies: Vec::new(),
-                model: None,
-            };
-            &fallback
-        }
+        Some(skill) => skill.clone(),
+        None => Skill {
+            name: "workflow_runner".into(),
+            description: "NomadWorks workflow runner (built in)".into(),
+            body: String::new(),
+            directory: PathBuf::from("."),
+            context: Some("fork".into()),
+            policies: Vec::new(),
+            model: None,
+        },
     };
 
     let worktree = workflow_worktree();
     let resumed = record.is_some();
     let session_id = match (&requested_session, resumed) {
-        (Some(id), _) if delegation::load_task(id).is_some() => id.clone(),
-        _ => delegation::new_id("wf"),
+        (Some(id), true) => id.clone(),
+        _ => forced_id.map(str::to_string).unwrap_or_else(|| delegation::new_id("wf")),
     };
     let messages = match record {
         Some(record) => {
@@ -1245,9 +1274,33 @@ async fn handle_nomadflow(
             }
             messages
         }
-        None => agents::build_fork_messages(runner, &nomad_tools::workflow_fork_prompt(&worktree, &task_path, &instructions, &session_id)),
+        None => agents::build_fork_messages(&runner, &nomad_tools::workflow_fork_prompt(&worktree, &task_path, &instructions, &session_id)),
     };
+    Ok(Prepared { runner, session_id, task_path, resumed, messages, previous_meta, worktree })
+}
 
+/// How a workflow session ended.
+struct Finished {
+    outcome: Result<String, String>,
+    filed: Option<handover::Filed>,
+}
+
+/// Runs a prepared workflow to its handover. `inline`: this process *is* the runner's session, so its events
+/// are the process's own (not a task's) — see `run_workflow_session`.
+// One argument more than clippy likes; the call sites pass the same run context every time.
+#[allow(clippy::too_many_arguments)]
+async fn run_prepared(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    depth: u8,
+    prepared: &Prepared,
+    call_id: &str,
+    inline: bool,
+) -> Finished {
+    let Prepared { runner, session_id, task_path, resumed, previous_meta, worktree, .. } = prepared;
+    let meta_str = |key: &str| previous_meta.as_ref().and_then(|m| m[key].as_str()).map(str::to_string);
     let scope = WorkflowScope {
         session_id: session_id.clone(),
         task_path: task_path.clone(),
@@ -1255,9 +1308,9 @@ async fn handle_nomadflow(
         agent: runner.name.clone(),
         filed: Mutex::new(None),
     };
-    let task_id = handover::task_id_of(&task_path);
+    let task_id = handover::task_id_of(task_path);
     log_workflow_event(
-        &worktree,
+        worktree,
         json!({ "event": "workflow:started", "session_id": session_id, "task": task_path, "task_id": task_id, "resumed": resumed }),
     );
 
@@ -1275,15 +1328,16 @@ async fn handle_nomadflow(
         Delegation {
             skill: runner,
             task_id: session_id.clone(),
-            messages,
+            messages: prepared.messages.clone(),
             description: format!("Workflow {task_id}"),
             mode: "orchestrator",
-            resumed,
-            call_id: &call.id,
+            resumed: *resumed,
+            call_id,
             meta: Some(base_meta),
             workflow: Some(&scope),
             lane: None,
             model: None,
+            inline,
         },
     )
     .await;
@@ -1292,7 +1346,7 @@ async fn handle_nomadflow(
     if let Some(filed) = &filed {
         // The session now knows its handover, for the next bounce.
         delegation::save_task(
-            &session_id,
+            session_id,
             delegation::TaskRecord {
                 agent: runner.name.clone(),
                 messages: consistent_prefix(&messages),
@@ -1305,7 +1359,7 @@ async fn handle_nomadflow(
             },
         );
         log_workflow_event(
-            &worktree,
+            worktree,
             json!({
                 "event": "handover:filed", "session_id": session_id, "task": task_path,
                 "outcome": filed.outcome.as_str(), "revision": filed.revision,
@@ -1313,25 +1367,62 @@ async fn handle_nomadflow(
             }),
         );
     }
+    match (&outcome, &filed) {
+        (Ok(_), Some(filed)) => log_workflow_event(worktree, json!({ "event": format!("workflow:{}", filed.outcome.as_str()), "session_id": session_id, "task": task_path })),
+        (Err(err), _) => log_workflow_event(worktree, json!({ "event": "workflow:errored", "session_id": session_id, "task": task_path, "error": err })),
+        _ => {}
+    }
+    Finished { outcome, filed }
+}
 
+fn headline_of(outcome: handover::Outcome) -> &'static str {
+    match outcome {
+        handover::Outcome::Completed => "SUCCESS: Workflow completed",
+        handover::Outcome::Partial => "PARTIAL: Workflow ended with work left",
+        handover::Outcome::Blocked => "BLOCKED: Workflow cannot continue without a decision",
+        handover::Outcome::Failed => "Error: Workflow failed",
+    }
+}
+
+/// `nomadflow_run_workflow` / `nomadflow_prompt_workflow`: run a task lifecycle in a workflow session of its own
+/// (a Workflow Runner orchestrating the team), ending in a handover for the Product Manager to evaluate.
+///
+/// The session has an id (`wf_…`). Passing it back — to either tool — resumes that session with the
+/// instructions as a follow-up (a bounce-back), and records the reason in the handover's review log.
+/// By default this runs inside the call (the agent is one process per message, so a "background" session
+/// would end with it); with `NOMAD_WORKFLOW_MODE=async` the call only starts the workflow and the host runs it.
+async fn handle_nomadflow(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    call: &PreparedCall,
+    depth: u8,
+) -> String {
+    // Background workflows are the Product Manager's: a nested caller (a workflow's own orchestrator) waits for its result.
+    if let (true, 0, Some(top)) = (workflow_async(), depth, top) {
+        return nomadflow_in_background(top, call);
+    }
+    let prepared = match prepare_workflow(&call.name, &call.args, skills, None) {
+        Ok(prepared) => prepared,
+        Err(message) => return message,
+    };
+    let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, depth, &prepared, &call.id, false).await;
+
+    let session_id = &prepared.session_id;
+    let task_path = &prepared.task_path;
     let continue_hint = format!("session_id: {session_id} (pass it to nomadflow_prompt_workflow or nomadflow_run_workflow to send this workflow back or continue it)");
     match (outcome, filed) {
         (Ok(answer), Some(filed)) => {
-            log_workflow_event(&worktree, json!({ "event": format!("workflow:{}", filed.outcome.as_str()), "session_id": session_id, "task": task_path }));
-            let headline = match filed.outcome {
-                handover::Outcome::Completed => "SUCCESS: Workflow completed".to_string(),
-                handover::Outcome::Partial => "PARTIAL: Workflow ended with work left".to_string(),
-                handover::Outcome::Blocked => "BLOCKED: Workflow cannot continue without a decision".to_string(),
-                handover::Outcome::Failed => "Error: Workflow failed".to_string(),
-            };
             let warnings = if filed.warnings.is_empty() {
                 String::new()
             } else {
                 format!("\n{}", filed.warnings.iter().map(|w| format!("warning: {w}")).collect::<Vec<_>>().join("\n"))
             };
             format!(
-                "{headline} — handover filed (revision {}, verification {}, {} open issue(s)).\n{continue_hint}\ntask: {task_path}\nhandover: {}{warnings}\n\n\
+                "{} — handover filed (revision {}, verification {}, {} open issue(s)).\n{continue_hint}\ntask: {task_path}\nhandover: {}{warnings}\n\n\
 <handover>\n{}\n</handover>\n\n<workflow_result>\n{answer}\n</workflow_result>",
+                headline_of(filed.outcome),
                 filed.revision,
                 filed.verification,
                 filed.open_issues,
@@ -1340,11 +1431,124 @@ async fn handle_nomadflow(
             )
         }
         (Ok(answer), None) => format!("Error: workflow ended without a handover.\n{continue_hint}\n\n{answer}"),
-        (Err(err), _) => {
-            log_workflow_event(&worktree, json!({ "event": "workflow:errored", "session_id": session_id, "task": task_path, "error": err }));
-            format!("Error: workflow did not finish: {err}\n\n{continue_hint}; progress was saved")
-        }
+        (Err(err), _) => format!("Error: workflow did not finish: {err}\n\n{continue_hint}; progress was saved"),
     }
+}
+
+/// The asynchronous `nomadflow_*`: registers the workflow, tells the host to run it (a `workflow.start` /
+/// `workflow.prompt` event) and returns at once, in the words of NomadWorks' plugin.
+fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
+    let tool = call.name.as_str();
+    let args = &call.args;
+    let text_of = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let worktree = workflow_worktree();
+    let asking = if tool == "nomadflow_run_workflow" { "run complex workflows" } else { "send workflow runner prompts" };
+    if workflows::team_mode_blocks_workflows(&worktree) {
+        return format!("FAIL: Workflow Runner is unavailable in the current team configuration. Switch to full team mode to {asking}.");
+    }
+    let manager = env::var("CODENOMAD_SESSION_KEY").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "this session".into());
+    const BUSY: &str = "FAIL: A shared-worktree implementation workflow is already running. You may continue investigation or spec work separately, but only one implementation workflow can own the shared worktree at a time.";
+
+    // `nomadflow_run_workflow` with a session_id continues that session, as in the synchronous mode.
+    let follow_up = if tool == "nomadflow_prompt_workflow" || text_of("session_id").is_some() { Some(text_of("session_id")) } else { None };
+    if let Some(requested) = follow_up {
+        let (Some(requested), Some(text)) = (requested, text_of("text").or_else(|| text_of("instructions"))) else {
+            return format!("Error: {tool} requires {}.", if tool == "nomadflow_run_workflow" { "task_path and instructions" } else { "session_id and text" });
+        };
+        let id = workflows::workflow_id(&requested);
+        let Some(entry) = workflows::find(&worktree, &id) else {
+            return format!("Error: unknown workflow session `{requested}`. Start one with nomadflow_run_workflow, or pass the session_id it returned.");
+        };
+        let session = workflows::session_id(&id);
+        if entry.running() {
+            top.emitter.emit(json!({ "type": "workflow.prompt", "workflow_id": id, "session_id": session, "text": text, "active": true, "call_id": call.id }));
+            return format!("SUCCESS: Prompt sent to active session '{requested}'. Instructions added to queue. You will be notified on completion in this session ({manager}).");
+        }
+        if entry.track == "implementation" && workflows::running_implementation(&worktree).is_some() {
+            return BUSY.into();
+        }
+        workflows::set_state(&worktree, &id, "running");
+        log_workflow_event(&worktree, json!({ "event": "workflow:resumed", "session_id": id, "task": entry.task_path }));
+        top.emitter.emit(json!({ "type": "workflow.prompt", "workflow_id": id, "session_id": session, "text": text, "active": false, "call_id": call.id }));
+        return format!("SUCCESS: Session '{requested}' was not tracked. Sent prompt and resumed monitoring. You will be notified on completion in this session ({manager}).");
+    }
+
+    let (Some(task_path), Some(instructions)) = (text_of("task_path"), text_of("instructions")) else {
+        return "Error: nomadflow_run_workflow requires task_path and instructions.".into();
+    };
+    let meta = workflows::task_meta(&worktree, &task_path);
+    let track = meta.track_or_default();
+    if track == "implementation" && workflows::running_implementation(&worktree).is_some() {
+        return BUSY.into();
+    }
+    let id = delegation::new_id("wf");
+    let session = workflows::session_id(&id);
+    let entry = workflows::Entry { workflow_id: id.clone(), task_path: task_path.clone(), track: track.clone(), state: "running".into() };
+    if let Err(err) = workflows::write_entry(&worktree, &entry) {
+        return format!("FAIL: Failed to initiate session: {err}");
+    }
+    let file_name = Path::new(&task_path).file_name().and_then(|n| n.to_str()).unwrap_or(&task_path).to_string();
+    log_workflow_event(&worktree, json!({ "event": "workflow:queued", "session_id": id, "task": task_path, "track": track }));
+    top.emitter.emit(json!({
+        "type": "workflow.start",
+        "workflow_id": id,
+        "session_id": session,
+        "title": format!("Workflow Run: {file_name}"),
+        "task_path": task_path,
+        "track": track,
+        "instructions": instructions,
+        "prompt": workflows::display_prompt(&task_path, &meta, &track, &instructions),
+        "call_id": call.id,
+    }));
+    format!("SUCCESS: Workflow Runner session started. ID: {session}\nTrack: {track}\nInstructions sent for {task_path}. You will be notified on completion in this session ({manager}).")
+}
+
+/// Runs this process as a workflow's Workflow Runner (`NOMAD_WORKFLOW_RUN=1`; the host starts it after a
+/// `workflow.start` / `workflow.prompt` event). `NOMAD_WORKFLOW_SESSION` is the workflow's id: a session
+/// this process's task store already knows is resumed with `text` as the follow-up, any other starts new
+/// from `NOMAD_WORKFLOW_TASK_PATH` with `text` as the instructions. The process's own events are the
+/// runner's session (its specialists are tasks under it), and a `workflow.done` event closes it.
+async fn run_workflow_session(
+    client: &Client<OpenAIConfig>,
+    cfg: &LlmConfig,
+    skills: &[Skill],
+    top: Option<&TopLevel<'_>>,
+    text: &str,
+) -> Result<String, String> {
+    let id = env::var("NOMAD_WORKFLOW_SESSION").ok().map(|v| workflows::workflow_id(&v)).filter(|v| !v.is_empty());
+    let Some(id) = id else { return Err("NOMAD_WORKFLOW_RUN needs NOMAD_WORKFLOW_SESSION".into()) };
+    let (tool, args) = if delegation::load_task(&id).is_some() {
+        ("nomadflow_prompt_workflow", json!({ "session_id": id, "text": text }))
+    } else {
+        let task_path = env::var("NOMAD_WORKFLOW_TASK_PATH").unwrap_or_default();
+        ("nomadflow_run_workflow", json!({ "task_path": task_path, "instructions": text }))
+    };
+    let prepared = prepare_workflow(tool, &args, skills, Some(&id))?;
+    let worktree = prepared.worktree.clone();
+    let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, 0, &prepared, "", true).await;
+    workflows::set_state(&worktree, &id, "idle");
+    if let Some(top) = top {
+        let handover = filed.as_ref().map(|f| {
+            json!({
+                "outcome": f.outcome.as_str(), "path": f.display_path, "revision": f.revision,
+                "verification": f.verification, "open_issues": f.open_issues, "markdown": f.markdown,
+            })
+        });
+        top.emitter.emit(json!({
+            "type": "workflow.done",
+            "workflow_id": id,
+            "session_id": workflows::session_id(&id),
+            "task_path": prepared.task_path,
+            "status": match (&outcome, &filed) {
+                (Err(_), _) => "failed",
+                (Ok(_), Some(f)) if matches!(f.outcome, handover::Outcome::Blocked | handover::Outcome::Failed) => "failed",
+                _ => "completed",
+            },
+            "handover": handover,
+            "error": outcome.as_ref().err(),
+        }));
+    }
+    outcome
 }
 
 async fn handle_skill(
@@ -1390,6 +1594,33 @@ async fn handle_skill(
     let body = substitute_arguments(&skill.body, skill_args);
     let body = wrap_skill_body_for_location(skill, &body);
     Ok(body)
+}
+
+/// Extra tries for a step whose request the gateway in front of the model turned into a 502/503/504 (`LLM_GATEWAY_RETRIES`, default 2).
+fn gateway_retries() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = TEST_GATEWAY_RETRIES.with(|t| t.get()) {
+        return n;
+    }
+    env::var("LLM_GATEWAY_RETRIES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2).min(6)
+}
+
+fn gateway_backoff(attempt: u32) -> std::time::Duration {
+    #[cfg(test)]
+    return std::time::Duration::from_millis(10 * attempt as u64);
+    #[cfg(not(test))]
+    std::time::Duration::from_secs(3 * attempt as u64)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GATEWAY_RETRIES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// A gateway timeout or outage rather than an answer from the model: 502, 503, 504, "Bad Gateway", "upstream request failed".
+fn is_gateway_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["502", "503", "504", "bad gateway", "service unavailable", "gateway time", "upstream request failed"].iter().any(|n| lower.contains(n))
 }
 
 /// Credit/quota exhaustion (Ollama cloud: "usage credits … monthly max reached").
@@ -1481,6 +1712,36 @@ async fn main() -> std::process::ExitCode {
     }
 
     let (client, active_base) = resolve_client(&cfg).await;
+
+    // The host started this process to be a workflow's Workflow Runner (see `run_workflow_session`).
+    if env::var("NOMAD_WORKFLOW_RUN").map(|v| v.trim() == "1").unwrap_or(false) {
+        let top = stream_mode.then(|| TopLevel {
+            emitter: &emitter,
+            base_url: active_base.clone(),
+            stream: stream_enabled(),
+            protocol2: protocol2_enabled(),
+        });
+        if stream_mode {
+            emitter.emit(json!({
+                "type": "meta",
+                "model": cfg.model,
+                "agent": "workflow_runner",
+                "baseUrl": active_base,
+                "protocol": if protocol2_enabled() { 2 } else { 1 },
+            }));
+        }
+        return match run_workflow_session(&client, &cfg, &skills, top.as_ref(), &args.prompt.clone().unwrap_or_default()).await {
+            Ok(answer) => {
+                if stream_mode {
+                    emitter.emit(json!({ "type": "final", "text": answer, "model": cfg.model }));
+                } else {
+                    println!("{answer}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => fail(1, err),
+        };
+    }
 
     let initial = build_initial_run(&prompt, &skills);
     let run_cfg = if let Some(model) = &args.model {
@@ -2112,6 +2373,349 @@ mod tests {
         let _ = fs::remove_dir_all(wt);
     }
 
+    // ------------------------------------------------------------ a flaky gateway in front of the model
+
+    /// An endpoint that answers `status` (with `body`) to its first `failures` requests, then a plain answer. Counts requests.
+    async fn flaky_endpoint(failures: usize, status: &'static str, body: &'static str) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let mut got = 0;
+                    loop {
+                        let n = sock.read(&mut buf[got..]).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        got += n;
+                        if let Some(pos) = buf[..got].windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                            let want: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                            if got >= pos + 4 + want { break; }
+                        }
+                    }
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let (code, payload) = if n < failures {
+                        (status, body.to_string())
+                    } else {
+                        ("200 OK", json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ANSWER" }, "finish_reason": "stop" }] }).to_string())
+                    };
+                    let out = format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len());
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    async fn one_step(base: &str) -> Result<String, String> {
+        let cfg = LlmConfig { base_url: base.into(), fallback_base_url: base.into(), api_key: "k".into(), model: "m".into(), max_tokens: 64 };
+        // The HTTP library's own retries are off here, so that what is counted is this step's.
+        let no_library_retries = backoff::ExponentialBackoffBuilder::new().with_max_elapsed_time(Some(std::time::Duration::ZERO)).build();
+        let client = Client::with_config(OpenAIConfig::new().with_api_base(base).with_api_key("k")).with_backoff(no_library_retries);
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::None, None, 0, None).await.map_err(|e| e.to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gateway_timeout_is_tried_again_and_the_run_goes_on() {
+        TEST_GATEWAY_RETRIES.with(|t| t.set(Some(2)));
+        let (base, seen) = flaky_endpoint(2, "502 Bad Gateway", "upstream request failed").await;
+        let answer = one_step(&base).await;
+        TEST_GATEWAY_RETRIES.with(|t| t.set(None));
+        assert_eq!(answer.as_deref(), Ok("ANSWER"));
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "two gateway errors, then the answer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gateway_that_keeps_failing_ends_the_run_after_the_retries() {
+        TEST_GATEWAY_RETRIES.with(|t| t.set(Some(2)));
+        let (base, seen) = flaky_endpoint(100, "504 Gateway Timeout", "gateway time-out").await;
+        let answer = one_step(&base).await;
+        TEST_GATEWAY_RETRIES.with(|t| t.set(None));
+        assert!(answer.is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "the first try and two more, no more");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_from_the_model_is_not_retried() {
+        TEST_GATEWAY_RETRIES.with(|t| t.set(Some(2)));
+        let (base, seen) = flaky_endpoint(100, "400 Bad Request", r#"{"error":{"message":"bad request"}}"#).await;
+        let answer = one_step(&base).await;
+        TEST_GATEWAY_RETRIES.with(|t| t.set(None));
+        assert!(answer.is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "an answer from the model, even a refusal, is final");
+    }
+
+    #[test]
+    fn gateway_errors_are_told_from_the_models_own() {
+        assert!(is_gateway_error("502 Bad Gateway upstream request failed"));
+        assert!(is_gateway_error("HTTP 504 Gateway Timeout"));
+        assert!(is_gateway_error("503 Service Unavailable"));
+        assert!(!is_gateway_error("400 Bad Request: invalid tool schema"));
+        assert!(!is_gateway_error("429 Too Many Requests"));
+    }
+
+    // ------------------------------------------------------------ asynchronous workflows (OpenCode's flow)
+
+    /// Switches the background mode on for this test's thread and back off after.
+    struct AsyncMode;
+    impl AsyncMode {
+        fn on() -> AsyncMode {
+            TEST_ASYNC.with(|t| t.set(Some(true)));
+            AsyncMode
+        }
+    }
+    impl Drop for AsyncMode {
+        fn drop(&mut self) {
+            TEST_ASYNC.with(|t| t.set(None));
+        }
+    }
+
+    fn event_of<'a>(run: &'a Run, kind: &str) -> Option<&'a Value> {
+        run.events.iter().find(|e| e["type"] == kind)
+    }
+
+    fn add_task(wt: &Path, name: &str, front_matter: &str) -> String {
+        let dir = wt.join(format!("tasks/todo/{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.md")), format!("{front_matter}# {name}\n\n# Post Implementation Task Updates\n")).unwrap();
+        format!("tasks/todo/{name}/{name}.md")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_the_background_a_workflow_starts_and_returns_at_once() {
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-start");
+        let task = add_task(&wt, "TASK-BG", "---\nstatus: active\ncomplexity: complex\ntrack: implementation\nslice: logic\n---\n");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": task, "instructions": "run the lifecycle" })), requests.clone()).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "the manager's process does not run the runner");
+
+        // The tool's answer is NomadWorks' plugin's, word for word.
+        let result = workflow_result(&run);
+        let session = result.strip_prefix("SUCCESS: Workflow Runner session started. ID: ").and_then(|r| r.split('\n').next()).expect(&result).to_string();
+        assert!(session.starts_with("ses_lcl_wf_"), "{session}");
+        assert_eq!(
+            result,
+            format!("SUCCESS: Workflow Runner session started. ID: {session}\nTrack: implementation\nInstructions sent for {task}. You will be notified on completion in this session (this session).")
+        );
+
+        // The host is told to run it.
+        let start = event_of(&run, "workflow.start").expect("workflow.start");
+        assert_eq!(start["session_id"], session.as_str());
+        assert_eq!(start["workflow_id"], session.trim_start_matches("ses_lcl_"));
+        assert_eq!(start["title"], "Workflow Run: TASK-BG.md");
+        assert_eq!(start["track"], "implementation");
+        assert_eq!(start["instructions"], "run the lifecycle");
+        assert_eq!(start["call_id"], "wf1");
+        let prompt = start["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with(&format!("Task File: {task}\n\nComplexity: complex\nTrack: implementation\nSlice: logic\nStatus: active\n\nInstructions: run the lifecycle")), "{prompt}");
+        assert!(event_of(&run, "task.start").is_none(), "no task: the runner is a session of its own");
+
+        // And it is on record as running.
+        let entry = workflows::find(&wt, session.trim_start_matches("ses_lcl_")).unwrap();
+        assert!(entry.running() && entry.task_path == task);
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_one_implementation_workflow_runs_at_a_time() {
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-guard");
+        let spec = add_task(&wt, "TASK-SPEC", "---\ntrack: spec\n---\n");
+        let first = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&first).starts_with("SUCCESS: Workflow Runner session started."));
+
+        let second = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go again" })), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(
+            workflow_result(&second),
+            "FAIL: A shared-worktree implementation workflow is already running. You may continue investigation or spec work separately, but only one implementation workflow can own the shared worktree at a time."
+        );
+        assert!(event_of(&second, "workflow.start").is_none());
+        assert_eq!(second.answer.as_deref(), Ok("PMA DONE"), "a refusal is a result, not the end of the run");
+
+        // Spec and investigation work may run alongside.
+        let third = flow(&wt, Runner::Happy, run_call(json!({ "task_path": spec, "instructions": "write it up" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&third).contains("Track: spec"), "{}", workflow_result(&third));
+
+        // Once the implementation workflow's runner is done, the next one may start.
+        let id = event_of(&first, "workflow.start").unwrap()["workflow_id"].as_str().unwrap().to_string();
+        workflows::set_state(&wt, &id, "idle");
+        let fourth = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go again" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&fourth).starts_with("SUCCESS: Workflow Runner session started."));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mini_team_has_no_workflow_runner() {
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-mini");
+        fs::create_dir_all(wt.join(".codenomad")).unwrap();
+        fs::write(wt.join(".codenomad/nomadworks.yaml"), "enabled: true\nteam_mode: mini\n").unwrap();
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(workflow_result(&run), "FAIL: Workflow Runner is unavailable in the current team configuration. Switch to full team mode to run complex workflows.");
+        let prompt = flow(&wt, Runner::Happy, json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": "ses_lcl_wf_x", "text": "hi" } }), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&prompt).ends_with("Switch to full team mode to send workflow runner prompts."));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prompting_a_background_workflow_queues_or_resumes_it() {
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-prompt");
+        let first = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        let start = event_of(&first, "workflow.start").unwrap();
+        let (session, id) = (start["session_id"].as_str().unwrap().to_string(), start["workflow_id"].as_str().unwrap().to_string());
+        let prompt = |text: &str| json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": session, "text": text } });
+
+        // Still running: the text is queued behind the runner's current run, and its own notification is promised.
+        let queued = flow(&wt, Runner::Happy, prompt("also check the CSV header"), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(workflow_result(&queued), format!("SUCCESS: Prompt sent to active session '{session}'. Instructions added to queue. You will be notified on completion in this session (this session)."));
+        let ev = event_of(&queued, "workflow.prompt").unwrap();
+        assert_eq!((ev["active"].clone(), ev["text"].as_str()), (json!(true), Some("also check the CSV header")));
+
+        // Finished (idle): it is resumed, and the manager is promised a notification.
+        workflows::set_state(&wt, &id, "idle");
+        let resumed = flow(&wt, Runner::Happy, prompt("the header is wrong"), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(
+            workflow_result(&resumed),
+            format!("SUCCESS: Session '{session}' was not tracked. Sent prompt and resumed monitoring. You will be notified on completion in this session (this session).")
+        );
+        let ev = event_of(&resumed, "workflow.prompt").unwrap();
+        assert_eq!((ev["active"].clone(), ev["session_id"].as_str()), (json!(false), Some(session.as_str())));
+        assert!(workflows::find(&wt, &id).unwrap().running(), "running again");
+
+        // A session nobody started is an error, and so are missing arguments.
+        let unknown = flow(&wt, Runner::Happy, json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": "ses_lcl_wf_nope", "text": "hi" } }), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&unknown).starts_with("Error: unknown workflow session `ses_lcl_wf_nope`"), "{}", workflow_result(&unknown));
+        let missing = flow(&wt, Runner::Happy, json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": session } }), Arc::new(AtomicUsize::new(0))).await;
+        assert_eq!(workflow_result(&missing), "Error: nomadflow_prompt_workflow requires session_id and text.");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_nested_caller_still_waits_for_its_workflow() {
+        // Only the Product Manager's own call runs in the background; a workflow runner delegating to another does not.
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-nested");
+        let base = scripted_model(|req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            let content = last["content"].as_str().unwrap_or("").to_string();
+            if system.contains("workflow_runner") {
+                return match last["role"].as_str().unwrap_or("") {
+                    "tool" if content.contains("Handover filed") => text_message("closing note"),
+                    _ => call_message("h1", "handover", valid_handover("export shipped")),
+                };
+            }
+            if req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool")) { text_message("DONE") } else {
+                call_message("w1", "nomadflow_run_workflow", json!({ "task_path": TASK, "instructions": "go" }))
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("workflow_runner", true)];
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let mut messages = vec![json!({ "role": "user", "content": "go" })];
+        // depth 1: as a subagent of the manager would call it.
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, Some(&top), 1, None).await.map_err(|e| e.to_string());
+        assert_eq!(answer.as_deref(), Ok("DONE"));
+        let result = messages.iter().find(|m| m["role"] == "tool").and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+        assert!(result.starts_with("SUCCESS: Workflow completed — handover filed"), "{result}");
+        assert!(sink.lock().unwrap().iter().all(|e| e["type"] != "workflow.start"));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    /// The host's second process: this one is the Workflow Runner, and its events are the runner session's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_runner_process_files_a_handover_and_reports_it_as_its_own_session() {
+        let wt = new_worktree("runner-process");
+        let base = scripted_model(|req| {
+            let last = last_message(req);
+            let content = last["content"].as_str().unwrap_or("").to_string();
+            match last["role"].as_str().unwrap_or("") {
+                "tool" if content.contains("Handover filed") => text_message("closing note"),
+                _ if content.contains("sent the workflow back") => call_message("h2", "handover", valid_handover("fixed the header")),
+                _ => call_message("h1", "handover", valid_handover("export shipped")),
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("workflow_runner", true)];
+        let id = delegation::new_id("wf");
+        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into() }).unwrap();
+        std::env::set_var("NOMAD_WORKFLOW_SESSION", workflows::session_id(&id));
+        std::env::set_var("NOMAD_WORKFLOW_TASK_PATH", TASK);
+
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let answer = run_workflow_session(&client, &cfg, &skills, Some(&top), "run the lifecycle").await;
+        assert_eq!(answer.as_deref(), Ok("closing note"));
+        let events = sink.lock().unwrap().clone();
+        assert!(events.iter().all(|e| e["type"] != "task.start" && e["type"] != "task.end"), "the process is the session, not a task");
+        assert!(events.iter().all(|e| e.get("task_id").is_none()), "its own events are not stamped as a task's");
+        assert!(events.iter().any(|e| e["type"] == "tool" && e["name"] == "handover"), "its tool calls stream as the session's own");
+        let done = events.iter().find(|e| e["type"] == "workflow.done").expect("workflow.done");
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["session_id"], workflows::session_id(&id).as_str());
+        assert_eq!(done["handover"]["outcome"], "completed");
+        assert_eq!(done["handover"]["revision"], 1);
+        assert_eq!(done["handover"]["path"], "tasks/todo/TASK-9/HANDOVER.md");
+        assert!(done["handover"]["markdown"].as_str().unwrap().contains("export shipped"));
+        assert!(!workflows::find(&wt, &id).unwrap().running(), "idle once its runner is done");
+        assert!(fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap().contains("revision: 1"));
+
+        // Sent back: the same session continues, and the reason goes in the review log.
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let again = run_workflow_session(&client, &cfg, &skills, Some(&top), "The CSV header is wrong, fix it.").await;
+        assert_eq!(again.as_deref(), Ok("closing note"));
+        let done = sink.lock().unwrap().iter().find(|e| e["type"] == "workflow.done").cloned().unwrap();
+        assert_eq!(done["handover"]["revision"], 2);
+        let file = fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap();
+        assert!(file.contains("The CSV header is wrong, fix it."), "{file}");
+        std::env::remove_var("NOMAD_WORKFLOW_SESSION");
+        std::env::remove_var("NOMAD_WORKFLOW_TASK_PATH");
+        let _ = fs::remove_dir_all(wt);
+        // A runner that never files its handover fails, and says so.
+        a_runner_that_cannot_finish_reports_the_failure_and_goes_idle().await;
+    }
+
+    /// Part of the runner-process test: the two share the process-wide environment, so they run one after the other.
+    async fn a_runner_that_cannot_finish_reports_the_failure_and_goes_idle() {
+        let wt = new_worktree("runner-fails");
+        let base = scripted_model(|_| text_message("no handover from me")).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("workflow_runner", true)];
+        let id = delegation::new_id("wf");
+        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into() }).unwrap();
+        std::env::set_var("NOMAD_WORKFLOW_SESSION", &id);
+        std::env::set_var("NOMAD_WORKFLOW_TASK_PATH", TASK);
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let answer = run_workflow_session(&client, &cfg, &skills, Some(&top), "go").await;
+        std::env::remove_var("NOMAD_WORKFLOW_SESSION");
+        std::env::remove_var("NOMAD_WORKFLOW_TASK_PATH");
+        assert!(answer.unwrap_err().contains("without filing a handover"));
+        let done = sink.lock().unwrap().iter().find(|e| e["type"] == "workflow.done").cloned().unwrap();
+        assert_eq!(done["status"], "failed");
+        assert!(done["error"].as_str().unwrap().contains("without filing a handover"));
+        assert!(done["handover"].is_null());
+        assert!(!workflows::find(&wt, &id).unwrap().running());
+        let _ = fs::remove_dir_all(wt);
+    }
+
     #[test]
     fn the_handover_tool_belongs_to_workflow_sessions_only() {
         assert!(file_handover(None, &valid_handover("x")).starts_with("Error: the handover tool is only available inside a workflow session"));
@@ -2160,16 +2764,29 @@ mod tests {
         assert!(saved.messages.iter().filter(|m| m["role"] == "tool").count() >= 2, "the steps it did are in the saved conversation");
     }
 
+    /// Blocks the calling (test model) thread until both parallel writers have reached their last turn, so the lane
+    /// of whichever one finishes first is still held when the other's write has already been tried. A fixed sleep
+    /// made these tests depend on how fast the machine was (D22, and again under load in Phase 7).
+    fn wait_for_both(arrived: &AtomicUsize) {
+        arrived.fetch_add(1, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        while arrived.load(Ordering::SeqCst) < 2 && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn two_writers(shared: String, other: Option<String>) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
+        let arrived = Arc::new(AtomicUsize::new(0));
+        // Lanes are named by call id and the lane table is process-wide: tests that run at the same time need ids of their own.
+        let (id_a, id_b) = (format!("ta-{}", delegation::new_task_id()), format!("tb-{}", delegation::new_task_id()));
         move |req| {
             let system = system_text(req);
             let last = last_message(req);
             if system.contains("agent `writer`") {
                 if last["role"] == "tool" {
-                    // Hold this writer's lane open after its write, so the other writer's write lands while it
-                    // is still live. Without this the first writer can finish and release its lane before the
-                    // second one writes, and nothing is refused (the test was timing-dependent).
-                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    // Hold this writer's lane open until the other writer has also tried its write (it is at its last
+                    // turn only after that), so one of the two is always turned away.
+                    wait_for_both(&arrived);
                     return text_message("writer done");
                 }
                 let which = req["messages"].to_string().contains("WRITER-B");
@@ -2183,8 +2800,8 @@ mod tests {
             let answered = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool"));
             if answered { return text_message("PMA DONE"); }
             json!({ "role": "assistant", "content": null, "tool_calls": [
-                { "id": "ta", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "a", "prompt": "WRITER-A" }).to_string() } },
-                { "id": "tb", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "b", "prompt": "WRITER-B" }).to_string() } },
+                { "id": id_a, "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "a", "prompt": "WRITER-A" }).to_string() } },
+                { "id": id_b, "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "b", "prompt": "WRITER-B" }).to_string() } },
             ] })
         }
     }
@@ -2380,11 +2997,13 @@ mod tests {
         let shared = dir.join("shared.txt");
         fs::write(&shared, "alpha\nbeta\n").unwrap();
         let path = shared.to_string_lossy().to_string();
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let (id_a, id_b) = (format!("ta-{}", delegation::new_task_id()), format!("tb-{}", delegation::new_task_id()));
         let base = scripted_model(move |req| {
             let system = system_text(req);
             if system.contains("agent `editor`") {
                 if last_message(req)["role"] == "tool" {
-                    std::thread::sleep(std::time::Duration::from_millis(400)); // keep the lane open (see two_writers)
+                    wait_for_both(&arrived); // keep the lane open until the other editor has tried (see two_writers)
                     return text_message("editor done");
                 }
                 let mine = req["messages"].to_string().contains("EDITOR-B");
@@ -2393,8 +3012,8 @@ mod tests {
             }
             if req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool")) { return text_message("PMA DONE"); }
             json!({ "role": "assistant", "content": null, "tool_calls": [
-                { "id": "ta", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "a", "prompt": "EDITOR-A" }).to_string() } },
-                { "id": "tb", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "b", "prompt": "EDITOR-B" }).to_string() } },
+                { "id": id_a, "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "a", "prompt": "EDITOR-A" }).to_string() } },
+                { "id": id_b, "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "b", "prompt": "EDITOR-B" }).to_string() } },
             ] })
         })
         .await;

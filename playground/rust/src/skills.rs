@@ -405,6 +405,18 @@ pub fn wrap_skill_body_for_location(skill: &Skill, body: &str) -> String {
     )
 }
 
+/// What follows the first `n` whitespace-separated tokens of `text`, with its own spacing and line breaks kept.
+fn after_tokens(text: &str, n: usize) -> String {
+    let mut rest = text.trim_start();
+    for _ in 0..n {
+        rest = match rest.find(char::is_whitespace) {
+            Some(end) => rest[end..].trim_start(),
+            None => "",
+        };
+    }
+    rest.trim_end().to_string()
+}
+
 /// Returns slash expansions, or `None` if not a slash prompt.
 /// A forked skill ends the expansion run (Claude Code rule); it is returned alone with args.
 pub fn expand_slash_invocation(prompt: &str, skills: &[Skill]) -> Option<Vec<SlashInvocation>> {
@@ -448,7 +460,9 @@ pub fn expand_slash_invocation(prompt: &str, skills: &[Skill]) -> Option<Vec<Sla
 
     if let Some(name) = fork_only {
         let skill = skill_by_name(skills, &name)?;
-        let arguments = arg_tokens.join(" ");
+        // The arguments are what follows the agent's name, as written: a multi-line message (a markdown table in a
+        // workflow's handover, say) keeps its lines instead of being flattened to one.
+        let arguments = after_tokens(stripped, expanded.len() + 1);
         let body = fork_user_body(skill, &arguments);
         return Some(vec![SlashInvocation {
             skill_name: name,
@@ -504,6 +518,27 @@ mod tests {
     fn substitute_indexed() {
         let out = substitute_arguments("$ARGUMENTS[1] $ARGUMENTS[0]", "first second");
         assert_eq!(out, "second first");
+    }
+
+    #[test]
+    fn a_forked_agent_gets_its_message_as_written_not_flattened() {
+        let skills = vec![Skill {
+            name: "pma".into(),
+            description: String::new(),
+            body: "Role body.".into(),
+            directory: PathBuf::from("/tmp/pma"),
+            context: Some("fork".into()),
+            policies: Vec::new(),
+            model: None,
+        }];
+        let message = "/pma [NomadFlow Notification] done.\n\n| Id | Status |\n|---|---|\n| R1 | met |\n";
+        let inv = expand_slash_invocation(message, &skills).expect("slash");
+        assert!(inv[0].body.ends_with("User request:\n[NomadFlow Notification] done.\n\n| Id | Status |\n|---|---|\n| R1 | met |"), "{}", inv[0].body);
+        // Spacing before the agent's name and after the message is not part of it.
+        let inv = expand_slash_invocation("  /pma   hello  \n", &skills).expect("slash");
+        assert!(inv[0].body.ends_with("User request:\nhello"));
+        assert_eq!(after_tokens("/a /b rest of it", 2), "rest of it");
+        assert_eq!(after_tokens("/a", 1), "");
     }
 
     #[test]
