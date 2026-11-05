@@ -1460,6 +1460,17 @@ fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
             return format!("Error: unknown workflow session `{requested}`. Start one with nomadflow_run_workflow, or pass the session_id it returned.");
         };
         let session = workflows::session_id(&id);
+        // Sending a workflow back again and again, with no completed handover, is the manager and runner
+        // talking to each other with nobody watching: after the limit the user is asked.
+        let limit = workflows::max_send_backs();
+        if limit > 0 && entry.send_backs >= limit {
+            return format!(
+                "FAIL: Workflow '{requested}' has already been sent back {} times without a completed handover (limit {limit}). Do not send it back again. \
+Tell the user where it stands (the latest handover's outcome and open issues) and ask how to proceed: retry with different instructions, change the task, or stop. A message from the user lifts this limit.",
+                entry.send_backs
+            );
+        }
+        workflows::set_send_backs(&worktree, &id, entry.send_backs + 1);
         if entry.running() {
             top.emitter.emit(json!({ "type": "workflow.prompt", "workflow_id": id, "session_id": session, "text": text, "active": true, "call_id": call.id }));
             return format!("SUCCESS: Prompt sent to active session '{requested}'. Instructions added to queue. You will be notified on completion in this session ({manager}).");
@@ -1483,7 +1494,7 @@ fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
     }
     let id = delegation::new_id("wf");
     let session = workflows::session_id(&id);
-    let entry = workflows::Entry { workflow_id: id.clone(), task_path: task_path.clone(), track: track.clone(), state: "running".into() };
+    let entry = workflows::Entry { workflow_id: id.clone(), task_path: task_path.clone(), track: track.clone(), state: "running".into(), send_backs: 0 };
     if let Err(err) = workflows::write_entry(&worktree, &entry) {
         return format!("FAIL: Failed to initiate session: {err}");
     }
@@ -1501,6 +1512,14 @@ fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
         "call_id": call.id,
     }));
     format!("SUCCESS: Workflow Runner session started. ID: {session}\nTrack: {track}\nInstructions sent for {task_path}. You will be notified on completion in this session ({manager}).")
+}
+
+/// A message from the user lifts the limit on send-backs (see `workflows::max_send_backs`); the host's own
+/// `[NomadFlow Notification]` / `[NomadFlow Error]` messages do not.
+fn lift_send_back_limit(prompt: &str, worktree: &Path) {
+    if !prompt.trim_start().starts_with("[NomadFlow") {
+        workflows::reset_all_send_backs(worktree);
+    }
 }
 
 /// Runs this process as a workflow's Workflow Runner (`NOMAD_WORKFLOW_RUN=1`; the host starts it after a
@@ -1527,6 +1546,10 @@ async fn run_workflow_session(
     let worktree = prepared.worktree.clone();
     let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, 0, &prepared, "", true).await;
     workflows::set_state(&worktree, &id, "idle");
+    // A completed handover ends the back-and-forth: the count starts again.
+    if filed.as_ref().is_some_and(|f| f.outcome == handover::Outcome::Completed) {
+        workflows::set_send_backs(&worktree, &id, 0);
+    }
     if let Some(top) = top {
         let handover = filed.as_ref().map(|f| {
             json!({
@@ -1741,6 +1764,12 @@ async fn main() -> std::process::ExitCode {
             }
             Err(err) => fail(1, err),
         };
+    }
+
+    // The user wrote this message (a notification from a workflow begins `[NomadFlow`): the limit on
+    // send-backs is lifted, since they are in the loop again.
+    if workflow_async() {
+        lift_send_back_limit(args.prompt.as_deref().unwrap_or(""), &workflow_worktree());
     }
 
     let initial = build_initial_run(&prompt, &skills);
@@ -2603,6 +2632,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_sent_back_too_often_is_left_to_the_user() {
+        let _mode = AsyncMode::on();
+        let wt = new_worktree("bg-limit");
+        let first = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        let start = event_of(&first, "workflow.start").unwrap();
+        let (session, id) = (start["session_id"].as_str().unwrap().to_string(), start["workflow_id"].as_str().unwrap().to_string());
+        let prompt = |n: usize| json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": session, "text": format!("try {n}") } });
+        workflows::set_state(&wt, &id, "idle");
+        for n in 1..=3 {
+            let sent = flow(&wt, Runner::Happy, prompt(n), Arc::new(AtomicUsize::new(0))).await;
+            assert!(workflow_result(&sent).starts_with("SUCCESS"), "send-back {n}: {}", workflow_result(&sent));
+            workflows::set_state(&wt, &id, "idle");
+        }
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 3);
+
+        // The fourth is refused, nothing is sent, and the manager is told to ask the user.
+        let refused = flow(&wt, Runner::Happy, prompt(4), Arc::new(AtomicUsize::new(0))).await;
+        let text = workflow_result(&refused);
+        assert!(text.starts_with("FAIL: Workflow '") && text.contains("sent back 3 times without a completed handover (limit 3)") && text.contains("ask how to proceed"), "{text}");
+        assert!(event_of(&refused, "workflow.prompt").is_none(), "nothing was sent to the runner");
+        assert!(!workflows::find(&wt, &id).unwrap().running());
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 3, "a refusal is not a send-back");
+
+        // The user speaks: the limit is lifted.
+        workflows::reset_all_send_backs(&wt);
+        let again = flow(&wt, Runner::Happy, prompt(5), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&again).starts_with("SUCCESS"), "{}", workflow_result(&again));
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 1);
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn only_the_users_message_lifts_the_send_back_limit() {
+        let wt = new_worktree("bg-lift");
+        workflows::write_entry(&wt, &workflows::Entry { workflow_id: "wf_l".into(), task_path: TASK.into(), track: "spec".into(), state: "idle".into(), send_backs: 3 }).unwrap();
+        lift_send_back_limit("[NomadFlow Notification] Workflow Runner has finished work for: t.md.", &wt);
+        lift_send_back_limit("[NomadFlow Error] Workflow Runner failed.", &wt);
+        assert_eq!(workflows::find(&wt, "wf_l").unwrap().send_backs, 3);
+        lift_send_back_limit("Please try once more.", &wt);
+        assert_eq!(workflows::find(&wt, "wf_l").unwrap().send_backs, 0);
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_nested_caller_still_waits_for_its_workflow() {
         // Only the Product Manager's own call runs in the background; a workflow runner delegating to another does not.
         let _mode = AsyncMode::on();
@@ -2653,7 +2726,7 @@ mod tests {
         let client = make_client(&base, "k");
         let skills = vec![skill("workflow_runner", true)];
         let id = delegation::new_id("wf");
-        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into() }).unwrap();
+        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into(), send_backs: 2 }).unwrap();
         std::env::set_var("NOMAD_WORKFLOW_SESSION", workflows::session_id(&id));
         std::env::set_var("NOMAD_WORKFLOW_TASK_PATH", TASK);
 
@@ -2673,6 +2746,7 @@ mod tests {
         assert_eq!(done["handover"]["path"], "tasks/todo/TASK-9/HANDOVER.md");
         assert!(done["handover"]["markdown"].as_str().unwrap().contains("export shipped"));
         assert!(!workflows::find(&wt, &id).unwrap().running(), "idle once its runner is done");
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 0, "a completed handover starts the count again");
         assert!(fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap().contains("revision: 1"));
 
         // Sent back: the same session continues, and the reason goes in the review log.
@@ -2699,7 +2773,7 @@ mod tests {
         let client = make_client(&base, "k");
         let skills = vec![skill("workflow_runner", true)];
         let id = delegation::new_id("wf");
-        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into() }).unwrap();
+        workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: TASK.into(), track: "implementation".into(), state: "running".into(), send_backs: 2 }).unwrap();
         std::env::set_var("NOMAD_WORKFLOW_SESSION", &id);
         std::env::set_var("NOMAD_WORKFLOW_TASK_PATH", TASK);
         let (emitter, sink) = Emitter::capturing();
@@ -2713,6 +2787,7 @@ mod tests {
         assert!(done["error"].as_str().unwrap().contains("without filing a handover"));
         assert!(done["handover"].is_null());
         assert!(!workflows::find(&wt, &id).unwrap().running());
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 2, "no completed handover, the count stays");
         let _ = fs::remove_dir_all(wt);
     }
 

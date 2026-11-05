@@ -124,6 +124,9 @@ pub struct Entry {
     pub track: String,
     /// `running` while its runner has work, `idle` after.
     pub state: String,
+    /// Times the Product Manager has sent this workflow back (or added to it) since its last `completed`
+    /// handover or the user's last message; see `max_send_backs`.
+    pub send_backs: u32,
 }
 
 impl Entry {
@@ -143,7 +146,7 @@ fn entry_path(worktree: &Path, workflow_id: &str) -> Option<PathBuf> {
 pub fn write_entry(worktree: &Path, entry: &Entry) -> Result<(), String> {
     let path = entry_path(worktree, &entry.workflow_id).ok_or_else(|| format!("bad workflow id `{}`", entry.workflow_id))?;
     fs::create_dir_all(registry_dir(worktree)).map_err(|e| e.to_string())?;
-    let doc = json!({ "workflow_id": entry.workflow_id, "task_path": entry.task_path, "track": entry.track, "state": entry.state });
+    let doc = json!({ "workflow_id": entry.workflow_id, "task_path": entry.task_path, "track": entry.track, "state": entry.state, "send_backs": entry.send_backs });
     fs::write(path, doc.to_string()).map_err(|e| e.to_string())
 }
 
@@ -154,6 +157,7 @@ fn read_entry(path: &Path) -> Option<Entry> {
         task_path: doc["task_path"].as_str().unwrap_or_default().to_string(),
         track: doc["track"].as_str().unwrap_or("implementation").to_string(),
         state: doc["state"].as_str().unwrap_or("idle").to_string(),
+        send_backs: doc["send_backs"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
     })
 }
 
@@ -178,6 +182,42 @@ pub fn set_state(worktree: &Path, workflow_id: &str, state: &str) {
     if let Some(mut entry) = find(worktree, workflow_id) {
         entry.state = state.into();
         let _ = write_entry(worktree, &entry);
+    }
+}
+
+/// How many times the manager may send a workflow back without a `completed` handover before it must ask the
+/// user (`NOMAD_WORKFLOW_MAX_SENDBACKS`, default 3; `0` = no limit). Nothing in OpenCode's plugin bounds this
+/// exchange, and each notification starts a manager turn that may prompt the runner again.
+pub fn max_send_backs() -> u32 {
+    parse_max_send_backs(std::env::var("NOMAD_WORKFLOW_MAX_SENDBACKS").ok().as_deref())
+}
+
+fn parse_max_send_backs(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(3)
+}
+
+/// Sets a workflow's send-back count.
+pub fn set_send_backs(worktree: &Path, workflow_id: &str, count: u32) {
+    if let Some(mut entry) = find(worktree, workflow_id) {
+        if entry.send_backs != count {
+            entry.send_backs = count;
+            let _ = write_entry(worktree, &entry);
+        }
+    }
+}
+
+/// A message from the user lifts the limit for every workflow: they are in the loop again.
+pub fn reset_all_send_backs(worktree: &Path) {
+    let ids: Vec<String> = fs::read_dir(registry_dir(worktree))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| read_entry(&e.path()))
+        .filter(|e| e.send_backs > 0)
+        .map(|e| e.workflow_id)
+        .collect();
+    for id in ids {
+        set_send_backs(worktree, &id, 0);
     }
 }
 
@@ -237,9 +277,28 @@ Please execute the full lifecycle (Sync -> Implementation -> Commit -> Archive) 
     }
 
     #[test]
+    fn send_backs_are_counted_kept_and_lifted() {
+        assert_eq!(parse_max_send_backs(None), 3);
+        assert_eq!(parse_max_send_backs(Some(" 5 ")), 5);
+        assert_eq!(parse_max_send_backs(Some("0")), 0);
+        assert_eq!(parse_max_send_backs(Some("many")), 3);
+        let wt = worktree("sendbacks");
+        write_entry(&wt, &Entry { workflow_id: "wf_a".into(), task_path: "t.md".into(), track: "spec".into(), state: "idle".into(), send_backs: 0 }).unwrap();
+        write_entry(&wt, &Entry { workflow_id: "wf_b".into(), task_path: "t.md".into(), track: "spec".into(), state: "idle".into(), send_backs: 0 }).unwrap();
+        set_send_backs(&wt, "wf_a", 2);
+        set_send_backs(&wt, "wf_b", 3);
+        set_state(&wt, "wf_a", "running");
+        assert_eq!(find(&wt, "wf_a").unwrap().send_backs, 2, "a state change keeps the count");
+        reset_all_send_backs(&wt);
+        assert_eq!((find(&wt, "wf_a").unwrap().send_backs, find(&wt, "wf_b").unwrap().send_backs), (0, 0));
+        assert!(find(&wt, "wf_a").unwrap().running(), "only the count changed");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
     fn the_registry_guards_one_running_implementation_workflow() {
         let wt = worktree("registry");
-        let entry = |id: &str, track: &str, state: &str| Entry { workflow_id: id.into(), task_path: "t.md".into(), track: track.into(), state: state.into() };
+        let entry = |id: &str, track: &str, state: &str| Entry { workflow_id: id.into(), task_path: "t.md".into(), track: track.into(), state: state.into(), send_backs: 0 };
         assert!(running_implementation(&wt).is_none());
         write_entry(&wt, &entry("wf_spec", "spec", "running")).unwrap();
         assert!(running_implementation(&wt).is_none(), "a spec workflow does not own the worktree");
