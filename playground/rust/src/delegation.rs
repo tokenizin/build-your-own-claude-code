@@ -69,11 +69,23 @@ needs in the prompt: it does not see this conversation.\n\nAvailable subagents:\
                     "task_id": {
                         "type": "string",
                         "description": "Resume an earlier task with this subagent (from a previous Task result)"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model for this task (e.g. ollama/qwen3.6:latest); the agent's own model by default"
                     }
                 }
             }
         }
     })
+}
+
+/// The endpoint's id for a model named in a Task call: an `ollama/` prefix (OpenCode's provider
+/// notation, as in the agent pins) is dropped; anything else is passed through unchanged.
+pub fn endpoint_model(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let id = trimmed.strip_prefix("ollama/").unwrap_or(trimmed).trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// Tool names models use for the same tools (OpenCode is lowercase), and close misses.

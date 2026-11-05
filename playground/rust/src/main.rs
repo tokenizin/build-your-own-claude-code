@@ -5,6 +5,7 @@ mod delegation;
 mod file_lease;
 mod handover;
 mod inputs;
+mod lanes;
 mod nomad_tools;
 mod opencode_config;
 mod skills;
@@ -82,6 +83,30 @@ struct TopLevel<'a> {
 /// `NOMAD_PROTOCOL=2` opts in to task-scoped events.
 fn protocol2_enabled() -> bool {
     env::var("NOMAD_PROTOCOL").map(|v| v.trim() == "2").unwrap_or(false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MAX_STEPS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// `raw` as a step count, or `default` when it is missing or not a positive number.
+fn parse_steps(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(default).min(2000)
+}
+
+/// Model round-trips one run may take (`NOMAD_MAX_STEPS`, default 40). A workflow session
+/// orchestrates a whole lifecycle, so it gets more (`NOMAD_MAX_WORKFLOW_STEPS`, default 120).
+fn max_steps(workflow: bool) -> usize {
+    #[cfg(test)]
+    if let Some(n) = TEST_MAX_STEPS.with(|t| t.get()) {
+        return n;
+    }
+    if workflow {
+        parse_steps(env::var("NOMAD_MAX_WORKFLOW_STEPS").ok().as_deref(), 120)
+    } else {
+        parse_steps(env::var("NOMAD_MAX_STEPS").ok().as_deref(), 40)
+    }
 }
 
 /// How many Task calls of one assistant turn run at once (`NOMAD_MAX_PARALLEL`, default 3).
@@ -478,6 +503,8 @@ struct RunScope<'a> {
     checkpoint: Option<Checkpoint<'a>>,
     /// Set for a workflow session: it gets the `handover` tool and must file one.
     workflow: Option<&'a WorkflowScope>,
+    /// The lane this run is in when it is one of several Task calls running at once (see lanes.rs).
+    lane: Option<&'a str>,
 }
 
 // One more argument than clippy likes; bundling them is a refactor of every call site.
@@ -496,7 +523,8 @@ async fn run_agent_loop(
     let checkpoint = scope.and_then(|s| s.checkpoint);
     let tools = tool_specs(tool_mode, skills, depth, workflow.is_some());
 
-    for _ in 0..40 {
+    let step_cap = max_steps(workflow.is_some());
+    for _ in 0..step_cap {
         let mut request = json!({
             "model": cfg.model,
             // One system message, first: strict chat templates reject any other layout.
@@ -616,7 +644,7 @@ async fn run_agent_loop(
                 while end < calls.len() && batchable(&calls[end]) {
                     end += 1;
                 }
-                run_task_batch(client, cfg, skills, top, &calls[idx..end], &mut outputs[idx..end], depth).await;
+                run_task_batch(client, cfg, skills, top, &calls[idx..end], &mut outputs[idx..end], depth, scope.and_then(|s| s.lane)).await;
                 idx = end;
                 continue;
             }
@@ -626,7 +654,7 @@ async fn run_agent_loop(
                 // A failing workflow is a result the caller can react to, not the end of this run.
                 Box::pin(handle_nomadflow(client, cfg, skills, top, call, depth)).await
             } else {
-                Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth, workflow)).await?
+                Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth, scope)).await?
             };
             emit_tool_result(top, call, &result);
             outputs[idx] = Some(result);
@@ -646,7 +674,10 @@ async fn run_agent_loop(
         }
     }
 
-    Err("agent loop exceeded maximum iterations".into())
+    Err(format!(
+        "the agent used all {step_cap} steps without finishing (NOMAD_MAX_STEPS raises the limit); a delegated task keeps its progress, so its id can continue it"
+    )
+    .into())
 }
 
 /// A tool call with its name and arguments normalized.
@@ -695,15 +726,26 @@ async fn execute_call(
     tools: Option<&Value>,
     call: &PreparedCall,
     depth: u8,
-    workflow: Option<&WorkflowScope>,
+    scope: Option<&RunScope<'_>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fn_args = &call.args;
+    let workflow = scope.and_then(|s| s.workflow);
     let file_path = fn_args["file_path"].as_str().unwrap_or("");
     Ok(match call.name.as_str() {
         "Read" => file_lease::with_lease(file_path, &call.id, || execute_read(fn_args))
             .unwrap_or_else(|err| format!("Error: {err}")),
-        "Write" => file_lease::with_lease(file_path, &call.id, || execute_write(fn_args))
-            .unwrap_or_else(|err| format!("Error: {err}")),
+        "Write" => {
+            // Among Task calls running at the same time, a file belongs to the first lane that writes it.
+            if let Some(lane) = scope.and_then(|s| s.lane) {
+                if let Err(owner) = lanes::claim(file_path, lane) {
+                    return Ok(format!(
+                        "Error: {file_path} is being written by another task running in parallel ({owner}). Do not edit it from here: leave it to that task, \
+or report back so the work can be done one after the other."
+                    ));
+                }
+            }
+            file_lease::with_lease(file_path, &call.id, || execute_write(fn_args)).unwrap_or_else(|err| format!("Error: {err}"))
+        }
         // Off the async thread: a long command must not stall the other tasks of this turn.
         "Bash" => {
             let args = fn_args.clone();
@@ -747,6 +789,8 @@ fn duplicate_resumes(calls: &[PreparedCall]) -> Vec<bool> {
         .collect()
 }
 
+// Same shape as run_agent_loop, which it serves; bundling the arguments is a refactor of both.
+#[allow(clippy::too_many_arguments)]
 /// Runs a run of consecutive Task calls concurrently (at most `max_parallel()`
 /// at a time). Every card is announced up front, so the UI shows the whole
 /// dispatch at once; each result is reported the moment its task finishes.
@@ -758,13 +802,18 @@ async fn run_task_batch(
     calls: &[PreparedCall],
     outputs: &mut [Option<String>],
     depth: u8,
+    parent_lane: Option<&str>,
 ) {
     for call in calls {
         emit_tool(top, call);
     }
     let duplicate = duplicate_resumes(calls);
+    // Several tasks at once each get a lane of their own; a lone one stays in its parent's.
+    let parent_lane = parent_lane.map(str::to_string);
     let jobs = calls.iter().enumerate().map(move |(i, call)| {
         let duplicate = duplicate[i];
+        let own_lane = (calls.len() > 1).then(|| lanes::child_lane(parent_lane.as_deref(), &call.id));
+        let lane = own_lane.clone().or_else(|| parent_lane.clone());
         async move {
             let output = if duplicate {
                 format!(
@@ -773,8 +822,11 @@ turn. Resume it in a later turn, after that call has returned.",
                     call.args["task_id"].as_str().unwrap_or("")
                 )
             } else {
-                handle_task(client, cfg, skills, top, &call.id, &call.args, depth).await
+                handle_task(client, cfg, skills, top, call, depth, lane.as_deref()).await
             };
+            if let Some(own) = &own_lane {
+                lanes::release(own);
+            }
             (i, output)
         }
     });
@@ -816,6 +868,9 @@ struct Delegation<'a> {
     /// Saved with the conversation (a workflow remembers its task path and handover).
     meta: Option<Value>,
     workflow: Option<&'a WorkflowScope>,
+    lane: Option<&'a str>,
+    /// An explicit model for this run (the Task call's `model`); wins over the agent's own.
+    model: Option<String>,
 }
 
 /// Runs a delegated agent to its answer, in its own context.
@@ -832,8 +887,8 @@ async fn run_delegated(
     depth: u8,
     d: Delegation<'_>,
 ) -> (Result<String, String>, Vec<Value>) {
-    let Delegation { skill, task_id, mut messages, description, mode, resumed, call_id, meta, workflow } = d;
-    let task_cfg = match &skill.model {
+    let Delegation { skill, task_id, mut messages, description, mode, resumed, call_id, meta, workflow, lane, model } = d;
+    let task_cfg = match model.as_ref().or(skill.model.as_ref()) {
         Some(model) => cfg.with_model(model),
         None => cfg.clone(),
     };
@@ -867,7 +922,7 @@ async fn run_delegated(
             delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec(), meta: save_meta.clone() },
         )
     };
-    let scope = RunScope { checkpoint: Some(&checkpoint), workflow };
+    let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane };
     let mut outcome = Box::pin(run_agent_loop(
         client,
         &task_cfg,
@@ -949,10 +1004,11 @@ async fn handle_task(
     cfg: &LlmConfig,
     skills: &[Skill],
     top: Option<&TopLevel<'_>>,
-    call_id: &str,
-    args: &Value,
+    call: &PreparedCall,
     depth: u8,
+    lane: Option<&str>,
 ) -> String {
+    let (call_id, args) = (call.id.as_str(), &call.args);
     let agents = delegation::task_agents(skills);
     let requested = args["subagent_type"].as_str().unwrap_or("").trim();
     let prompt = args["prompt"].as_str().unwrap_or("").trim();
@@ -1002,6 +1058,8 @@ async fn handle_task(
             call_id,
             meta: None,
             workflow: None,
+            lane,
+            model: args["model"].as_str().and_then(delegation::endpoint_model),
         },
     )
     .await;
@@ -1196,6 +1254,8 @@ async fn handle_nomadflow(
             call_id: &call.id,
             meta: Some(base_meta),
             workflow: Some(&scope),
+            lane: None,
+            model: None,
         },
     )
     .await;
@@ -2031,5 +2091,151 @@ mod tests {
         let without = tool_specs(ToolMode::All, &[], 0, false).unwrap();
         let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "handover");
         assert!(has(&with) && !has(&without));
+    }
+
+    // ------------------------------------------------------------ hardening: step cap, lanes, Task model
+
+    #[test]
+    fn step_limits_come_from_the_environment_or_default() {
+        assert_eq!(parse_steps(None, 40), 40);
+        assert_eq!(parse_steps(Some("75"), 40), 75);
+        assert_eq!(parse_steps(Some(" 5 "), 40), 5);
+        assert_eq!(parse_steps(Some("0"), 40), 40, "zero would stop every run before it starts");
+        assert_eq!(parse_steps(Some("lots"), 40), 40);
+        assert_eq!(parse_steps(Some("99999"), 40), 2000, "capped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_never_finishes_stops_at_the_step_limit_and_a_task_can_continue() {
+        TEST_MAX_STEPS.with(|t| t.set(Some(3)));
+        // The subagent asks for a tool every time; the manager calls it once and then reports.
+        let base = scripted_model(|req| {
+            let system = system_text(req);
+            let answered = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool" && x["content"].as_str().is_some_and(|c| c.contains("task_id"))));
+            if system.contains("agent `looper`") {
+                call_message(&format!("r{}", req["messages"].as_array().map(|m| m.len()).unwrap_or(0)), "Read", json!({ "file_path": "/etc/hostname" }))
+            } else if answered { text_message("PMA DONE") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "looper", "description": "loop", "prompt": "never finish" }))
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("looper", true)];
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        let outcome = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, None).await;
+        TEST_MAX_STEPS.with(|t| t.set(None));
+        assert_eq!(outcome.as_deref().ok(), Some("PMA DONE"));
+        let result = messages.iter().rev().find(|m| m["role"] == "tool").and_then(|m| m["content"].as_str()).unwrap().to_string();
+        assert!(result.starts_with("Error: subagent looper failed: the agent used all 3 steps without finishing (NOMAD_MAX_STEPS raises the limit)"), "{result}");
+        let id = result.split("task_id: ").nth(1).unwrap().split_whitespace().next().unwrap();
+        let saved = delegation::load_task(id).expect("its progress was kept");
+        assert!(saved.messages.iter().filter(|m| m["role"] == "tool").count() >= 2, "the steps it did are in the saved conversation");
+    }
+
+    fn two_writers(shared: String, other: Option<String>) -> impl Fn(&Value) -> Value + Send + Sync + 'static {
+        move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `writer`") {
+                if last["role"] == "tool" { return text_message("writer done"); }
+                let which = req["messages"].to_string().contains("WRITER-B");
+                let (path, body) = match (&other, which) {
+                    (Some(o), true) => (o.clone(), "from B"),
+                    (_, true) => (shared.clone(), "from B"),
+                    (_, false) => (shared.clone(), "from A"),
+                };
+                return call_message("w", "Write", json!({ "file_path": path, "content": body }));
+            }
+            let answered = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool"));
+            if answered { return text_message("PMA DONE"); }
+            json!({ "role": "assistant", "content": null, "tool_calls": [
+                { "id": "ta", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "a", "prompt": "WRITER-A" }).to_string() } },
+                { "id": "tb", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "writer", "description": "b", "prompt": "WRITER-B" }).to_string() } },
+            ] })
+        }
+    }
+
+    async fn run_writers(reply: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Vec<String> {
+        let base = scripted_model(reply).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("writer", true)];
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        let outcome = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, None).await;
+        assert_eq!(outcome.as_deref().ok(), Some("PMA DONE"));
+        messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_parallel_tasks_cannot_overwrite_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("lanes-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared.txt").to_string_lossy().to_string();
+        let results = run_writers(two_writers(shared.clone(), None)).await;
+        // The refusal goes to the writer that was too late; the manager only sees each writer's final answer.
+        let refusals: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.split("task_id: ").nth(1).and_then(|t| t.split_whitespace().next()).and_then(delegation::load_task))
+            .flat_map(|task| task.messages)
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str().map(str::to_string))
+            .filter(|c| c.contains("is being written by another task running in parallel"))
+            .collect();
+        assert_eq!(refusals.len(), 1, "exactly one of the two writers is turned away: {refusals:?}");
+        assert!(refusals[0].starts_with(&format!("Error: {shared} is being written by another task running in parallel (t")), "{}", refusals[0]);
+        let content = fs::read_to_string(&shared).unwrap();
+        assert!(content == "from A" || content == "from B", "one writer's content, whole: {content}");
+        // And the file is free again once the batch is over.
+        assert_eq!(lanes::claim(&shared, "later"), Ok(()));
+        lanes::release("later");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_tasks_writing_different_files_do_not_get_in_each_others_way() {
+        let dir = std::env::temp_dir().join(format!("lanes2-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.txt").to_string_lossy().to_string(), dir.join("b.txt").to_string_lossy().to_string());
+        let results = run_writers(two_writers(a.clone(), Some(b.clone()))).await;
+        assert!(results.iter().all(|r| !r.contains("Error")), "{results:?}");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "from A");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "from B");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_task_model_names_the_endpoints_model() {
+        assert_eq!(delegation::endpoint_model("ollama/qwen3.6:latest").as_deref(), Some("qwen3.6:latest"));
+        assert_eq!(delegation::endpoint_model(" gemma4:26b ").as_deref(), Some("gemma4:26b"));
+        assert_eq!(delegation::endpoint_model("ollama/").as_deref(), None);
+        assert_eq!(delegation::endpoint_model("   ").as_deref(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_can_name_its_model_and_it_is_used_for_that_task_only() {
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let record = seen.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let model = req["model"].as_str().unwrap_or("").to_string();
+            let who = if system.contains("agent `named`") { "named" } else if system.contains("agent `plain`") { "plain" } else { "pma" };
+            record.lock().unwrap().push((who.to_string(), model));
+            if who != "pma" { return text_message("ok"); }
+            let answered = req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool"));
+            if answered { return text_message("PMA DONE"); }
+            json!({ "role": "assistant", "content": null, "tool_calls": [
+                { "id": "t1", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "named", "description": "n", "prompt": "p", "model": "ollama/qwen3.6:latest" }).to_string() } },
+                { "id": "t2", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "plain", "description": "p", "prompt": "p" }).to_string() } },
+            ] })
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "default-model".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("named", true), skill("plain", true)];
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, None).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.contains(&("named".into(), "qwen3.6:latest".into())), "{seen:?}");
+        assert!(seen.contains(&("plain".into(), "default-model".into())), "{seen:?}");
+        assert!(seen.contains(&("pma".into(), "default-model".into())));
     }
 }
