@@ -10,6 +10,7 @@ mod nomad_tools;
 mod opencode_config;
 mod skills;
 mod stream;
+mod tools;
 
 use async_openai::{Client, config::OpenAIConfig};
 use futures_util::StreamExt;
@@ -247,6 +248,8 @@ fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool) -> Op
 
             // P3: NomadWorks tools available to base + all (including forked agents).
             tools.extend(nomad_tools::tool_specs());
+            // Edit, Grep, Glob, WebFetch, TodoWrite, TodoRead (OpenCode's tool surface).
+            tools.extend(tools::tool_specs());
 
             // A workflow session reports back through its handover.
             if workflow {
@@ -505,6 +508,8 @@ struct RunScope<'a> {
     workflow: Option<&'a WorkflowScope>,
     /// The lane this run is in when it is one of several Task calls running at once (see lanes.rs).
     lane: Option<&'a str>,
+    /// Who owns this run's todo list: the delegated task's id; none for the top-level run.
+    owner: Option<&'a str>,
 }
 
 // One more argument than clippy likes; bundling them is a refactor of every call site.
@@ -690,7 +695,11 @@ struct PreparedCall {
 impl PreparedCall {
     fn from_value(call: &Value) -> Self {
         let name = delegation::canonical_tool_name(call["function"]["name"].as_str().unwrap_or("")).to_string();
-        let args = delegation::apply_aliases(&name, delegation::parse_arguments(&call["function"]["arguments"]));
+        let mut args = delegation::apply_aliases(&name, delegation::parse_arguments(&call["function"]["arguments"]));
+        if name == "TodoWrite" {
+            // The model, and the UI's plan panel, see the list in canonical form.
+            args = tools::normalize_todo_args(args);
+        }
         PreparedCall { id: call["id"].as_str().unwrap_or("").to_string(), name, args }
     }
 }
@@ -706,13 +715,19 @@ fn emit_tool(top: Option<&TopLevel<'_>>, call: &PreparedCall) {
     }
 }
 
+/// How much of a tool's output goes to the UI. An Edit's output is the diff its card draws, so a cut-off hunk would
+/// show wrong line counts; it gets room for the largest diff the tool produces (300 lines).
+fn ui_output_limit(tool: &str) -> usize {
+    if tool == "Edit" { 30_000 } else { 2_000 }
+}
+
 fn emit_tool_result(top: Option<&TopLevel<'_>>, call: &PreparedCall, result: &str) {
     if let Some(top) = top {
         top.emitter.emit(json!({
             "type": "tool_result",
             "id": call.id,
             "name": call.name,
-            "output": stream::truncate_chars(result, 2000),
+            "output": stream::truncate_chars(result, ui_output_limit(&call.name)),
             "isError": stream::is_error_output(result),
         }));
     }
@@ -734,7 +749,7 @@ async fn execute_call(
     Ok(match call.name.as_str() {
         "Read" => file_lease::with_lease(file_path, &call.id, || execute_read(fn_args))
             .unwrap_or_else(|err| format!("Error: {err}")),
-        "Write" => {
+        "Write" | "Edit" => {
             // Among Task calls running at the same time, a file belongs to the first lane that writes it.
             if let Some(lane) = scope.and_then(|s| s.lane) {
                 if let Err(owner) = lanes::claim(file_path, lane) {
@@ -744,8 +759,21 @@ or report back so the work can be done one after the other."
                     ));
                 }
             }
-            file_lease::with_lease(file_path, &call.id, || execute_write(fn_args)).unwrap_or_else(|err| format!("Error: {err}"))
+            let run = |args: &Value| if call.name == "Edit" { tools::edit(args) } else { execute_write(args) };
+            file_lease::with_lease(file_path, &call.id, || run(fn_args)).unwrap_or_else(|err| format!("Error: {err}"))
         }
+        // Searches walk the disk: off the async thread, like Bash.
+        "Grep" => {
+            let args = fn_args.clone();
+            tokio::task::spawn_blocking(move || tools::grep(&args)).await.unwrap_or_else(|err| format!("Error: search did not complete: {err}"))
+        }
+        "Glob" => {
+            let args = fn_args.clone();
+            tokio::task::spawn_blocking(move || tools::glob(&args)).await.unwrap_or_else(|err| format!("Error: search did not complete: {err}"))
+        }
+        "WebFetch" => tools::webfetch(fn_args).await,
+        "TodoWrite" => tools::todowrite(scope.and_then(|s| s.owner).unwrap_or("root"), fn_args),
+        "TodoRead" => tools::todoread(scope.and_then(|s| s.owner).unwrap_or("root")),
         // Off the async thread: a long command must not stall the other tasks of this turn.
         "Bash" => {
             let args = fn_args.clone();
@@ -922,7 +950,7 @@ async fn run_delegated(
             delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec(), meta: save_meta.clone() },
         )
     };
-    let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane };
+    let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane, owner: Some(task_id.as_str()) };
     let mut outcome = Box::pin(run_agent_loop(
         client,
         &task_cfg,
@@ -2137,7 +2165,13 @@ mod tests {
             let system = system_text(req);
             let last = last_message(req);
             if system.contains("agent `writer`") {
-                if last["role"] == "tool" { return text_message("writer done"); }
+                if last["role"] == "tool" {
+                    // Hold this writer's lane open after its write, so the other writer's write lands while it
+                    // is still live. Without this the first writer can finish and release its lane before the
+                    // second one writes, and nothing is refused (the test was timing-dependent).
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    return text_message("writer done");
+                }
                 let which = req["messages"].to_string().contains("WRITER-B");
                 let (path, body) = match (&other, which) {
                     (Some(o), true) => (o.clone(), "from B"),
@@ -2237,5 +2271,166 @@ mod tests {
         assert!(seen.contains(&("named".into(), "qwen3.6:latest".into())), "{seen:?}");
         assert!(seen.contains(&("plain".into(), "default-model".into())), "{seen:?}");
         assert!(seen.contains(&("pma".into(), "default-model".into())));
+    }
+
+    // ------------------------------------------------------------ OpenCode's tool surface
+
+    /// One agent that works through `steps` (one tool call per round trip), then reports.
+    async fn run_steps(steps: Vec<(&'static str, Value)>) -> Run {
+        let steps = Arc::new(steps);
+        let base = scripted_model(move |req| {
+            let done = req["messages"].as_array().map(|m| m.iter().filter(|x| x["role"] == "tool").count()).unwrap_or(0);
+            match steps.get(done) {
+                Some((name, args)) => call_message(&format!("s{done}"), name, args.clone()),
+                None => text_message("ALL STEPS DONE"),
+            }
+        })
+        .await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: false };
+        let mut messages = vec![json!({ "role": "system", "content": "you work" }), json!({ "role": "user", "content": "go" })];
+        // Its own todo scope: tests share one process, and the top-level run's default scope is shared state.
+        let owner = delegation::new_id("test");
+        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()) };
+        let started = std::time::Instant::now();
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, Some(&top), 0, Some(&scope)).await.map_err(|e| e.to_string());
+        let events = sink.lock().unwrap().clone();
+        Run { answer, messages, events, elapsed: started.elapsed() }
+    }
+
+    fn tool_outputs(run: &Run) -> Vec<String> {
+        run.messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_using_opencodes_names_and_arguments_can_plan_edit_search_and_fetch() {
+        let dir = std::env::temp_dir().join(format!("surface-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/app.ts"), "export const answer = 41\nexport const name = 'x'\n").unwrap();
+        let (file, root) = (dir.join("src/app.ts").to_string_lossy().to_string(), dir.to_string_lossy().to_string());
+        let site = tools::tests::serve(vec![("/doc", "text/html", b"<h1>Docs</h1><p>See <a href=\"/more\">more</a>.</p>".to_vec())]).await;
+
+        let run = run_steps(vec![
+            // lower-case names and camelCase arguments, sloppy statuses: what OpenCode prompts and weak models send
+            ("todowrite", json!({ "todos": [{ "content": "Fix the answer", "status": "doing" }, { "content": "Check it", "status": "todo", "priority": "HIGH" }] })),
+            ("edit", json!({ "filePath": file, "oldString": "answer = 41", "newString": "answer = 42" })),
+            ("grep", json!({ "pattern": "answer", "path": root, "include": "*.ts" })),
+            ("glob", json!({ "pattern": "src/*.ts", "path": root })),
+            ("webfetch", json!({ "url": format!("{site}/doc"), "format": "markdown" })),
+            ("todoread", json!({})),
+        ])
+        .await;
+        assert_eq!(run.answer.as_deref(), Ok("ALL STEPS DONE"));
+        let out = tool_outputs(&run);
+        assert!(out[0].starts_with("Todo list updated: 2 item(s): 0 completed, 1 in progress, 1 pending"), "{}", out[0]);
+        assert!(out[1].contains("-export const answer = 41") && out[1].contains("+export const answer = 42"), "{}", out[1]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "export const answer = 42\nexport const name = 'x'\n");
+        assert!(out[2].starts_with("Found 1 match") && out[2].contains("Line 1: export const answer = 42"), "{}", out[2]);
+        assert!(out[3].contains("app.ts"), "{}", out[3]);
+        assert_eq!(out[4], "# Docs\n\nSee [more](/more).");
+        assert!(out[5].contains("\"content\": \"Check it\"") && out[5].contains("\"priority\": \"high\""), "{}", out[5]);
+
+        // The events the UI is fed carry canonical names and a todo list in canonical form.
+        let tool_events: Vec<&Value> = run.events.iter().filter(|e| e["type"] == "tool").collect();
+        let names: Vec<&str> = tool_events.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["TodoWrite", "Edit", "Grep", "Glob", "WebFetch", "TodoRead"]);
+        assert_eq!(tool_events[0]["input"]["todos"][0]["status"], "in_progress", "canonical status for the plan panel");
+        assert_eq!(tool_events[1]["input"]["old_string"], "answer = 41", "arguments were normalized to one style");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_delegated_task_keeps_its_own_todo_list() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let done = req["messages"].as_array().map(|m| m.iter().filter(|x| x["role"] == "tool").count()).unwrap_or(0);
+            if system.contains("agent `helper`") {
+                return if done == 0 { call_message("h1", "TodoWrite", json!({ "todos": [{ "content": "helper step", "status": "pending" }] })) } else { text_message("helper done") };
+            }
+            match done {
+                0 => call_message("m1", "TodoWrite", json!({ "todos": [{ "content": "manager plan", "status": "in_progress" }] })),
+                1 => call_message("m2", "Task", json!({ "subagent_type": "helper", "description": "h", "prompt": "do it" })),
+                2 => call_message("m3", "TodoRead", json!({})),
+                _ => {
+                    record.lock().unwrap().push(req["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string());
+                    text_message("MANAGER DONE")
+                }
+            }
+        })
+        .await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("helper", true)];
+        let mut messages = vec![json!({ "role": "system", "content": "you manage" }), json!({ "role": "user", "content": "go" })];
+        let owner = delegation::new_id("test");
+        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()) };
+        run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, Some(&scope)).await.unwrap();
+        let last_read = seen.lock().unwrap()[0].clone();
+        assert!(last_read.contains("manager plan") && !last_read.contains("helper step"), "the helper's list did not replace the manager's: {last_read}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_tasks_cannot_edit_the_same_file_either() {
+        let dir = std::env::temp_dir().join(format!("lanes-edit-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shared = dir.join("shared.txt");
+        fs::write(&shared, "alpha\nbeta\n").unwrap();
+        let path = shared.to_string_lossy().to_string();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            if system.contains("agent `editor`") {
+                if last_message(req)["role"] == "tool" {
+                    std::thread::sleep(std::time::Duration::from_millis(400)); // keep the lane open (see two_writers)
+                    return text_message("editor done");
+                }
+                let mine = req["messages"].to_string().contains("EDITOR-B");
+                let (old, new) = if mine { ("beta", "BETA") } else { ("alpha", "ALPHA") };
+                return call_message("e", "Edit", json!({ "file_path": path, "old_string": old, "new_string": new }));
+            }
+            if req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool")) { return text_message("PMA DONE"); }
+            json!({ "role": "assistant", "content": null, "tool_calls": [
+                { "id": "ta", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "a", "prompt": "EDITOR-A" }).to_string() } },
+                { "id": "tb", "type": "function", "function": { "name": "Task", "arguments": json!({ "subagent_type": "editor", "description": "b", "prompt": "EDITOR-B" }).to_string() } },
+            ] })
+        })
+        .await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("editor", true)];
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, None).await.unwrap();
+        let refusals: Vec<String> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str().and_then(|r| r.split("task_id: ").nth(1)).and_then(|t| t.split_whitespace().next()).and_then(delegation::load_task))
+            .flat_map(|t| t.messages)
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str().map(str::to_string))
+            .filter(|c| c.contains("is being written by another task running in parallel"))
+            .collect();
+        assert_eq!(refusals.len(), 1, "one editor is turned away: {refusals:?}");
+        let content = fs::read_to_string(&shared).unwrap();
+        assert!(content == "ALPHA\nbeta\n" || content == "alpha\nBETA\n", "exactly one edit landed, whole: {content:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_edit_diff_reaches_the_ui_whole() {
+        let dir = std::env::temp_dir().join(format!("bigedit-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.txt");
+        fs::write(&file, (1..=120).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        let run = run_steps(vec![("Edit", json!({ "file_path": file.to_string_lossy(), "old_string": "line", "new_string": "LINE", "replace_all": true }))]).await;
+        let shown = run.events.iter().find(|e| e["type"] == "tool_result").unwrap()["output"].as_str().unwrap().to_string();
+        let model = tool_outputs(&run)[0].clone();
+        assert!(model.len() > 2000, "a diff well over the usual limit: {}", model.len());
+        assert_eq!(shown, model, "the UI gets the whole diff, so its hunk line counts match");
+        // Other tools stay capped.
+        assert_eq!(ui_output_limit("Grep"), 2000);
+        let _ = fs::remove_dir_all(dir);
     }
 }

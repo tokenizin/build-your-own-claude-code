@@ -16,6 +16,8 @@ base64 = "0.22"
 backoff = "0.4"
 # Runs a turn's Task calls concurrently (bounded) while borrowing the parent's state.
 futures-util = "0.3"
+ignore = "0.4"
+globset = "0.4"
 
 [dev-dependencies]
 # Test-only mock model endpoint.

@@ -97,6 +97,12 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "bash" | "Bash" | "shell" | "sh" => "Bash",
         "skill" | "Skill" => "Skill",
         "handover" | "Handover" | "file_handover" | "submit_handover" => "handover",
+        "edit" | "Edit" | "edit_file" | "str_replace" | "str_replace_editor" => "Edit",
+        "grep" | "Grep" | "search" | "ripgrep" | "search_files" => "Grep",
+        "glob" | "Glob" | "find_files" | "list_files" => "Glob",
+        "webfetch" | "WebFetch" | "web_fetch" | "fetch" | "fetch_url" => "WebFetch",
+        "todowrite" | "TodoWrite" | "todo_write" | "update_todos" | "write_todos" => "TodoWrite",
+        "todoread" | "TodoRead" | "todo_read" | "read_todos" => "TodoRead",
         "nomadflow_validate" | "nomadworks_validate" | "nomad_validate" => "nomadworks_validate",
         other => other,
     }
@@ -136,6 +142,16 @@ pub fn apply_aliases(tool: &str, args: Value) -> Value {
             ("content", &["contents", "text", "data", "body"]),
         ],
         "Bash" => &[("command", &["cmd", "script", "shell"])],
+        "Edit" => &[
+            ("file_path", &["filePath", "path", "file", "filename"]),
+            ("old_string", &["oldString", "old", "search", "find", "old_text", "oldText"]),
+            ("new_string", &["newString", "new", "replace", "replacement", "new_text", "newText"]),
+            ("replace_all", &["replaceAll", "all"]),
+        ],
+        "Grep" => &[("pattern", &["regex", "query", "search", "regexp"]), ("path", &["directory", "dir", "folder"]), ("include", &["glob", "files", "filePattern"])],
+        "Glob" => &[("pattern", &["glob", "match", "name"]), ("path", &["directory", "dir", "folder"])],
+        "WebFetch" => &[("url", &["uri", "link", "href"])],
+        "TodoWrite" => &[("todos", &["items", "list", "tasks", "plan"])],
         "Skill" => &[("name", &["skill", "skill_name"]), ("args", &["arguments", "input"])],
         "Task" => &[
             ("subagent_type", &["subagentType", "agent", "subagent", "agent_type", "role", "subagent_name"]),
@@ -320,6 +336,11 @@ fn store_dir() -> Option<PathBuf> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+/// Where the current session keeps its task records (and other per-session state), if CodeNomad set one.
+pub fn store_path() -> Option<PathBuf> {
+    store_dir()
 }
 
 fn safe_id(task_id: &str) -> bool {
