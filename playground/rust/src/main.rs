@@ -1311,6 +1311,12 @@ fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
             return format!("Error: handover rejected. Fix these and call handover again:\n{list}");
         }
     };
+    // Evidence that names a file must name one that is there (a model can describe a change it never made).
+    let missing = handover::missing_evidence_files(&w.worktree, &w.task_path, &parsed);
+    if !missing.is_empty() {
+        let list = missing.iter().map(|m| format!("- evidence file `{m}` does not exist (relative to the project, or to the task's folder). Point at a file that exists, or use kind `note`.")).collect::<Vec<_>>().join("\n");
+        return format!("Error: handover rejected. Fix these and call handover again:\n{list}");
+    }
     match handover::file(&w.worktree, &w.task_path, &w.session_id, &w.agent, &parsed) {
         Err(err) => format!("Error: could not file the handover: {err}"),
         Ok(filed) => {

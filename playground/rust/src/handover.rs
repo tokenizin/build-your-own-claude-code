@@ -437,6 +437,23 @@ pub fn front_matter_value(file: &str, key: &str) -> Option<String> {
     block.lines().find_map(|l| l.strip_prefix(&format!("{key}: "))).map(|v| v.trim().to_string())
 }
 
+/// The `file` evidence of a handover that is not there. A reference is looked for relative to the worktree, and relative
+/// to the task file's folder; one that leaves the worktree counts as missing.
+pub fn missing_evidence_files(worktree: &Path, task_path: &str, handover: &Handover) -> Vec<String> {
+    let task_dir = Path::new(task_path).parent().map(Path::to_path_buf).unwrap_or_default();
+    handover
+        .evidence
+        .iter()
+        .filter(|e| e.kind == "file")
+        .filter(|e| {
+            let reference = e.reference.trim();
+            let found = |base: &Path| inside_worktree(worktree, &base.join(reference).display().to_string()).map(|p| p.exists()).unwrap_or(false);
+            !(found(Path::new("")) || found(&task_dir))
+        })
+        .map(|e| e.reference.clone())
+        .collect()
+}
+
 // ---------------------------------------------------------------- where it lives
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -722,6 +739,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("handover-{name}-{}-{}", std::process::id(), crate::delegation::new_task_id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn file_evidence_must_exist() {
+        let wt = tmp("evidence");
+        fs::create_dir_all(wt.join("tasks/todo/T1")).unwrap();
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::write(wt.join("src/export.ts"), "x").unwrap();
+        fs::write(wt.join("tasks/todo/T1/notes.md"), "x").unwrap();
+        let with = |files: &[&str]| {
+            let mut args = good();
+            args["evidence"] = json!(files.iter().map(|f| json!({ "kind": "file", "ref": f })).chain([json!({ "kind": "note", "ref": "a note that need not exist.md" })]).collect::<Vec<_>>());
+            Handover::from_args(&args).unwrap()
+        };
+        // From the project root, or from the task's folder.
+        assert!(missing_evidence_files(&wt, "tasks/todo/T1/T1.md", &with(&["src/export.ts", "notes.md"])).is_empty());
+        // A file that is not there (the model described a change it never made), or one outside the worktree.
+        assert_eq!(missing_evidence_files(&wt, "tasks/todo/T1/T1.md", &with(&["../specifications/EXPORT.md", "src/export.ts", "../../../../../etc/hosts"])), ["../specifications/EXPORT.md", "../../../../../etc/hosts"]);
+        let _ = fs::remove_dir_all(wt);
     }
 
     #[test]
