@@ -450,6 +450,34 @@ async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Stri
     catalog::parse_model_list(&body).map_err(|e| format!("GET {url}: {e}"))
 }
 
+/// Context window of each model, from Ollama's `/api/show` next to the `/v1` base. Models that do not answer
+/// within a few seconds (a cloud model, another kind of endpoint) are left out.
+async fn fetch_contexts(base_url: &str, api_key: &str, models: &[String]) -> std::collections::HashMap<String, u64> {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let url = format!("{root}/api/show");
+    let client = reqwest::Client::new();
+    futures_util::stream::iter(models.iter().take(80).cloned())
+        .map(|id| {
+            let (client, url) = (client.clone(), url.clone());
+            async move {
+                let response = client
+                    .post(&url)
+                    .bearer_auth(api_key)
+                    .json(&json!({ "model": id }))
+                    .timeout(std::time::Duration::from_secs(4))
+                    .send()
+                    .await
+                    .ok()?;
+                let body: Value = response.json().await.ok()?;
+                catalog::context_from_show(&body).map(|context| (id, context))
+            }
+        })
+        .buffer_unordered(8)
+        .filter_map(|found| async move { found })
+        .collect()
+        .await
+}
+
 /// List models from the primary base, then the fallback. Returns (base used, result).
 async fn list_models(cfg: &LlmConfig) -> (String, Result<Vec<String>, String>) {
     let primary = fetch_models(&cfg.base_url, &cfg.api_key).await;
@@ -1708,7 +1736,10 @@ async fn main() -> std::process::ExitCode {
         if let Err(err) = &listed {
             eprintln!("catalog: model listing failed: {err}");
         }
-        let catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed);
+        // Context sizes, best effort: an endpoint that is not Ollama simply has none to give.
+        let wanted = catalog::merge_models(&cfg.model, listed.as_deref().unwrap_or_default(), &skills);
+        let contexts = fetch_contexts(&base, &cfg.api_key, &wanted).await;
+        let catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed, &contexts);
         println!("{catalog}");
         return ExitCode::SUCCESS;
     }
