@@ -287,6 +287,9 @@ pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
     if calls.is_empty() { None } else { Some((before, calls)) }
 }
 
+/// Tools a model may write out as a fenced `{name, arguments}` block and still have them run: they only hand work on.
+const COORDINATION_TOOLS: [&str; 4] = ["Task", "nomadflow_run_workflow", "nomadflow_prompt_workflow", "nomadworks_validate"];
+
 /// A model that says "I will send these requests" and writes each one as a fenced JSON block, instead of calling the
 /// tool: every block that is a Task call (`subagent_type` and `prompt`), alone or in a list, becomes one. Nothing else in
 /// a fence is touched. Returns the text before the first block and the calls.
@@ -310,6 +313,13 @@ fn extract_fenced_task_calls(text: &str) -> Option<(String, Vec<Value>)> {
             if v["subagent_type"].as_str().is_some_and(|t| !t.trim().is_empty()) && v["prompt"].as_str().is_some_and(|p| !p.trim().is_empty()) {
                 first_fence.get_or_insert(offset + open);
                 calls.push(openai_call("Task", v, calls.len()));
+            } else if let Some(name) = v["name"].as_str().filter(|n| COORDINATION_TOOLS.contains(n)) {
+                // `{ "name": "nomadflow_prompt_workflow", "arguments": { … } }`: only the tools that hand work on, never one that writes.
+                let args = if v["arguments"].is_null() { v["parameters"].clone() } else { v["arguments"].clone() };
+                if args.is_object() || args.is_string() {
+                    first_fence.get_or_insert(offset + open);
+                    calls.push(openai_call(name, parse_arguments(&args), calls.len()));
+                }
             }
         }
         let consumed = body_start + close + 3;
@@ -465,6 +475,15 @@ mod tests {
         assert!(extract_text_tool_calls("```rust\nfn main() {}\n```").is_none());
         assert!(extract_text_tool_calls("```json\n{\"subagent_type\":\"a\"}\n```").is_none(), "no prompt: not a request");
         assert!(extract_text_tool_calls("plain answer").is_none());
+
+        // `{name, arguments}` for a tool that only hands work on; never for one that writes.
+        let prompt = "I will send it back.\n```json\n{ \"name\": \"nomadflow_prompt_workflow\", \"arguments\": { \"session_id\": \"ses_lcl_wf_x\", \"text\": \"write the file\" } }\n```";
+        let (before, calls) = extract_text_tool_calls(prompt).unwrap();
+        assert_eq!((before.as_str(), calls[0]["function"]["name"].as_str()), ("I will send it back.", Some("nomadflow_prompt_workflow")));
+        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["session_id"], "ses_lcl_wf_x");
+        assert!(extract_text_tool_calls("```json\n{ \"name\": \"Write\", \"arguments\": { \"file_path\": \"/etc/passwd\", \"content\": \"x\" } }\n```").is_none());
+        assert!(extract_text_tool_calls("```json\n{ \"name\": \"Bash\", \"arguments\": { \"command\": \"rm -rf /\" } }\n```").is_none());
     }
 
     #[test]
