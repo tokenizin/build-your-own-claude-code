@@ -1,6 +1,7 @@
 mod agents;
 mod catalog;
 mod config;
+mod control;
 mod delegation;
 mod file_lease;
 mod handover;
@@ -967,18 +968,17 @@ async fn run_delegated(
         )
     };
     let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane, owner: Some(task_id.as_str()) };
-    let mut outcome = Box::pin(run_agent_loop(
-        client,
-        &task_cfg,
-        &mut messages,
-        skills,
-        ToolMode::All,
-        child_top.as_ref(),
-        depth + 1,
-        Some(&scope),
-    ))
-    .await
-    .map_err(|e| e.to_string());
+    // A task the user stops is dropped where it stands (control.rs); a workflow runner's own process is stopped as a whole.
+    let stoppable = !inline;
+    if stoppable {
+        control::clear(&task_id);
+    }
+    let mut outcome = run_stoppable(stoppable, &task_id, async {
+        Box::pin(run_agent_loop(client, &task_cfg, &mut messages, skills, ToolMode::All, child_top.as_ref(), depth + 1, Some(&scope)))
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await;
 
     // A workflow is not finished until it has filed its handover: remind it, twice at most.
     if let Some(w) = workflow {
@@ -990,18 +990,12 @@ async fn run_delegated(
             }
             reminders += 1;
             messages.push(json!({ "role": "user", "content": HANDOVER_REMINDER }));
-            outcome = Box::pin(run_agent_loop(
-                client,
-                &task_cfg,
-                &mut messages,
-                skills,
-                ToolMode::All,
-                child_top.as_ref(),
-                depth + 1,
-                Some(&scope),
-            ))
-            .await
-            .map_err(|e| e.to_string());
+            outcome = run_stoppable(stoppable, &task_id, async {
+                Box::pin(run_agent_loop(client, &task_cfg, &mut messages, skills, ToolMode::All, child_top.as_ref(), depth + 1, Some(&scope)))
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
         }
     }
 
@@ -1033,11 +1027,19 @@ async fn run_delegated(
                 delegation::TaskRecord { agent: skill.name.clone(), messages: consistent_prefix(&messages), meta },
             );
             if let Some(emitter) = &scoped {
-                emitter.emit(json!({ "type": "task.end", "status": "failed", "error": err }));
+                if err == control::STOPPED {
+                    emitter.emit(json!({ "type": "task.end", "status": "aborted", "summary": "Stopped by the user" }));
+                } else {
+                    emitter.emit(json!({ "type": "task.end", "status": "failed", "error": err }));
+                }
             }
         }
     }
     (outcome, messages)
+}
+
+async fn run_stoppable<T>(stoppable: bool, task_id: &str, work: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    if stoppable { control::stoppable(task_id, work).await } else { work.await }
 }
 
 /// The Task tool: run a NomadWorks subagent in its own context and return its
@@ -1110,6 +1112,10 @@ async fn handle_task(
     .await;
     match outcome {
         Ok(answer) => delegation::task_result(&task_id, &answer),
+        Err(err) if err == control::STOPPED => format!(
+            "The user stopped subagent {} before it finished; what it had done so far was kept.\n\ntask_id: {task_id} (pass this task_id to continue it, or carry on without it)",
+            skill.name
+        ),
         Err(err) => format!(
             "Error: subagent {} failed: {err}\n\ntask_id: {task_id} (progress was saved; pass this task_id to continue)",
             skill.name
@@ -2067,6 +2073,61 @@ mod tests {
         for (n, m) in tool_msgs.iter().enumerate() {
             assert!(m["content"].as_str().unwrap().contains(&format!("answer-{}", n + 1)), "{m}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_one_task_leaves_the_others_running() {
+        let control = std::env::temp_dir().join(format!("control-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&control).unwrap();
+        std::env::set_var("NOMAD_CONTROL_DIR", &control);
+        let base = mock_model(1500, false).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let skills = vec![skill("worker", true)];
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "plan the work" })];
+        let started = std::time::Instant::now();
+
+        // The user presses Stop on the card of call_2 once its task has started.
+        let stopper_sink = sink.clone();
+        let stopper_dir = control.clone();
+        let stopper = async move {
+            let task_id = loop {
+                let found = stopper_sink.lock().unwrap().iter().find(|e| e["type"] == "task.start" && e["parent_call_id"] == "call_2").and_then(|e| e["task_id"].as_str().map(str::to_string));
+                if let Some(id) = found { break id };
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fs::write(stopper_dir.join(format!("stop-{task_id}")), "").unwrap();
+            task_id
+        };
+        let (answer, stopped_id) = tokio::join!(run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, Some(&top), 0, None), stopper);
+        std::env::remove_var("NOMAD_CONTROL_DIR");
+        assert_eq!(answer.map_err(|e| e.to_string()).as_deref(), Ok("ALL DONE"), "the parent carries on");
+
+        let events = sink.lock().unwrap().clone();
+        let end_of = |call: &str| {
+            let task = events.iter().find(|e| e["type"] == "task.start" && e["parent_call_id"] == call).unwrap()["task_id"].clone();
+            events.iter().position(|e| e["type"] == "task.end" && e["task_id"] == task).map(|i| (i, events[i].clone()))
+        };
+        let (stopped_at, stopped) = end_of("call_2").unwrap();
+        assert_eq!(stopped["status"], "aborted");
+        assert_eq!(stopped["task_id"], stopped_id.as_str());
+        for call in ["call_1", "call_3"] {
+            let (at, end) = end_of(call).unwrap();
+            assert_eq!(end["status"], "completed", "{call} ran to its answer");
+            assert!(stopped_at < at, "the stopped task ended first");
+        }
+        // The caller is told, and can resume it; the other two answered normally.
+        let results: Vec<String> = messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+        assert!(results[0].contains("answer-1") && results[2].contains("answer-3"));
+        assert!(results[1].starts_with("The user stopped subagent worker before it finished") && results[1].contains(&format!("task_id: {stopped_id}")), "{}", results[1]);
+        // The request was taken (a resumed task must not stop at once), and the saved work can be picked up again.
+        assert!(!control.join(format!("stop-{stopped_id}")).exists());
+        assert!(delegation::load_task(&stopped_id).is_some(), "progress is kept so the task can be resumed");
+        assert!(started.elapsed().as_millis() < 2800, "the stopped task did not hold the batch up: {:?}", started.elapsed());
+        let _ = fs::remove_dir_all(control);
     }
 
     #[tokio::test(flavor = "multi_thread")]
