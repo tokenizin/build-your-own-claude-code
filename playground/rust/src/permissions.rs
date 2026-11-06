@@ -216,6 +216,9 @@ pub fn policy_for(agent: &str) -> Policy {
             }
         }
     }
+    if std::env::var("NOMAD_PERMISSIONS_DEBUG").is_ok_and(|v| v != "0") {
+        eprintln!("permissions: agent `{agent}`: {} rule(s) beyond the defaults", more.len());
+    }
     Policy::defaults().with(more)
 }
 
