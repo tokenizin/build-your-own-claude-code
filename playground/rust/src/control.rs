@@ -6,8 +6,8 @@
 //! request is cancelled, nested tasks go with it, and the task ends as `aborted`. The other tasks of the
 //! batch, and the caller, carry on. The caller gets the task's id back so the work can be resumed.
 //!
-//! The same directory carries the other direction too: a question the agent asks (`question` tool) is answered
-//! by the host dropping `answer-<id>.json` there.
+//! The same directory carries the other direction too: a question the agent asks (`question` tool), or a permission it
+//! requests, is answered by the host dropping `answer-<id>.json` there.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -71,24 +71,47 @@ pub fn can_ask() -> bool {
     std::env::var("NOMAD_CONTROL_DIR").map(|d| !d.trim().is_empty()).unwrap_or(false)
 }
 
-/// Waits for the host to put `answer-<id>.json` (`{"answers":[["A"],["B","C"]]}` or `{"dismissed":true}`) in the
-/// control directory, and takes it. A task that is stopped meanwhile is dropped by `stoppable`, so this just waits.
-pub async fn wait_for_answer(question_id: &str) -> Answer {
-    let Some(path) = answer_marker(question_id) else { return std::future::pending().await };
+/// Waits for the host to put `answer-<id>.json` in the control directory, and takes it. A task that is stopped
+/// meanwhile is dropped by `stoppable`, so this just waits.
+async fn wait_for_document(id: &str) -> serde_json::Value {
+    let Some(path) = answer_marker(id) else { return std::future::pending().await };
     loop {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) {
                 let _ = std::fs::remove_file(&path);
-                if doc["dismissed"].as_bool() == Some(true) {
-                    return Answer::Dismissed;
-                }
-                let answers = doc["answers"]
-                    .as_array()
-                    .map(|list| list.iter().map(|one| one.as_array().map(|labels| labels.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()).unwrap_or_default()).collect())
-                    .unwrap_or_default();
-                return Answer::Answers(answers);
+                return doc;
             }
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The answer to a question: `{"answers":[["A"],["B","C"]]}` or `{"dismissed":true}`.
+pub async fn wait_for_answer(question_id: &str) -> Answer {
+    let doc = wait_for_document(question_id).await;
+    if doc["dismissed"].as_bool() == Some(true) {
+        return Answer::Dismissed;
+    }
+    let answers = doc["answers"]
+        .as_array()
+        .map(|list| list.iter().map(|one| one.as_array().map(|labels| labels.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()).unwrap_or_default()).collect())
+        .unwrap_or_default();
+    Answer::Answers(answers)
+}
+
+/// What the user said to a permission request (OpenCode's three replies).
+#[derive(Debug, PartialEq)]
+pub enum Reply {
+    Once,
+    Always,
+    Reject,
+}
+
+/// The reply to a permission request: `{"reply":"once"|"always"|"reject"}`. Anything else counts as a rejection.
+pub async fn wait_for_reply(request_id: &str) -> Reply {
+    match wait_for_document(request_id).await["reply"].as_str() {
+        Some("once") => Reply::Once,
+        Some("always") => Reply::Always,
+        _ => Reply::Reject,
     }
 }

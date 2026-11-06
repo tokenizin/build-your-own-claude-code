@@ -10,6 +10,7 @@ mod lanes;
 mod nomad_tools;
 mod opencode_config;
 mod patch;
+mod permissions;
 mod skills;
 mod stream;
 mod tools;
@@ -550,6 +551,8 @@ struct RunScope<'a> {
     lane: Option<&'a str>,
     /// Who owns this run's todo list: the delegated task's id; none for the top-level run.
     owner: Option<&'a str>,
+    /// The permission rules of the agent this run is (permissions.rs); none: nothing is checked.
+    rules: Option<&'a permissions::Policy>,
 }
 
 // One more argument than clippy likes; bundling them is a refactor of every call site.
@@ -698,13 +701,15 @@ async fn run_agent_loop(
                 while end < calls.len() && batchable(&calls[end]) {
                     end += 1;
                 }
-                run_task_batch(client, cfg, skills, top, &calls[idx..end], &mut outputs[idx..end], depth, scope.and_then(|s| s.lane)).await;
+                run_task_batch(client, cfg, skills, top, &calls[idx..end], &mut outputs[idx..end], depth, scope.and_then(|s| s.lane), scope.and_then(|s| s.rules)).await;
                 idx = end;
                 continue;
             }
             let call = &calls[idx];
             emit_tool(top, call);
-            let result = if call.name == "question" {
+            let result = if let Some(blocked) = gate(top, scope, call).await {
+                blocked
+            } else if call.name == "question" {
                 handle_question(top, call).await
             } else if matches!(call.name.as_str(), "nomadflow_run_workflow" | "nomadflow_prompt_workflow") {
                 // A failing workflow is a result the caller can react to, not the end of this run.
@@ -734,6 +739,51 @@ async fn run_agent_loop(
         "the agent used all {step_cap} steps without finishing (NOMAD_MAX_STEPS raises the limit); a delegated task keeps its progress, so its id can continue it"
     )
     .into())
+}
+
+/// Checks a call against the agent's permission rules (permissions.rs). `None`: go ahead. `Some(text)`: do not run it, and
+/// this is the result the model gets (a rule forbids it, the user said no, or nobody is here to ask).
+async fn gate(top: Option<&TopLevel<'_>>, scope: Option<&RunScope<'_>>, call: &PreparedCall) -> Option<String> {
+    let rules = scope.and_then(|s| s.rules)?;
+    gate_with(top, rules, scope.is_some_and(|s| s.workflow.is_some()), call).await
+}
+
+async fn gate_with(top: Option<&TopLevel<'_>>, rules: &permissions::Policy, unattended: bool, call: &PreparedCall) -> Option<String> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let requests = permissions::requests_for(&call.name, &call.args, &cwd);
+    if requests.is_empty() {
+        return None;
+    }
+    match permissions::check(rules, control::can_ask() && !unattended, &requests) {
+        permissions::Verdict::Allow => None,
+        permissions::Verdict::Deny(rule) => Some(permissions::denied_text(&rule)),
+        permissions::Verdict::Ask(asked) => {
+            // A workflow runner works unattended: it must not wait for an answer.
+            let Some(top) = top.filter(|_| control::can_ask() && !unattended) else {
+                return Some(format!(
+                    "Error: this tool call needs the user's permission ({} {}) and nobody is here to give it. Use another way, or say what you need.",
+                    asked[0].permission, asked[0].pattern
+                ));
+            };
+            let id = delegation::new_id("per");
+            top.emitter.emit(json!({
+                "type": "permission",
+                "id": id,
+                "call_id": call.id,
+                "permission": asked[0].permission,
+                "patterns": asked.iter().map(|r| r.pattern.clone()).collect::<Vec<_>>(),
+                "always": asked.iter().map(|r| r.always.clone()).collect::<Vec<_>>(),
+            }));
+            match control::wait_for_reply(&id).await {
+                control::Reply::Once => None,
+                control::Reply::Always => {
+                    permissions::remember(&asked);
+                    None
+                }
+                control::Reply::Reject => Some("The user rejected permission to use this specific tool call. You may try again with different parameters.".into()),
+            }
+        }
+    }
 }
 
 /// The `question` tool: shows the user the questions and waits for the answers the host passes back.
@@ -919,6 +969,7 @@ async fn run_task_batch(
     outputs: &mut [Option<String>],
     depth: u8,
     parent_lane: Option<&str>,
+    rules: Option<&permissions::Policy>,
 ) {
     for call in calls {
         emit_tool(top, call);
@@ -937,6 +988,11 @@ async fn run_task_batch(
 turn. Resume it in a later turn, after that call has returned.",
                     call.args["task_id"].as_str().unwrap_or("")
                 )
+            } else if let Some(blocked) = match rules {
+                Some(rules) => gate_with(top, rules, false, call).await,
+                None => None,
+            } {
+                blocked
             } else {
                 handle_task(client, cfg, skills, top, call, depth, lane.as_deref()).await
             };
@@ -1044,7 +1100,8 @@ async fn run_delegated(
             delegation::TaskRecord { agent: agent_name.clone(), messages: msgs.to_vec(), meta: save_meta.clone() },
         )
     };
-    let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane, owner: Some(task_id.as_str()) };
+    let policy = permissions::policy_for(&skill.name);
+    let scope = RunScope { checkpoint: Some(&checkpoint), workflow, lane, owner: Some(task_id.as_str()), rules: Some(&policy) };
     // A task the user stops is dropped where it stands (control.rs); a workflow runner's own process is stopped as a whole.
     let stoppable = !inline;
     if stoppable {
@@ -1680,6 +1737,8 @@ async fn handle_skill(
         if fork_cfg.model != cfg.model {
             eprintln!("fork `{}`: model {}", skill.name, fork_cfg.model);
         }
+        let policy = permissions::policy_for(&skill.name);
+        let fork_scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: None, rules: Some(&policy) };
         let answer = Box::pin(run_agent_loop(
             client,
             &fork_cfg,
@@ -1688,7 +1747,7 @@ async fn handle_skill(
             ToolMode::Base,
             None,
             depth + 1,
-            None,
+            Some(&fork_scope),
         ))
         .await?;
         return Ok(format!(
@@ -1895,6 +1954,9 @@ async fn main() -> std::process::ExitCode {
         }));
     }
 
+    // The rules of the agent this run is (and OpenCode's defaults and the config's).
+    let policy = permissions::policy_for(initial.agent.as_deref().unwrap_or(""));
+    let top_scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: None, rules: Some(&policy) };
     match run_agent_loop(
         &client,
         &run_cfg,
@@ -1903,7 +1965,7 @@ async fn main() -> std::process::ExitCode {
         initial.tool_mode,
         top.as_ref(),
         0,
-        None,
+        Some(&top_scope),
     )
     .await
     {
@@ -2238,6 +2300,122 @@ mod tests {
         std::env::remove_var("NOMAD_CONTROL_DIR");
         let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "question");
         assert!(!has(&tool_specs(ToolMode::All, &[], 0, false, "m").unwrap()));
+    }
+
+    /// One tool call by a scripted model, under the permission rules `agent_file` declares; returns what the model was told
+    /// and the events. `answers`: what the user replies to each permission request, in turn (none: nobody can answer).
+    async fn call_under_rules(agent_file: &str, calls: Vec<(&str, Value)>, answers: Vec<&str>) -> (Vec<String>, Vec<Value>) {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
+        permissions::forget_all();
+        let control = std::env::temp_dir().join(format!("control-p-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&control).unwrap();
+        // Taken down again even when an assertion fails below: the variable is process-wide.
+        struct ControlDirGuard;
+        impl Drop for ControlDirGuard {
+            fn drop(&mut self) {
+                std::env::remove_var("NOMAD_CONTROL_DIR");
+            }
+        }
+        let _guard = ControlDirGuard;
+        if !answers.is_empty() {
+            std::env::set_var("NOMAD_CONTROL_DIR", &control);
+        }
+        let plan = std::sync::Arc::new(calls.iter().map(|(name, args)| (name.to_string(), args.clone())).collect::<Vec<_>>());
+        let step = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = {
+            let (plan, step) = (plan.clone(), step.clone());
+            scripted_model(move |_req| {
+                let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match plan.get(n) {
+                    Some((name, args)) => call_message(&format!("c{n}"), name, args.clone()),
+                    None => text_message("done"),
+                }
+            })
+            .await
+        };
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let policy = permissions::Policy::defaults().with(permissions::rules_from_front_matter(agent_file));
+        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: None, rules: Some(&policy) };
+        let mut messages = vec![json!({ "role": "user", "content": "go" })];
+        let user = {
+            let (sink, dir) = (sink.clone(), control.clone());
+            async move {
+                for (turn, reply) in answers.into_iter().enumerate() {
+                    // The turn-th request; answered after a moment, and the answer taken before the next.
+                    let id = loop {
+                        let found = sink.lock().unwrap().iter().filter(|e| e["type"] == "permission").nth(turn).and_then(|e| e["id"].as_str().map(str::to_string));
+                        if let Some(id) = found { break id };
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    };
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let file = dir.join(format!("answer-{id}.json"));
+                    fs::write(&file, json!({ "reply": reply }).to_string()).unwrap();
+                    while file.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        };
+        let both = async { tokio::join!(run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, Some(&top), 0, Some(&scope)), user) };
+        tokio::time::timeout(std::time::Duration::from_secs(20), both).await.expect("the run did not finish (a request nobody answered?)");
+        std::env::remove_var("NOMAD_CONTROL_DIR");
+        permissions::forget_all();
+        let told: Vec<String> = messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap_or("").to_string()).collect();
+        let events = sink.lock().unwrap().clone();
+        let _ = fs::remove_dir_all(control);
+        (told, events)
+    }
+
+    const REVIEWER: &str = "---\nname: reviewer\npermission:\n  bash:\n    \"*\": ask\n    \"echo ok*\": allow\n  edit:\n    \"**/*.key\": deny\n---\n";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_that_denies_a_call_keeps_it_from_running() {
+        let wt = new_worktree("perm-deny");
+        let secret = wt.join("prod.key");
+        let (told, events) = call_under_rules(REVIEWER, vec![("Write", json!({ "file_path": secret.display().to_string(), "content": "x" }))], vec![]).await;
+        assert!(told[0].starts_with("The user has specified a rule which prevents you from using this specific tool call."), "{}", told[0]);
+        assert!(!secret.exists(), "nothing was written");
+        assert!(events.iter().all(|e| e["type"] != "permission"), "a deny asks nobody");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ask_waits_for_the_user_once_always_or_reject() {
+        // Allowed by a pattern: runs at once, no question.
+        let (told, events) = call_under_rules(REVIEWER, vec![("Bash", json!({ "command": "echo ok-fine" }))], vec![]).await;
+        assert!(told[0].contains("ok-fine") && events.iter().all(|e| e["type"] != "permission"));
+
+        // Asked, allowed once: runs; the same command is asked again.
+        let call = ("Bash", json!({ "command": "printf asked-once" }));
+        let (told, events) = call_under_rules(REVIEWER, vec![call.clone(), call.clone()], vec!["once", "once"]).await;
+        assert_eq!(events.iter().filter(|e| e["type"] == "permission").count(), 2);
+        assert!(told.iter().all(|t| t.contains("asked-once")), "{told:?}");
+        let asked = events.iter().find(|e| e["type"] == "permission").unwrap();
+        assert_eq!((asked["permission"].as_str(), asked["call_id"].as_str()), (Some("bash"), Some("c0")));
+        assert_eq!(asked["patterns"], json!(["printf asked-once"]));
+        assert_eq!(asked["always"], json!(["printf *"]));
+        assert!(asked["id"].as_str().unwrap().starts_with("per_"));
+
+        // Always: asked the first time only, and a different command of the same kind is covered too.
+        let (told, events) = call_under_rules(REVIEWER, vec![call.clone(), ("Bash", json!({ "command": "printf second" }))], vec!["always"]).await;
+        assert_eq!(events.iter().filter(|e| e["type"] == "permission").count(), 1);
+        assert!(told[0].contains("asked-once") && told[1].contains("second"), "{told:?}");
+
+        // Rejected: it does not run, and the model is told so.
+        let marker = std::env::temp_dir().join(format!("perm-marker-{}", delegation::new_task_id()));
+        let (told, _) = call_under_rules(REVIEWER, vec![("Bash", json!({ "command": format!("touch {}", marker.display()) }))], vec!["reject"]).await;
+        assert!(told[0].starts_with("The user rejected permission to use this specific tool call"), "{}", told[0]);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_nobody_to_ask_an_ask_is_refused() {
+        let (told, events) = call_under_rules(REVIEWER, vec![("Bash", json!({ "command": "rm -rf /tmp/never" }))], vec![]).await;
+        assert!(told[0].starts_with("Error: this tool call needs the user's permission (bash rm -rf /tmp/never) and nobody is here to give it"), "{}", told[0]);
+        assert!(events.iter().all(|e| e["type"] != "permission"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3149,6 +3327,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn two_parallel_tasks_cannot_overwrite_the_same_file() {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("lanes-{}-{}", std::process::id(), delegation::new_task_id()));
         fs::create_dir_all(&dir).unwrap();
         let shared = dir.join("shared.txt").to_string_lossy().to_string();
@@ -3174,6 +3353,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn parallel_tasks_writing_different_files_do_not_get_in_each_others_way() {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("lanes2-{}-{}", std::process::id(), delegation::new_task_id()));
         fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a.txt").to_string_lossy().to_string(), dir.join("b.txt").to_string_lossy().to_string());
@@ -3240,7 +3420,7 @@ mod tests {
         let mut messages = vec![json!({ "role": "system", "content": "you work" }), json!({ "role": "user", "content": "go" })];
         // Its own todo scope: tests share one process, and the top-level run's default scope is shared state.
         let owner = delegation::new_id("test");
-        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()) };
+        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()), rules: None };
         let started = std::time::Instant::now();
         let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, Some(&top), 0, Some(&scope)).await.map_err(|e| e.to_string());
         let events = sink.lock().unwrap().clone();
@@ -3314,7 +3494,7 @@ mod tests {
         let skills = vec![skill("helper", true)];
         let mut messages = vec![json!({ "role": "system", "content": "you manage" }), json!({ "role": "user", "content": "go" })];
         let owner = delegation::new_id("test");
-        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()) };
+        let scope = RunScope { checkpoint: None, workflow: None, lane: None, owner: Some(owner.as_str()), rules: None };
         run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, None, 0, Some(&scope)).await.unwrap();
         let last_read = seen.lock().unwrap()[0].clone();
         assert!(last_read.contains("manager plan") && !last_read.contains("helper step"), "the helper's list did not replace the manager's: {last_read}");
@@ -3322,6 +3502,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn parallel_tasks_cannot_edit_the_same_file_either() {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("lanes-edit-{}-{}", std::process::id(), delegation::new_task_id()));
         fs::create_dir_all(&dir).unwrap();
         let shared = dir.join("shared.txt");
