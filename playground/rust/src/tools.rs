@@ -27,6 +27,91 @@ fn spec(name: &str, description: &str, required: &[&str], properties: Value) -> 
     })
 }
 
+/// OpenCode's `question` tool: ask the user something and wait for the answer. Offered only when the host
+/// can pass an answer back (`NOMAD_CONTROL_DIR`).
+pub fn question_spec() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "question",
+            "description": "Use this tool when you need to ask the user questions during execution. This allows you to:\n\
+1. Gather user preferences or requirements\n2. Clarify ambiguous instructions\n3. Get decisions on implementation choices as you work\n\
+4. Offer choices to the user about what direction to take.\n\nUsage notes:\n\
+- When `custom` is enabled (default), a \"Type your own answer\" option is added automatically; don't include \"Other\" or catch-all options\n\
+- Answers are returned as arrays of labels; set `multiple: true` to allow selecting more than one\n\
+- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label",
+            "parameters": {
+                "type": "object",
+                "required": ["questions"],
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "description": "Questions to ask",
+                        "items": {
+                            "type": "object",
+                            "required": ["question", "header", "options"],
+                            "properties": {
+                                "question": { "type": "string", "description": "Complete question" },
+                                "header": { "type": "string", "description": "Very short label (max 30 chars)" },
+                                "options": {
+                                    "type": "array",
+                                    "description": "Available choices",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["label", "description"],
+                                        "properties": {
+                                            "label": { "type": "string", "description": "Display text (1-5 words, concise)" },
+                                            "description": { "type": "string", "description": "Explanation of choice" }
+                                        }
+                                    }
+                                },
+                                "multiple": { "type": "boolean", "description": "Allow selecting multiple choices" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The questions of a `question` call, checked and tidied (`header` cut to 30 characters).
+pub fn parse_questions(args: &Value) -> Result<Vec<Value>, String> {
+    let list = args["questions"].as_array().filter(|l| !l.is_empty()).ok_or("Error: question requires `questions`: a list of {question, header, options}.")?;
+    list.iter()
+        .map(|item| {
+            let question = item["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or("Error: every question needs a `question` text.")?;
+            let header: String = item["header"].as_str().unwrap_or(question).chars().take(30).collect();
+            let options: Vec<Value> = item["options"]
+                .as_array()
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            let label = o["label"].as_str().or_else(|| o.as_str())?.trim();
+                            (!label.is_empty()).then(|| json!({ "label": label, "description": o["description"].as_str().unwrap_or("") }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(json!({ "question": question, "header": header, "options": options, "multiple": item["multiple"].as_bool().unwrap_or(false) }))
+        })
+        .collect::<Result<Vec<Value>, &str>>()
+        .map_err(str::to_string)
+}
+
+/// The model-facing result, in OpenCode's words.
+pub fn answered_text(questions: &[Value], answers: &[Vec<String>]) -> String {
+    let lines: Vec<String> = questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let given = answers.get(i).filter(|a| !a.is_empty()).map(|a| a.join(", ")).unwrap_or_else(|| "Unanswered".into());
+            format!("\"{}\"=\"{given}\"", q["question"].as_str().unwrap_or(""))
+        })
+        .collect();
+    format!("User has answered your questions: {}. You can now continue with the user's answers in mind.", lines.join(", "))
+}
+
 pub fn tool_specs() -> Vec<Value> {
     vec![
         spec(

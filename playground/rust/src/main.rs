@@ -256,6 +256,9 @@ fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool) -> Op
             // A workflow session reports back through its handover.
             if workflow {
                 tools.push(handover::tool_spec());
+            } else if control::can_ask() {
+                // Someone can answer (the host passes answers back); an unattended workflow runner must not wait for one.
+                tools.push(tools::question_spec());
             }
 
             // Delegation to NomadWorks subagents (OpenCode's `task` tool).
@@ -694,7 +697,9 @@ async fn run_agent_loop(
             }
             let call = &calls[idx];
             emit_tool(top, call);
-            let result = if matches!(call.name.as_str(), "nomadflow_run_workflow" | "nomadflow_prompt_workflow") {
+            let result = if call.name == "question" {
+                handle_question(top, call).await
+            } else if matches!(call.name.as_str(), "nomadflow_run_workflow" | "nomadflow_prompt_workflow") {
                 // A failing workflow is a result the caller can react to, not the end of this run.
                 Box::pin(handle_nomadflow(client, cfg, skills, top, call, depth)).await
             } else {
@@ -722,6 +727,24 @@ async fn run_agent_loop(
         "the agent used all {step_cap} steps without finishing (NOMAD_MAX_STEPS raises the limit); a delegated task keeps its progress, so its id can continue it"
     )
     .into())
+}
+
+/// The `question` tool: shows the user the questions and waits for the answers the host passes back.
+/// A task that is stopped while it waits is dropped by its caller (control.rs), so no timeout is needed here.
+async fn handle_question(top: Option<&TopLevel<'_>>, call: &PreparedCall) -> String {
+    let Some(top) = top.filter(|_| control::can_ask()) else {
+        return "Error: nobody is here to answer questions in this run. Make a reasonable assumption, say what you assumed, and carry on.".into();
+    };
+    let questions = match tools::parse_questions(&call.args) {
+        Ok(questions) => questions,
+        Err(err) => return err,
+    };
+    let id = delegation::new_id("que");
+    top.emitter.emit(json!({ "type": "question", "id": id, "call_id": call.id, "questions": questions }));
+    match control::wait_for_answer(&id).await {
+        control::Answer::Answers(answers) => tools::answered_text(&questions, &answers),
+        control::Answer::Dismissed => "Error: The user dismissed this question".into(),
+    }
 }
 
 /// A tool call with its name and arguments normalized.
@@ -2106,8 +2129,94 @@ mod tests {
         }
     }
 
+    /// `NOMAD_CONTROL_DIR` is process-wide: tests that set it, or that rely on it being unset, take turns.
+    static CONTROL_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Runs the agent with a model that asks one question, while a "user" answers it through the control directory.
+    async fn ask_one_question(reply: Value) -> (Vec<Value>, String) {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
+        let control = std::env::temp_dir().join(format!("control-q-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&control).unwrap();
+        std::env::set_var("NOMAD_CONTROL_DIR", &control);
+        let base = scripted_model(|req| {
+            let last = last_message(req);
+            if last["role"] == "tool" {
+                text_message(&format!("Got: {}", last["content"].as_str().unwrap_or("")))
+            } else {
+                call_message("q1", "question", json!({ "questions": [
+                    { "question": "Which format should the export use?", "header": "Format", "options": [
+                        { "label": "CSV (Recommended)", "description": "Plain and portable" }, { "label": "JSON", "description": "Typed" } ] },
+                    { "question": "Which columns?", "header": "Columns", "multiple": true, "options": [ { "label": "id", "description": "" }, { "label": "name", "description": "" } ] }
+                ] }))
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: true };
+        let mut messages = vec![json!({ "role": "system", "content": "you ask" }), json!({ "role": "user", "content": "export it" })];
+        let user = {
+            let (sink, dir) = (sink.clone(), control.clone());
+            async move {
+                let id = loop {
+                    let found = sink.lock().unwrap().iter().find(|e| e["type"] == "question").and_then(|e| e["id"].as_str().map(str::to_string));
+                    if let Some(id) = found { break id };
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                fs::write(dir.join(format!("answer-{id}.json")), reply.to_string()).unwrap();
+                id
+            }
+        };
+        let (answer, id) = tokio::join!(run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, Some(&top), 0, None), user);
+        std::env::remove_var("NOMAD_CONTROL_DIR");
+        assert!(!control.join(format!("answer-{id}.json")).exists(), "the answer was taken");
+        let events = sink.lock().unwrap().clone();
+        let _ = fs::remove_dir_all(control);
+        (events, answer.map_err(|e| e.to_string()).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_question_waits_for_the_users_answer_and_returns_it_in_opencodes_words() {
+        let (events, answer) = ask_one_question(json!({ "answers": [["CSV (Recommended)"], ["id", "name"]] })).await;
+        let asked = events.iter().find(|e| e["type"] == "question").unwrap();
+        assert_eq!(asked["call_id"], "q1");
+        assert_eq!(asked["questions"][0]["header"], "Format");
+        assert_eq!(asked["questions"][1]["multiple"], true);
+        assert!(asked["id"].as_str().unwrap().starts_with("que_"));
+        // The card was announced first, the result came after the answer.
+        let at = |kind: &str| events.iter().position(|e| e["type"] == kind).unwrap();
+        assert!(at("tool") < at("question") && at("question") < at("tool_result"));
+        assert_eq!(
+            answer,
+            "Got: User has answered your questions: \"Which format should the export use?\"=\"CSV (Recommended)\", \"Which columns?\"=\"id, name\". You can now continue with the user's answers in mind."
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dismissed_question_is_an_error_the_model_can_read() {
+        let (_, answer) = ask_one_question(json!({ "dismissed": true })).await;
+        assert_eq!(answer, "Got: Error: The user dismissed this question");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn questions_are_checked_and_the_tool_needs_someone_to_answer() {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
+        assert!(tools::parse_questions(&json!({})).unwrap_err().contains("requires `questions`"));
+        assert!(tools::parse_questions(&json!({ "questions": [{ "header": "x" }] })).unwrap_err().contains("`question` text"));
+        let parsed = tools::parse_questions(&json!({ "questions": [{ "question": "Q?", "header": "a very long header that goes past thirty characters", "options": [{ "label": "A" }, "B"] }] })).unwrap();
+        assert_eq!(parsed[0]["header"].as_str().unwrap().chars().count(), 30);
+        assert_eq!(parsed[0]["options"][1]["label"], "B");
+        assert_eq!(tools::answered_text(&parsed, &[vec![]]), "User has answered your questions: \"Q?\"=\"Unanswered\". You can now continue with the user's answers in mind.");
+        // Without a control directory nobody can answer: the tool is not offered, and a call is told so.
+        std::env::remove_var("NOMAD_CONTROL_DIR");
+        let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "question");
+        assert!(!has(&tool_specs(ToolMode::All, &[], 0, false).unwrap()));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn stopping_one_task_leaves_the_others_running() {
+        let _turn = CONTROL_DIR_LOCK.lock().await;
         let control = std::env::temp_dir().join(format!("control-{}-{}", std::process::id(), delegation::new_task_id()));
         fs::create_dir_all(&control).unwrap();
         std::env::set_var("NOMAD_CONTROL_DIR", &control);
