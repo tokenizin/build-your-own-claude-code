@@ -72,7 +72,7 @@ needs in the prompt: it does not see this conversation.\n\nAvailable subagents:\
                     },
                     "model": {
                         "type": "string",
-                        "description": "Optional model for this task (e.g. ollama/qwen3.6:latest); the agent's own model by default"
+                        "description": "Optional: only to run this task on a different model the endpoint serves. Leave it out to use the agent's own model (almost always right)."
                     }
                 }
             }
@@ -233,10 +233,9 @@ pub fn unknown_tool_message(name: &str, tools: Option<&Value>) -> String {
 ///
 /// Returns the text before the first call and the calls in OpenAI shape.
 pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
-    let first = ["<tool_call>", "<function=", "<parameter="]
-        .iter()
-        .filter_map(|tag| text.find(tag))
-        .min()?;
+    let Some(first) = ["<tool_call>", "<function=", "<parameter="].iter().filter_map(|tag| text.find(tag)).min() else {
+        return extract_fenced_task_calls(text);
+    };
     let before = text[..first].trim_end().to_string();
     let rest = &text[first..];
 
@@ -286,6 +285,39 @@ pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
         }
     }
     if calls.is_empty() { None } else { Some((before, calls)) }
+}
+
+/// A model that says "I will send these requests" and writes each one as a fenced JSON block, instead of calling the
+/// tool: every block that is a Task call (`subagent_type` and `prompt`), alone or in a list, becomes one. Nothing else in
+/// a fence is touched. Returns the text before the first block and the calls.
+fn extract_fenced_task_calls(text: &str) -> Option<(String, Vec<Value>)> {
+    let mut calls = Vec::new();
+    let mut first_fence: Option<usize> = None;
+    let mut rest = text;
+    let mut offset = 0;
+    while let Some(open) = rest.find("```") {
+        let after_open = &rest[open + 3..];
+        let Some(line_end) = after_open.find('\n') else { break };
+        let body_start = open + 3 + line_end + 1;
+        let Some(close) = rest[body_start..].find("```") else { break };
+        let body = rest[body_start..body_start + close].trim();
+        let candidates: Vec<Value> = match serde_json::from_str::<Value>(body) {
+            Ok(Value::Array(list)) => list,
+            Ok(one @ Value::Object(_)) => vec![one],
+            _ => Vec::new(),
+        };
+        for v in candidates {
+            if v["subagent_type"].as_str().is_some_and(|t| !t.trim().is_empty()) && v["prompt"].as_str().is_some_and(|p| !p.trim().is_empty()) {
+                first_fence.get_or_insert(offset + open);
+                calls.push(openai_call("Task", v, calls.len()));
+            }
+        }
+        let consumed = body_start + close + 3;
+        offset += consumed;
+        rest = &rest[consumed..];
+    }
+    let first = first_fence?;
+    Some((text[..first].trim_end().to_string(), calls))
 }
 
 fn xml_parameters(body: &str) -> Map<String, Value> {
@@ -415,6 +447,24 @@ mod tests {
             policies: vec![],
             model: None,
         }
+    }
+
+    #[test]
+    fn fenced_json_task_requests_become_tool_calls() {
+        let text = "I will send the requests.\n\nTo the BA:\n```json\n{\"subagent_type\":\"business_analyst\",\"description\":\"Review\",\"prompt\":\"Review docs/export.md\"}\n```\nand the lead:\n```\n{\"subagent_type\":\"tech_lead\",\"prompt\":\"Review it too\"}\n```\nDone.";
+        let (before, calls) = extract_text_tool_calls(text).expect("two calls");
+        assert_eq!(before, "I will send the requests.\n\nTo the BA:");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "Task");
+        let args: Value = serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!((args["subagent_type"].as_str(), args["prompt"].as_str()), (Some("tech_lead"), Some("Review it too")));
+        // A list in one block works; other fenced JSON, code and prose are left alone.
+        let list = "```json\n[{\"subagent_type\":\"a\",\"prompt\":\"x\"},{\"subagent_type\":\"b\",\"prompt\":\"y\"}]\n```";
+        assert_eq!(extract_text_tool_calls(list).unwrap().1.len(), 2);
+        assert!(extract_text_tool_calls("```json\n{\"name\":\"x\",\"value\":1}\n```").is_none());
+        assert!(extract_text_tool_calls("```rust\nfn main() {}\n```").is_none());
+        assert!(extract_text_tool_calls("```json\n{\"subagent_type\":\"a\"}\n```").is_none(), "no prompt: not a request");
+        assert!(extract_text_tool_calls("plain answer").is_none());
     }
 
     #[test]

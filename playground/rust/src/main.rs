@@ -680,6 +680,9 @@ async fn run_agent_loop(
 
         if tool_calls.is_empty() {
             if text.is_empty() {
+                // What the endpoint actually sent, so a model that answers in an unexpected shape can be told from one that is silent.
+                let raw = stream::truncate_chars(&message.to_string(), 600);
+                eprintln!("model answered with no text and no tool call: {raw}");
                 return Err("assistant returned empty content".into());
             }
             return Ok(text);
