@@ -9,6 +9,7 @@ mod inputs;
 mod lanes;
 mod nomad_tools;
 mod opencode_config;
+mod patch;
 mod skills;
 mod stream;
 mod tools;
@@ -162,7 +163,7 @@ fn apply_agent_flag(prompt: &str, agent: Option<&str>, skills: &[Skill]) -> (Str
     }
 }
 
-fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool) -> Option<Value> {
+fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool, model: &str) -> Option<Value> {
     match mode {
         ToolMode::None => None,
         ToolMode::Base | ToolMode::All => {
@@ -252,6 +253,12 @@ fn tool_specs(mode: ToolMode, skills: &[Skill], depth: u8, workflow: bool) -> Op
             tools.extend(nomad_tools::tool_specs());
             // Edit, Grep, Glob, WebFetch, TodoWrite, TodoRead (OpenCode's tool surface).
             tools.extend(tools::tool_specs());
+
+            // OpenCode gives GPT models `apply_patch` in place of Edit and Write.
+            if patch::offered_for(model) {
+                tools.retain(|t| !matches!(t["function"]["name"].as_str(), Some("Edit" | "Write")));
+                tools.push(patch::tool_spec());
+            }
 
             // A workflow session reports back through its handover.
             if workflow {
@@ -559,7 +566,7 @@ async fn run_agent_loop(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let workflow = scope.and_then(|s| s.workflow);
     let checkpoint = scope.and_then(|s| s.checkpoint);
-    let tools = tool_specs(tool_mode, skills, depth, workflow.is_some());
+    let tools = tool_specs(tool_mode, skills, depth, workflow.is_some(), &cfg.model);
 
     let step_cap = max_steps(workflow.is_some());
     for _ in 0..step_cap {
@@ -832,6 +839,25 @@ or report back so the work can be done one after the other."
         "Glob" => {
             let args = fn_args.clone();
             tokio::task::spawn_blocking(move || tools::glob(&args)).await.unwrap_or_else(|err| format!("Error: search did not complete: {err}"))
+        }
+        "apply_patch" => {
+            let text = fn_args["patchText"].as_str().unwrap_or("");
+            // Among Task calls running at the same time, a file belongs to the first lane that writes it.
+            if let Some(lane) = scope.and_then(|s| s.lane) {
+                for path in patch::paths(text) {
+                    if let Err(owner) = lanes::claim(&path, lane) {
+                        return Ok(format!(
+                            "Error: {path} is being written by another task running in parallel ({owner}). Do not edit it from here: leave it to that task, \
+or report back so the work can be done one after the other."
+                        ));
+                    }
+                }
+            }
+            let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match patch::apply(text, &base) {
+                Ok(done) => done,
+                Err(err) => format!("Error: apply_patch failed: {err}"),
+            }
         }
         "WebFetch" => tools::webfetch(fn_args).await,
         "TodoWrite" => tools::todowrite(scope.and_then(|s| s.owner).unwrap_or("root"), fn_args),
@@ -2211,7 +2237,35 @@ mod tests {
         // Without a control directory nobody can answer: the tool is not offered, and a call is told so.
         std::env::remove_var("NOMAD_CONTROL_DIR");
         let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "question");
-        assert!(!has(&tool_specs(ToolMode::All, &[], 0, false).unwrap()));
+        assert!(!has(&tool_specs(ToolMode::All, &[], 0, false, "m").unwrap()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gpt_models_get_apply_patch_and_it_edits_files() {
+        let names = |model: &str| -> Vec<String> {
+            tool_specs(ToolMode::All, &[], 0, false, model).unwrap().as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect()
+        };
+        let (gpt, other) = (names("gpt-5"), names("qwen2.5:14b"));
+        assert!(gpt.contains(&"apply_patch".to_string()) && !gpt.contains(&"Edit".to_string()) && !gpt.contains(&"Write".to_string()));
+        assert!(!other.contains(&"apply_patch".to_string()) && other.contains(&"Edit".to_string()) && other.contains(&"Write".to_string()));
+
+        // A model that calls it: the file changes and the model is told what was updated.
+        let wt = new_worktree("apply-patch");
+        let file = wt.join("notes.txt");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n-two\n+2\n*** Add File: {}\n+new\n*** End Patch", file.display(), wt.join("added.txt").display());
+        let base = scripted_model(move |req| {
+            let last = last_message(req);
+            if last["role"] == "tool" { text_message(last["content"].as_str().unwrap_or("")) } else { call_message("p1", "apply_patch", json!({ "patchText": patch })) }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "gpt-5".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let mut messages = vec![json!({ "role": "user", "content": "patch it" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, None, 0, None).await.map_err(|e| e.to_string()).unwrap();
+        assert!(answer.starts_with("Success. Updated the following files:\nM "), "{answer}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\n2\n");
+        assert_eq!(fs::read_to_string(wt.join("added.txt")).unwrap(), "new\n");
+        let _ = fs::remove_dir_all(wt);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2995,8 +3049,8 @@ mod tests {
     #[test]
     fn the_handover_tool_belongs_to_workflow_sessions_only() {
         assert!(file_handover(None, &valid_handover("x")).starts_with("Error: the handover tool is only available inside a workflow session"));
-        let with = tool_specs(ToolMode::All, &[], 0, true).unwrap();
-        let without = tool_specs(ToolMode::All, &[], 0, false).unwrap();
+        let with = tool_specs(ToolMode::All, &[], 0, true, "m").unwrap();
+        let without = tool_specs(ToolMode::All, &[], 0, false, "m").unwrap();
         let has = |v: &Value| v.as_array().unwrap().iter().any(|t| t["function"]["name"] == "handover");
         assert!(has(&with) && !has(&without));
     }

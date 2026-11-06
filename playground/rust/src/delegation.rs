@@ -97,6 +97,7 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "bash" | "Bash" | "shell" | "sh" => "Bash",
         "skill" | "Skill" => "Skill",
         "handover" | "Handover" | "file_handover" | "submit_handover" => "handover",
+        "apply_patch" | "applypatch" | "ApplyPatch" | "patch" => "apply_patch",
         "edit" | "Edit" | "edit_file" | "str_replace" | "str_replace_editor" => "Edit",
         "grep" | "Grep" | "search" | "ripgrep" | "search_files" => "Grep",
         "glob" | "Glob" | "find_files" | "list_files" => "Glob",
