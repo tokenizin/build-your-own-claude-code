@@ -124,8 +124,8 @@ pub struct Entry {
     pub track: String,
     /// `running` while its runner has work, `idle` after.
     pub state: String,
-    /// Times the Product Manager has sent this workflow back (or added to it) since its last `completed`
-    /// handover or the user's last message; see `max_send_backs`.
+    /// Times the Product Manager has sent this workflow back (or added to it) since the user's last message,
+    /// whatever the handovers said; see `max_send_backs`.
     pub send_backs: u32,
 }
 
@@ -185,8 +185,8 @@ pub fn set_state(worktree: &Path, workflow_id: &str, state: &str) {
     }
 }
 
-/// How many times the manager may send a workflow back without a `completed` handover before it must ask the
-/// user (`NOMAD_WORKFLOW_MAX_SENDBACKS`, default 3; `0` = no limit). Nothing in OpenCode's plugin bounds this
+/// How many times the manager may send a workflow back before it must ask the user, counted from the user's last
+/// message and not reset by a `completed` handover (`NOMAD_WORKFLOW_MAX_SENDBACKS`, default 3; `0` = no limit). Nothing in OpenCode's plugin bounds this
 /// exchange, and each notification starts a manager turn that may prompt the runner again.
 pub fn max_send_backs() -> u32 {
     parse_max_send_backs(std::env::var("NOMAD_WORKFLOW_MAX_SENDBACKS").ok().as_deref())

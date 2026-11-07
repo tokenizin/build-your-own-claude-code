@@ -1676,7 +1676,7 @@ fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
         let limit = workflows::max_send_backs();
         if limit > 0 && entry.send_backs >= limit {
             return format!(
-                "FAIL: Workflow '{requested}' has already been sent back {} times without a completed handover (limit {limit}). Do not send it back again. \
+                "FAIL: Workflow '{requested}' has already been sent back {} times since the user last wrote (limit {limit}). Do not send it back again. \
 Tell the user where it stands (the latest handover's outcome and open issues) and ask how to proceed: retry with different instructions, change the task, or stop. A message from the user lifts this limit.",
                 entry.send_backs
             );
@@ -1757,10 +1757,8 @@ async fn run_workflow_session(
     let worktree = prepared.worktree.clone();
     let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, 0, &prepared, "", true).await;
     workflows::set_state(&worktree, &id, "idle");
-    // A completed handover ends the back-and-forth: the count starts again.
-    if filed.as_ref().is_some_and(|f| f.outcome == handover::Outcome::Completed) {
-        workflows::set_send_backs(&worktree, &id, 0);
-    }
+    // The count is not reset here, not even by a `completed` handover: a manager that re-sends a finished
+    // workflow after every completion would otherwise never reach the limit (D62). Only the user's message does.
     if let Some(top) = top {
         let handover = filed.as_ref().map(|f| {
             json!({
@@ -3199,7 +3197,7 @@ mod tests {
         // The fourth is refused, nothing is sent, and the manager is told to ask the user.
         let refused = flow(&wt, Runner::Happy, prompt(4), Arc::new(AtomicUsize::new(0))).await;
         let text = workflow_result(&refused);
-        assert!(text.starts_with("FAIL: Workflow '") && text.contains("sent back 3 times without a completed handover (limit 3)") && text.contains("ask how to proceed"), "{text}");
+        assert!(text.starts_with("FAIL: Workflow '") && text.contains("sent back 3 times since the user last wrote (limit 3)") && text.contains("ask how to proceed"), "{text}");
         assert!(event_of(&refused, "workflow.prompt").is_none(), "nothing was sent to the runner");
         assert!(!workflows::find(&wt, &id).unwrap().running());
         assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 3, "a refusal is not a send-back");
@@ -3295,7 +3293,7 @@ mod tests {
         assert_eq!(done["handover"]["path"], "tasks/todo/TASK-9/HANDOVER.md");
         assert!(done["handover"]["markdown"].as_str().unwrap().contains("export shipped"));
         assert!(!workflows::find(&wt, &id).unwrap().running(), "idle once its runner is done");
-        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 0, "a completed handover starts the count again");
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 2, "a completed handover does not start the count again (D62)");
         assert!(fs::read_to_string(wt.join("tasks/todo/TASK-9/HANDOVER.md")).unwrap().contains("revision: 1"));
 
         // Sent back: the same session continues, and the reason goes in the review log.
@@ -3336,7 +3334,7 @@ mod tests {
         assert!(done["error"].as_str().unwrap().contains("without filing a handover"));
         assert!(done["handover"].is_null());
         assert!(!workflows::find(&wt, &id).unwrap().running());
-        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 2, "no completed handover, the count stays");
+        assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 2, "a failed run leaves the count as it was");
         let _ = fs::remove_dir_all(wt);
     }
 
