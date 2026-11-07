@@ -32,6 +32,16 @@ fn short(text: &str, max: usize) -> String {
 }
 
 /// The `Task` tool definition, listing the agents it can delegate to.
+/// Tells the model that Task calls made in one reply run at the same time. On unless `NOMAD_TASK_FANOUT_HINT=off`
+/// (which is how the difference it makes was measured).
+fn fan_out_hint() -> &'static str {
+    if std::env::var("NOMAD_TASK_FANOUT_HINT").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        ""
+    } else {
+        "\n\nLaunch several subagents at once whenever their work is independent: make all the Task calls in a single reply and they run at the same time (the way to get three reviews, or a spec and a design, in the time of one). Wait to call a subagent only when it needs another one's answer."
+    }
+}
+
 pub fn task_tool_spec(agents: &[&Skill]) -> Value {
     let names: Vec<&str> = agents.iter().map(|s| s.name.as_str()).collect();
     let roster = agents
@@ -47,7 +57,8 @@ pub fn task_tool_spec(agents: &[&Skill]) -> Value {
                 "Delegate a task to a specialist subagent. The subagent works on its own \
 (with tools), then returns its final answer and a task_id. Pass the same task_id \
 to continue with that subagent (follow-ups, bounce-backs). Give it everything it \
-needs in the prompt: it does not see this conversation.\n\nAvailable subagents:\n{roster}"
+needs in the prompt: it does not see this conversation.{}\n\nAvailable subagents:\n{roster}",
+                fan_out_hint()
             ),
             "parameters": {
                 "type": "object",

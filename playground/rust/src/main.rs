@@ -541,6 +541,8 @@ struct WorkflowScope {
     /// What the last `nomadworks_validate` of this run said: the first line, when it failed. A handover may not claim
     /// `verified` over a check that failed.
     last_validation_failure: Mutex<Option<String>>,
+    /// Said after a handover that is not `completed` for a reason the runner can fix itself (see `self_correction`).
+    nudge: Mutex<Option<String>>,
 }
 
 /// What a delegated run adds to the plain loop.
@@ -1130,13 +1132,23 @@ async fn run_delegated(
     // A workflow is not finished until it has filed its handover: remind it, twice at most.
     if let Some(w) = workflow {
         let mut reminders = 0;
-        while outcome.is_ok() && handover_missing(w) {
-            if reminders == 2 {
-                outcome = Err("the workflow ended without filing a handover, even after two reminders".into());
-                break;
+        let mut nudges = 0;
+        while outcome.is_ok() {
+            if handover_missing(w) {
+                if reminders == 2 {
+                    outcome = Err("the workflow ended without filing a handover, even after two reminders".into());
+                    break;
+                }
+                reminders += 1;
+                messages.push(json!({ "role": "user", "content": HANDOVER_REMINDER }));
+            } else {
+                // Filed, but for a reason the runner can mend itself: say so, up to twice, before it goes back to the manager.
+                let nudge = if nudges < 2 { w.nudge.lock().ok().and_then(|mut n| n.take()) } else { None };
+                let Some(nudge) = nudge else { break };
+                nudges += 1;
+                eprintln!("workflow {}: sending the runner back to fix itself ({nudges}/2)", w.session_id);
+                messages.push(json!({ "role": "user", "content": nudge }));
             }
-            reminders += 1;
-            messages.push(json!({ "role": "user", "content": HANDOVER_REMINDER }));
             outcome = run_stoppable(stoppable, &task_id, async {
                 Box::pin(run_agent_loop(client, &task_cfg, &mut messages, skills, ToolMode::All, child_top.as_ref(), depth + 1, Some(&scope)))
                     .await
@@ -1353,9 +1365,37 @@ fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
             if let Ok(mut slot) = w.filed.lock() {
                 *slot = Some(filed);
             }
+            if let Ok(mut slot) = w.nudge.lock() {
+                *slot = self_correction(&parsed, w.last_validation_failure.lock().ok().and_then(|f| f.clone()));
+            }
             note
         }
     }
+}
+
+/// What to tell a runner whose handover is not `completed` for a reason it can mend itself, so the fix does not wait for
+/// the manager or a person: a validation that failed (the work is not done), or a handover whose requirements are all met
+/// and verified but whose plan still lists steps (do them, or skip the ones outside the task).
+fn self_correction(handover: &handover::Handover, validation_failure: Option<String>) -> Option<String> {
+    use handover::Outcome;
+    if handover.outcome == Outcome::Completed {
+        return None;
+    }
+    if let Some(failure) = validation_failure {
+        return Some(format!(
+            "Your handover is {}, and the last nomadworks_validate said: {failure}\nDo the work that makes it pass (write the real content: describing a change does not make it), run nomadworks_validate again, and then file the handover again. If it cannot be done, say so in the handover.",
+            handover.outcome.as_str()
+        ));
+    }
+    let met = handover.requirements.iter().all(|r| r.status == "met" || r.status == "waived");
+    let pending: Vec<&str> = handover.plan.iter().filter(|p| p.status == "pending").map(|p| p.id.as_str()).collect();
+    if handover.verification == "verified" && met && !pending.is_empty() {
+        return Some(format!(
+            "Every requirement is met and verified, but your plan still lists these steps as pending: {}. If they are not part of this task, mark them `skipped` and say why in their result; if they are, do them. Then file the handover again, dropping any open issue this settles (a completed handover needs every step done or skipped, and no open issues).",
+            pending.join(", ")
+        ));
+    }
+    None
 }
 
 /// Whether `nomadflow_*` start workflows in the background (`NOMAD_WORKFLOW_MODE=async`), as OpenCode's
@@ -1476,6 +1516,7 @@ async fn run_prepared(
         agent: runner.name.clone(),
         filed: Mutex::new(None),
         last_validation_failure: Mutex::new(None),
+        nudge: Mutex::new(None),
     };
     let task_id = handover::task_id_of(task_path);
     log_workflow_event(
@@ -2447,6 +2488,42 @@ mod tests {
         assert!(events.iter().all(|e| e["type"] != "permission"));
     }
 
+    #[test]
+    fn a_runner_is_told_what_it_can_mend_itself() {
+        let mut h = handover::Handover::from_args(&valid_handover("x")).unwrap();
+        assert!(self_correction(&h, Some("FAIL: x".into())).is_none(), "completed needs nothing");
+        h.outcome = handover::Outcome::Partial;
+        h.open_issues = vec!["something".into()];
+        // A failed validation: the work is not done.
+        let told = self_correction(&h, Some("FAIL: docs/specifications/EXPORT.md has fewer than 40 words".into())).unwrap();
+        assert!(told.contains("Your handover is partial") && told.contains("fewer than 40 words") && told.contains("describing a change does not make it"), "{told}");
+        // Requirements met and verified, steps left pending.
+        h.plan.push(handover::PlanItem { id: "P9".into(), title: "Build".into(), owner: "".into(), status: "pending".into(), result: "".into(), depends_on: vec![] });
+        let told = self_correction(&h, None).unwrap();
+        assert!(told.contains("still lists these steps as pending: P9") && told.contains("`skipped`"), "{told}");
+        // Not this: an unmet requirement, or an unverified result, is real unfinished work for the manager to judge.
+        h.requirements[0].status = "unmet".into();
+        assert!(self_correction(&h, None).is_none());
+        h.requirements[0].status = "met".into();
+        h.verification = "unverified".into();
+        assert!(self_correction(&h, None).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runner_whose_only_shortfall_is_pending_steps_is_sent_back_by_the_engine() {
+        let wt = new_worktree("self-correct");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::PendingPlan, run_call(json!({ "task_path": TASK, "instructions": "do it" })), requests.clone()).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        // The manager got the handover from after the correction: completed, not the first, partial one.
+        let result = workflow_result(&run);
+        assert!(result.contains("completed"), "{result}");
+        let ends: Vec<&Value> = run.events.iter().filter(|e| e["type"] == "task.end").collect();
+        assert_eq!(ends.last().unwrap()["handover"]["outcome"], "completed");
+        assert_eq!(ends.last().unwrap()["handover"]["revision"], 2, "two filings, one workflow");
+        let _ = fs::remove_dir_all(wt);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn gpt_models_get_apply_patch_and_it_edits_files() {
         let names = |model: &str| -> Vec<String> {
@@ -2657,7 +2734,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy, PartialEq, Debug)]
-    enum Runner { Happy, RejectedFirst, NeverFiles, Failing }
+    enum Runner { Happy, RejectedFirst, NeverFiles, Failing, PendingPlan }
 
     fn new_worktree(name: &str) -> PathBuf {
         let wt = std::env::temp_dir().join(format!("wf-{name}-{}-{}", std::process::id(), delegation::new_task_id()));
@@ -2685,6 +2762,15 @@ mod tests {
                         let mut bad = valid_handover("x");
                         bad["open_issues"] = json!(["a leftover"]);
                         call_message("h1", "handover", bad)
+                    }
+                    // Files a partial handover whose only shortfall is steps left pending; once told so, files it completed.
+                    (_, Runner::PendingPlan) if content.contains("still lists these steps as pending") => call_message("h4", "handover", valid_handover("steps settled")),
+                    (_, Runner::PendingPlan) => {
+                        let mut early = valid_handover("spec done, build steps not started");
+                        early["outcome"] = json!("partial");
+                        early["open_issues"] = json!(["P3 not started"]);
+                        early["plan"].as_array_mut().unwrap().push(json!({ "id": "P3", "title": "Build the feature", "owner": "developer", "status": "pending" }));
+                        call_message("h1", "handover", early)
                     }
                     (_, Runner::Failing) => call_message("h1", "handover", json!({
                         "outcome": "failed", "objective": "Ship the export", "summary": "Build is broken",
@@ -3264,6 +3350,7 @@ mod tests {
             agent: "workflow_runner".into(),
             filed: Mutex::new(None),
             last_validation_failure: Mutex::new(Some("FAIL: docs/specifications/EXPORT.md has fewer than 40 words".into())),
+            nudge: Mutex::new(None),
         };
         let claimed = file_handover(Some(&scope), &valid_handover("done"));
         assert!(claimed.starts_with("Error: handover rejected.") && claimed.contains("last nomadworks_validate said: FAIL: docs/specifications/EXPORT.md has fewer than 40 words"), "{claimed}");
