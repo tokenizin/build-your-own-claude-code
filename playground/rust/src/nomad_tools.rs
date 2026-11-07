@@ -165,6 +165,15 @@ fn execute_validate(args: &Value) -> String {
     }
 }
 
+/// Runs the project's own validator (`scripts/validate-nomadworks.sh`) and returns the line that says `FAIL`, if it does.
+/// `None` when it passes, or when the project has no such script (nothing to check against).
+pub fn failing_validation(worktree: &Path) -> Option<String> {
+    if !worktree.join("scripts/validate-nomadworks.sh").is_file() {
+        return None;
+    }
+    validate_phase0(worktree).lines().find(|l| l.trim_start().starts_with("FAIL")).map(|l| l.trim().to_string())
+}
+
 fn validate_phase0(worktree: &Path) -> String {
     let script = worktree.join("scripts/validate-nomadworks.sh");
     if !script.is_file() {

@@ -1335,10 +1335,11 @@ fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
     };
     // `verified` over a check that just failed is a false claim: the runner fixes the cause or files `unverified`.
     if parsed.verification == "verified" {
-        let failure = w.last_validation_failure.lock().ok().and_then(|f| f.clone());
+        // The runner's word is not the check: the project's own validator is run here, whether or not the runner ran it.
+        let failure = w.last_validation_failure.lock().ok().and_then(|f| f.clone()).or_else(|| nomad_tools::failing_validation(&w.worktree));
         if let Some(failure) = failure {
             return format!(
-                "Error: handover rejected. Fix these and call handover again:\n- verification is `verified`, but the last nomadworks_validate said: {failure}\n  Fix what it names and run nomadworks_validate again, or file the handover with verification `unverified` and say why."
+                "Error: handover rejected. Fix these and call handover again:\n- verification is `verified`, but the project's validation says: {failure}\n  Fix what it names and run nomadworks_validate again, or file the handover with verification `unverified` and say why."
             );
         }
     }
@@ -3353,7 +3354,7 @@ mod tests {
             nudge: Mutex::new(None),
         };
         let claimed = file_handover(Some(&scope), &valid_handover("done"));
-        assert!(claimed.starts_with("Error: handover rejected.") && claimed.contains("last nomadworks_validate said: FAIL: docs/specifications/EXPORT.md has fewer than 40 words"), "{claimed}");
+        assert!(claimed.starts_with("Error: handover rejected.") && claimed.contains("validation says: FAIL: docs/specifications/EXPORT.md has fewer than 40 words"), "{claimed}");
         assert!(scope.filed.lock().unwrap().is_none(), "nothing was filed");
 
         // Honest about it: `unverified` (and partial) is accepted.
@@ -3364,6 +3365,14 @@ mod tests {
         honest["requirements"][0]["status"] = json!("partial");
         let filed = file_handover(Some(&scope), &honest);
         assert!(filed.starts_with("Handover filed:"), "{filed}");
+
+        // The runner never ran the validator, but the project has one: it is run at handover, and its FAIL stops the claim.
+        *scope.last_validation_failure.lock().unwrap() = None;
+        fs::create_dir_all(wt.join("scripts")).unwrap();
+        fs::write(wt.join("scripts/validate-nomadworks.sh"), "#!/bin/bash\necho 'FAIL: no specification under docs/specifications/'\nexit 1\n").unwrap();
+        let unrun = file_handover(Some(&scope), &valid_handover("claimed without running it"));
+        assert!(unrun.starts_with("Error: handover rejected.") && unrun.contains("validation says: FAIL: no specification under docs/specifications/"), "{unrun}");
+        fs::write(wt.join("scripts/validate-nomadworks.sh"), "#!/bin/bash\necho 'PASS: fine'\n").unwrap();
 
         // The validation passes on a later try: the claim goes through.
         *scope.last_validation_failure.lock().unwrap() = None;
