@@ -538,6 +538,9 @@ struct WorkflowScope {
     worktree: PathBuf,
     agent: String,
     filed: Mutex<Option<handover::Filed>>,
+    /// What the last `nomadworks_validate` of this run said: the first line, when it failed. A handover may not claim
+    /// `verified` over a check that failed.
+    last_validation_failure: Mutex<Option<String>>,
 }
 
 /// What a delegated run adds to the plain loop.
@@ -936,6 +939,13 @@ or report back so the work can be done one after the other."
         "handover" => file_handover(workflow, fn_args),
         other => {
             if let Some(out) = nomad_tools::dispatch(other, fn_args) {
+                if other == "nomadworks_validate" {
+                    if let Some(w) = workflow {
+                        if let Ok(mut last) = w.last_validation_failure.lock() {
+                            *last = out.lines().find(|l| l.trim_start().starts_with("FAIL")).map(|l| l.trim().to_string());
+                        }
+                    }
+                }
                 out
             } else {
                 delegation::unknown_tool_message(other, tools)
@@ -1311,6 +1321,15 @@ fn file_handover(workflow: Option<&WorkflowScope>, args: &Value) -> String {
             return format!("Error: handover rejected. Fix these and call handover again:\n{list}");
         }
     };
+    // `verified` over a check that just failed is a false claim: the runner fixes the cause or files `unverified`.
+    if parsed.verification == "verified" {
+        let failure = w.last_validation_failure.lock().ok().and_then(|f| f.clone());
+        if let Some(failure) = failure {
+            return format!(
+                "Error: handover rejected. Fix these and call handover again:\n- verification is `verified`, but the last nomadworks_validate said: {failure}\n  Fix what it names and run nomadworks_validate again, or file the handover with verification `unverified` and say why."
+            );
+        }
+    }
     // Evidence that names a file must name one that is there (a model can describe a change it never made).
     let missing = handover::missing_evidence_files(&w.worktree, &w.task_path, &parsed);
     if !missing.is_empty() {
@@ -1456,6 +1475,7 @@ async fn run_prepared(
         worktree: worktree.clone(),
         agent: runner.name.clone(),
         filed: Mutex::new(None),
+        last_validation_failure: Mutex::new(None),
     };
     let task_id = handover::task_id_of(task_path);
     log_workflow_event(
@@ -3230,6 +3250,38 @@ mod tests {
         assert!(done["handover"].is_null());
         assert!(!workflows::find(&wt, &id).unwrap().running());
         assert_eq!(workflows::find(&wt, &id).unwrap().send_backs, 2, "no completed handover, the count stays");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn a_handover_cannot_claim_verified_over_a_validation_that_failed() {
+        let wt = new_worktree("verified-claim");
+        fs::write(wt.join(TASK), "---\nid: T\n---\n").unwrap();
+        let scope = WorkflowScope {
+            session_id: "wf_claim".into(),
+            task_path: TASK.into(),
+            worktree: wt.clone(),
+            agent: "workflow_runner".into(),
+            filed: Mutex::new(None),
+            last_validation_failure: Mutex::new(Some("FAIL: docs/specifications/EXPORT.md has fewer than 40 words".into())),
+        };
+        let claimed = file_handover(Some(&scope), &valid_handover("done"));
+        assert!(claimed.starts_with("Error: handover rejected.") && claimed.contains("last nomadworks_validate said: FAIL: docs/specifications/EXPORT.md has fewer than 40 words"), "{claimed}");
+        assert!(scope.filed.lock().unwrap().is_none(), "nothing was filed");
+
+        // Honest about it: `unverified` (and partial) is accepted.
+        let mut honest = valid_handover("spec still too short");
+        honest["outcome"] = json!("partial");
+        honest["verification"] = json!("unverified");
+        honest["open_issues"] = json!(["the validator still fails"]);
+        honest["requirements"][0]["status"] = json!("partial");
+        let filed = file_handover(Some(&scope), &honest);
+        assert!(filed.starts_with("Handover filed:"), "{filed}");
+
+        // The validation passes on a later try: the claim goes through.
+        *scope.last_validation_failure.lock().unwrap() = None;
+        let ok = file_handover(Some(&scope), &valid_handover("fixed"));
+        assert!(ok.starts_with("Handover filed:") && ok.contains("verification verified"), "{ok}");
         let _ = fs::remove_dir_all(wt);
     }
 
