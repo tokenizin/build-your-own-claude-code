@@ -252,8 +252,13 @@ pub fn fork_user_body(skill: &Skill, arguments: &str) -> String {
     }
 }
 
-/// Discover skills across all roots. Higher-precedence roots win on name collision
-/// (stderr warning when `SKILLS_DEBUG` is set or always for collisions).
+/// Discover skills across all roots. Higher-precedence roots win on name collision.
+///
+/// Symlink twins (same canonical skill directory under `.claude/skills` and
+/// `.opencode/skills`) are skipped silently — StarWorld links Claude-compat
+/// roots at `.claude/skills/*` → `.opencode/skills/*`, so scanning both without
+/// inode/path dedupe floods stderr (OpenCode #46327 class).
+/// True name collisions with different directories still warn on stderr.
 pub fn discover_skills() -> Vec<Skill> {
     let roots = collect_skill_roots();
     let debug = std::env::var("SKILLS_DEBUG").is_ok_and(|v| v != "0");
@@ -269,10 +274,23 @@ pub fn discover_skills() -> Vec<Skill> {
     }
 
     let mut by_name: HashMap<String, Skill> = HashMap::new();
+    let mut seen_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut order: Vec<String> = Vec::new();
 
     for root in &roots {
         for skill in load_skills_from_dir(root) {
+            // Same directory via two roots (symlink) — not a conflict.
+            if !seen_dirs.insert(skill.directory.clone()) {
+                if debug {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "skills: skipping symlink twin '{}' at {}",
+                        skill.name,
+                        skill.directory.display()
+                    );
+                }
+                continue;
+            }
             if let Some(existing) = by_name.get(&skill.name) {
                 let _ = writeln!(
                     io::stderr(),
@@ -534,6 +552,43 @@ mod tests {
             alpha.description.contains("from-claude"),
             "expected claude to win, got {}",
             alpha.description
+        );
+    }
+
+    #[test]
+    fn symlink_twin_across_roots_is_silent_and_single() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile_dir("skills-symlink");
+        let opencode = tmp.join(".opencode").join("skills").join("alpha");
+        write_skill(&opencode, "alpha", "from-opencode");
+        let claude_root = tmp.join(".claude").join("skills");
+        fs::create_dir_all(&claude_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&opencode, claude_root.join("alpha")).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows CI: skip symlink case (junctions need elevated rights).
+            let _ = fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let prev = std::env::current_dir().unwrap();
+        for key in EXTRA_PATH_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        std::env::set_current_dir(&tmp).unwrap();
+        let skills = discover_skills();
+        std::env::set_current_dir(prev).unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+
+        let alphas: Vec<_> = skills.iter().filter(|s| s.name == "alpha").collect();
+        assert_eq!(alphas.len(), 1, "symlink twin must load once");
+        assert!(
+            alphas[0].description.contains("from-opencode"),
+            "canonical body should load"
         );
     }
 

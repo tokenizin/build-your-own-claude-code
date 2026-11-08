@@ -169,8 +169,18 @@ def discover_skills() -> list[Skill]:
             print(f"  - {root}", file=sys.stderr)
 
     by_name: dict[str, Skill] = {}
+    seen_dirs: set[Path] = set()
     for root in roots:
         for skill in _load_skills_from_dir(root):
+            # Same directory via two roots (symlink) — not a conflict.
+            if skill.directory in seen_dirs:
+                if debug:
+                    print(
+                        f"skills: skipping symlink twin '{skill.name}' at {skill.directory}",
+                        file=sys.stderr,
+                    )
+                continue
+            seen_dirs.add(skill.directory)
             if skill.name in by_name:
                 existing = by_name[skill.name]
                 print(
