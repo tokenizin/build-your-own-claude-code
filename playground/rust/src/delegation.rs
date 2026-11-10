@@ -390,7 +390,16 @@ fn gemma_value(chars: &[char], at: &mut usize) -> Value {
                         *at += 1;
                         break;
                     }
-                    _ => items.push(gemma_value(chars, at)),
+                    _ => {
+                        let begin = *at;
+                        let item = gemma_value(chars, at);
+                        if *at == begin {
+                            // A stray `}` where an item should be: nothing was read, so step over it or the list never ends.
+                            *at += 1;
+                        } else {
+                            items.push(item);
+                        }
+                    }
                 }
             }
             Value::Array(items)
@@ -685,6 +694,10 @@ mod tests {
         let (_, calls) = extract_text_tool_calls(cut).expect("cut-off call");
         assert_eq!(serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap()["command"], "ls docs");
         assert!(extract_text_tool_calls("see <|tool_call> in the docs").is_none());
+
+        // A garbled list (a stray `}` where an item should be) still ends: the brace is stepped over.
+        let (_, calls) = extract_text_tool_calls("<|tool_call>call:TodoWrite{todos:[}<|\"|>a<|\"|>]}<tool_call|>").expect("garbled call");
+        assert_eq!(serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap(), json!({ "todos": ["a"] }));
     }
 
     #[test]
