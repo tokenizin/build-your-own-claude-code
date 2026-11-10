@@ -161,6 +161,35 @@ pub struct StreamAccumulator {
     reasoning: String,
     tool_calls: Vec<PartialToolCall>,
     pub done: bool,
+    /// Why the model stopped (`stop`, `tool_calls`, `length`), when the endpoint says.
+    finish_reason: Option<String>,
+    /// The thinking is going round in circles (see `is_runaway`): the caller stops reading.
+    pub runaway: bool,
+    /// How much thinking had arrived when it was last checked for a loop.
+    checked_at: usize,
+}
+
+/// `finish_reason` this agent gives a reply it cut off because the thinking was repeating itself.
+pub const RUNAWAY: &str = "runaway";
+
+/// How much thinking arrives between two loop checks.
+const RUNAWAY_CHECK_EVERY: usize = 1000;
+
+/// Thinking that goes round in circles: its last 240 characters already occur at least four times in its last 6000.
+/// A thinking model that degenerates repeats one short block (a list, a sentence) until the reply limit cuts it off,
+/// which costs a minute and yields no answer and no tool call; real reasoning does not repeat 240 characters verbatim
+/// four times in a row.
+pub fn is_runaway(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 2000 {
+        return false;
+    }
+    let tail: String = chars[chars.len() - 240..].iter().collect();
+    if tail.trim().is_empty() {
+        return false;
+    }
+    let window: String = chars[chars.len().saturating_sub(6000)..].iter().collect();
+    window.matches(tail.as_str()).count() >= 4
 }
 
 impl StreamAccumulator {
@@ -195,6 +224,14 @@ impl StreamAccumulator {
             if let Some(r) = delta[key].as_str() {
                 self.reasoning.push_str(r);
             }
+        }
+        if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+            self.finish_reason = Some(reason.to_string());
+        }
+        if self.reasoning.len() >= self.checked_at + RUNAWAY_CHECK_EVERY {
+            self.checked_at = self.reasoning.len();
+            // Only while nothing else has come: an answer or a tool call under way is not a loop.
+            self.runaway = self.content.trim().is_empty() && self.tool_calls.is_empty() && is_runaway(&self.reasoning);
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
             for (pos, call) in calls.iter().enumerate() {
@@ -254,6 +291,11 @@ impl StreamAccumulator {
         }
         if let Some(usage) = self.usage {
             message["usage"] = usage;
+        }
+        if self.runaway {
+            message["finish_reason"] = Value::String(RUNAWAY.into());
+        } else if let Some(reason) = self.finish_reason {
+            message["finish_reason"] = Value::String(reason);
         }
         message
     }
@@ -331,12 +373,17 @@ pub async fn stream_chat(
         got_data = true;
         for line in lines.push(&chunk) {
             handle(&line, &mut acc).map_err(StreamError::Mid)?;
-            if acc.done {
+            if acc.done || acc.runaway {
                 break;
             }
         }
         if acc.done {
             break;
+        }
+        if acc.runaway {
+            // Stop reading: dropping the response ends the request, so the model stops generating.
+            eprintln!("stream: the model's thinking is repeating itself; reply cut off");
+            return Ok(acc.into_message());
         }
     }
     if let Some(rest) = lines.finish() {
@@ -351,6 +398,41 @@ pub async fn stream_chat(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn thinking_that_repeats_itself_is_told_from_long_thinking() {
+        let block = "`ls docs/scrs`\n`ls docs/features`\n`ls docs/domains`\n`ls docs/architecture`\n`ls docs/product`\n`ls docs/core`\n`ls docs/setup`\n`ls docs/guides`\n";
+        let looping = format!("First I look at the dialog and what it lists.\n{}", block.repeat(40));
+        assert!(is_runaway(&looping));
+        let long: String = (0..400).map(|i| format!("Step {i}: check file number {i} and compare it with the one before.\n")).collect();
+        assert!(!is_runaway(&long), "long but not repeating");
+        assert!(!is_runaway(&block.repeat(3)), "too short to call");
+        assert!(!is_runaway(&" ".repeat(5000)), "blank padding is not thinking");
+    }
+
+    #[test]
+    fn a_stream_whose_thinking_loops_is_marked_and_the_finish_reason_is_kept() {
+        let mut acc = StreamAccumulator::default();
+        let line = serde_json::json!({ "choices": [{ "delta": { "reasoning": "`ls docs/scrs`\n`ls docs/features`\n`ls docs/domains`\n".repeat(8) } }] });
+        for _ in 0..12 {
+            acc.feed_line(&format!("data: {line}")).unwrap();
+        }
+        assert!(acc.runaway);
+        assert_eq!(acc.into_message()["finish_reason"], RUNAWAY);
+
+        let mut acc = StreamAccumulator::default();
+        acc.feed_line(r#"data: {"choices":[{"delta":{"reasoning":"thinking"}}]}"#).unwrap();
+        acc.feed_line(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#).unwrap();
+        assert_eq!(acc.into_message()["finish_reason"], "length");
+
+        // An answer under way is never cut off, whatever the thinking before it looked like.
+        let mut acc = StreamAccumulator::default();
+        acc.feed_line(r#"data: {"choices":[{"delta":{"content":"The answer"}}]}"#).unwrap();
+        for _ in 0..12 {
+            acc.feed_line(&format!("data: {line}")).unwrap();
+        }
+        assert!(!acc.runaway);
+    }
 
     #[test]
     fn final_chunk_usage_reaches_the_message() {

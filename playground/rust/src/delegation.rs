@@ -244,6 +244,9 @@ pub fn unknown_tool_message(name: &str, tools: Option<&Value>) -> String {
 ///
 /// Returns the text before the first call and the calls in OpenAI shape.
 pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
+    if text.contains(GEMMA_OPEN) {
+        return extract_gemma_tool_calls(text);
+    }
     let Some(first) = ["<tool_call>", "<function=", "<parameter="].iter().filter_map(|tag| text.find(tag)).min() else {
         return extract_fenced_task_calls(text);
     };
@@ -296,6 +299,121 @@ pub fn extract_text_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
         }
     }
     if calls.is_empty() { None } else { Some((before, calls)) }
+}
+
+const GEMMA_OPEN: &str = "<|tool_call>";
+const GEMMA_CLOSE: &str = "<tool_call|>";
+const GEMMA_QUOTE: &str = "<|\"|>";
+
+/// Gemma's own tool-call tokens, which reach the agent as text when the server does not turn them into a call (seen with
+/// `gemma4:26b` on Ollama, mid-run): `<|tool_call>call:NAME{key:<|"|>text<|"|>,n:5,list:[…]}<tool_call|>`. Keys are bare,
+/// strings sit between `<|"|>` marks. Whatever follows the last call (`<|tool_response>`…) is the model going on by
+/// itself and is dropped.
+fn extract_gemma_tool_calls(text: &str) -> Option<(String, Vec<Value>)> {
+    let first = text.find(GEMMA_OPEN)?;
+    let before = text[..first].trim_end().to_string();
+    let mut calls = Vec::new();
+    for chunk in text[first..].split(GEMMA_OPEN).skip(1) {
+        let body = chunk.split(GEMMA_CLOSE).next().unwrap_or("").trim();
+        let Some(body) = body.strip_prefix("call:") else { continue };
+        let brace = body.find('{').unwrap_or(body.len());
+        let name = body[..brace].trim();
+        if name.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = body[brace..].chars().collect();
+        let mut at = 0;
+        let args = if chars.is_empty() { json!({}) } else { gemma_value(&chars, &mut at) };
+        if args.is_object() {
+            calls.push(openai_call(name, args, calls.len()));
+        }
+    }
+    if calls.is_empty() { None } else { Some((before, calls)) }
+}
+
+/// One value of Gemma's argument notation, from `chars[*at..]`. Lenient: a value cut off by the reply limit ends where
+/// the text does.
+fn gemma_value(chars: &[char], at: &mut usize) -> Value {
+    let starts = |at: usize, pat: &str| pat.chars().enumerate().all(|(i, c)| chars.get(at + i) == Some(&c));
+    while chars.get(*at).is_some_and(|c| c.is_whitespace()) {
+        *at += 1;
+    }
+    if starts(*at, GEMMA_QUOTE) {
+        *at += GEMMA_QUOTE.chars().count();
+        let begin = *at;
+        while *at < chars.len() && !starts(*at, GEMMA_QUOTE) {
+            *at += 1;
+        }
+        let text: String = chars[begin..*at].iter().collect();
+        *at = (*at + GEMMA_QUOTE.chars().count()).min(chars.len());
+        return Value::String(text);
+    }
+    match chars.get(*at) {
+        Some('{') => {
+            *at += 1;
+            let mut map = serde_json::Map::new();
+            loop {
+                while chars.get(*at).is_some_and(|c| c.is_whitespace() || *c == ',') {
+                    *at += 1;
+                }
+                match chars.get(*at) {
+                    None => break,
+                    Some('}') => {
+                        *at += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                let begin = *at;
+                while chars.get(*at).is_some_and(|c| *c != ':') {
+                    *at += 1;
+                }
+                let key: String = chars[begin..*at].iter().collect::<String>().trim().trim_matches('"').to_string();
+                if *at >= chars.len() || key.is_empty() {
+                    break;
+                }
+                *at += 1;
+                map.insert(key, gemma_value(chars, at));
+            }
+            Value::Object(map)
+        }
+        Some('[') => {
+            *at += 1;
+            let mut items = Vec::new();
+            loop {
+                while chars.get(*at).is_some_and(|c| c.is_whitespace() || *c == ',') {
+                    *at += 1;
+                }
+                match chars.get(*at) {
+                    None => break,
+                    Some(']') => {
+                        *at += 1;
+                        break;
+                    }
+                    _ => items.push(gemma_value(chars, at)),
+                }
+            }
+            Value::Array(items)
+        }
+        Some('"') => {
+            *at += 1;
+            let begin = *at;
+            while chars.get(*at).is_some_and(|c| *c != '"') {
+                *at += 1;
+            }
+            let text: String = chars[begin..*at].iter().collect();
+            *at = (*at + 1).min(chars.len());
+            Value::String(text)
+        }
+        _ => {
+            let begin = *at;
+            while chars.get(*at).is_some_and(|c| !matches!(c, ',' | '}' | ']')) {
+                *at += 1;
+            }
+            let raw: String = chars[begin..*at].iter().collect::<String>().trim().to_string();
+            serde_json::from_str::<Value>(&raw).ok().filter(|v| !v.is_object() && !v.is_array()).unwrap_or(Value::String(raw))
+        }
+    }
 }
 
 /// Tools a model may write out as a fenced `{name, arguments}` block and still have them run: they only hand work on.
@@ -538,6 +656,35 @@ mod tests {
         let spec = task_tool_spec(&agents);
         assert_eq!(spec["function"]["name"], "Task");
         assert_eq!(spec["function"]["parameters"]["properties"]["subagent_type"]["enum"], json!(["business_analyst", "tech-lead"]));
+    }
+
+    #[test]
+    fn gemmas_own_tool_call_tokens_written_as_text_are_run() {
+        // As gemma4:26b sent it through Ollama, mid-run.
+        let seen = "Let's check `usePromptPicker.ts`.<|tool_call>call:Read{file_path:<|\"|>CodeNomad/packages/ui/src/components/prompt-input/usePromptPicker.ts<|\"|>}<tool_call|><|tool_response>";
+        let (before, calls) = extract_text_tool_calls(seen).expect("one call");
+        assert_eq!(before, "Let's check `usePromptPicker.ts`.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "Read");
+        let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({ "file_path": "CodeNomad/packages/ui/src/components/prompt-input/usePromptPicker.ts" }));
+
+        // Several calls, nested values, numbers and flags, text with commas and braces in it.
+        let two = "<|tool_call>call:Task{subagent_type:<|\"|>developer<|\"|>,description:<|\"|>find dialog<|\"|>,prompt:<|\"|>Look at {a, b}: then report.<|\"|>}<tool_call|>\
+<|tool_call>call:TodoWrite{todos:[{content:<|\"|>Search<|\"|>,status:<|\"|>pending<|\"|>,n:2,done:false}]}<tool_call|>";
+        let (before, calls) = extract_text_tool_calls(two).expect("two calls");
+        assert!(before.is_empty());
+        assert_eq!(calls.len(), 2);
+        let task: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(task["prompt"], "Look at {a, b}: then report.");
+        let todo: Value = serde_json::from_str(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(todo, json!({ "todos": [{ "content": "Search", "status": "pending", "n": 2, "done": false }] }));
+
+        // Cut off by the reply limit: what arrived is used. Tokens with no call in them are left alone.
+        let cut = "<|tool_call>call:Bash{command:<|\"|>ls docs";
+        let (_, calls) = extract_text_tool_calls(cut).expect("cut-off call");
+        assert_eq!(serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap()["command"], "ls docs");
+        assert!(extract_text_tool_calls("see <|tool_call> in the docs").is_none());
     }
 
     #[test]

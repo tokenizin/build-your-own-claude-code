@@ -577,15 +577,32 @@ async fn run_agent_loop(
     let tools = tool_specs(tool_mode, skills, depth, workflow.is_some(), &cfg.model);
 
     let step_cap = max_steps(workflow.is_some());
+    let effort = thinking_effort(env::var("NOMAD_THINKING").ok().as_deref());
+    // A stalled step (no answer, no tool call) is tried again, differently, a few times per run.
+    let mut stalls = 0u32;
+    let mut retry_after: Option<Stall> = None;
+    // Whether this run has handed work on, and whether it was already reminded to.
+    let mut handed_on = false;
+    let mut reminded = false;
     for _ in 0..step_cap {
+        let mut outgoing = inputs::merge_system_messages(messages);
+        let retrying = retry_after.take();
+        // For this request only: the nudge is not part of the conversation.
+        if retrying.is_some() {
+            add_user_note(&mut outgoing, STALL_NUDGE);
+        }
         let mut request = json!({
             "model": cfg.model,
             // One system message, first: strict chat templates reject any other layout.
-            "messages": inputs::merge_system_messages(messages),
+            "messages": outgoing,
             "max_tokens": cfg.max_tokens,
         });
         if let Some(tools) = &tools {
             request["tools"] = tools.clone();
+        }
+        // A step lost to thinking is tried again without it; otherwise the user's setting, if any.
+        if let Some(effort) = if retrying == Some(Stall::Thinking) { Some("none") } else { effort } {
+            request["reasoning_effort"] = json!(effort);
         }
 
         // stream-json top level: try SSE streaming first (deltas emitted live).
@@ -631,6 +648,9 @@ async fn run_agent_loop(
                 if response["usage"].is_object() {
                     message["usage"] = response["usage"].clone();
                 }
+                if let Some(reason) = response["choices"][0]["finish_reason"].as_str() {
+                    message["finish_reason"] = json!(reason);
+                }
                 message
             }
         };
@@ -641,6 +661,31 @@ async fn run_agent_loop(
             }
         }
         let message = &message;
+
+        // Nothing to go on with: the model thought until it was cut off, or sent an empty reply. The thinking is not an
+        // answer (showing it as one is how a run "ends" on a page of planning), so the step is tried again.
+        if let Some(stall) = stall_of(message) {
+            if stalls < stall_retries() {
+                stalls += 1;
+                eprintln!(
+                    "model: {} — trying the step again{} ({stalls}/{})",
+                    if stall == Stall::Thinking { "the reply ended while it was still thinking, with no answer and no tool call" } else { "empty reply" },
+                    if stall == Stall::Thinking { " with thinking off" } else { "" },
+                    stall_retries()
+                );
+                retry_after = Some(stall);
+                continue;
+            }
+            if stall == Stall::Thinking {
+                return Err(format!(
+                    "the model ({}) spent its whole reply thinking and gave no answer and no tool call, {} times in a row. \
+Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off or low).",
+                    cfg.model,
+                    stalls + 1
+                )
+                .into());
+            }
+        }
         let text = assistant_text(message);
 
         if let Some(top) = top {
@@ -690,12 +735,24 @@ async fn run_agent_loop(
                 eprintln!("model answered with no text and no tool call: {raw}");
                 return Err("assistant returned empty content".into());
             }
+            // An agent that can delegate and stops on "I will now delegate…" has started nothing: say so, once.
+            // (A workflow session has its own reminders, for its handover.)
+            if !reminded && !handed_on && workflow.is_none() && delegation_nudge_on() && can_hand_on(tools.as_ref()) && announces_unstarted_work(&text) {
+                reminded = true;
+                eprintln!("agent: the turn ended on a promise of work with no tool call — reminding it once");
+                if let Some(top) = top {
+                    top.emitter.delta("\n\n");
+                }
+                messages.push(json!({ "role": "user", "content": DELEGATION_NUDGE }));
+                continue;
+            }
             return Ok(text);
         }
 
         // Normalize every call first: models name tools OpenCode-style and send
         // arguments as a string or an object, under varying keys.
         let calls: Vec<PreparedCall> = tool_calls.iter().map(PreparedCall::from_value).collect();
+        handed_on |= calls.iter().any(|c| matches!(c.name.as_str(), "Task" | "nomadflow_run_workflow" | "nomadflow_prompt_workflow"));
         let mut outputs: Vec<Option<String>> = vec![None; calls.len()];
         let batchable = |c: &PreparedCall| c.name == "Task" && depth < delegation::MAX_TASK_DEPTH;
 
@@ -1830,6 +1887,103 @@ async fn handle_skill(
     Ok(body)
 }
 
+/// `NOMAD_THINKING` as the `reasoning_effort` every request carries: `off` / `none`, `low`, `medium`, `high`. Unset (or
+/// anything else): nothing is sent and the model thinks as it is set up to.
+fn thinking_effort(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("off" | "none" | "false" | "0") => Some("none"),
+        Some("low") => Some("low"),
+        Some("medium") => Some("medium"),
+        Some("high") => Some("high"),
+        _ => None,
+    }
+}
+
+/// Extra tries for a step that came back with no answer and no tool call (`NOMAD_STALL_RETRIES`, default 2; `0` = none).
+fn stall_retries() -> u32 {
+    env::var("NOMAD_STALL_RETRIES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2).min(5)
+}
+
+/// Why a step produced nothing to go on with: no answer text and no tool call.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stall {
+    /// The reply limit (or this agent, on a loop) cut the model off while it was still thinking.
+    Thinking,
+    /// The endpoint sent an empty reply.
+    Empty,
+}
+
+/// Whether `message` is a stalled step. A reply that ended by itself with only thinking is not one: some models put
+/// their answer there (`assistant_text`).
+fn stall_of(message: &Value) -> Option<Stall> {
+    let has_text = message["content"].as_str().is_some_and(|c| !c.trim().is_empty());
+    let has_calls = message["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
+    if has_text || has_calls {
+        return None;
+    }
+    let thought = ["reasoning", "reasoning_content"].iter().any(|k| message[*k].as_str().is_some_and(|r| !r.trim().is_empty()));
+    match message["finish_reason"].as_str() {
+        Some("length") | Some(stream::RUNAWAY) => Some(Stall::Thinking),
+        _ if !thought => Some(Stall::Empty),
+        _ => None,
+    }
+}
+
+/// Adds `note` as the user's last word: its own turn after an assistant or tool message, the end of the user's message
+/// when that is already last (strict chat templates refuse two user turns in a row).
+fn add_user_note(messages: &mut Vec<Value>, note: &str) {
+    match messages.last_mut().filter(|m| m["role"] == "user") {
+        Some(last) => match &mut last["content"] {
+            Value::String(text) => {
+                text.push_str("\n\n");
+                text.push_str(note);
+            }
+            Value::Array(parts) => parts.push(json!({ "type": "text", "text": note })),
+            other => *other = Value::String(note.to_string()),
+        },
+        None => messages.push(json!({ "role": "user", "content": note })),
+    }
+}
+
+/// Said to the model, for one request only, after a stalled step.
+const STALL_NUDGE: &str = "Your last reply was cut off before it contained an answer or a tool call. Do not plan any further. \
+Reply now with the next tool call, or with your answer if the work is done.";
+
+/// Said once to an agent that can delegate and ended its turn announcing work it did not start.
+const DELEGATION_NUDGE: &str = "You ended your turn by saying what you will do, but you made no tool call, so nothing has been started. \
+Do it now, in this reply: call Task to delegate (several Task calls in one reply run at the same time) or \
+nomadflow_run_workflow to start the workflow. If you are waiting for the user's decision instead, say exactly what you need \
+from them and stop.";
+
+/// Whether an answer ends on a promise of work ("I will now delegate…", "3. Initializing") rather than on a result or a
+/// question to the user. Deliberately narrow: a missed promise costs nothing new, a false alarm costs one extra step.
+fn announces_unstarted_work(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.ends_with('?') {
+        return false;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect::<String>().to_lowercase().replace('\u{2019}', "'");
+    const PROMISES: [&str; 18] = [
+        "i will now", "i'll now", "i will delegate", "i'll delegate", "i am delegating", "i'm delegating", "delegating to",
+        "i will task", "i will dispatch", "i will hand", "i will orchestrate", "i will start by", "i will begin", "i will proceed",
+        "i will initiate", "next, i will", "initializing", "prepare it for the",
+    ];
+    PROMISES.iter().any(|p| tail.contains(p))
+}
+
+/// `NOMAD_DELEGATION_NUDGE=off` switches the reminder off.
+fn delegation_nudge_on() -> bool {
+    !matches!(env::var("NOMAD_DELEGATION_NUDGE").ok().as_deref().map(str::trim), Some("off" | "0" | "false"))
+}
+
+/// Whether the tools offered to this run include one that hands work on.
+fn can_hand_on(tools: Option<&Value>) -> bool {
+    tools.and_then(|t| t.as_array()).is_some_and(|t| {
+        t.iter().any(|tool| matches!(tool["function"]["name"].as_str(), Some("Task" | "nomadflow_run_workflow")))
+    })
+}
+
 /// Extra tries for a step whose request the gateway in front of the model turned into a 502/503/504 (`LLM_GATEWAY_RETRIES`, default 2).
 fn gateway_retries() -> u32 {
     #[cfg(test)]
@@ -2693,8 +2847,10 @@ mod tests {
                     }
                     let req: Value = serde_json::from_slice(&buf[body_start..]).unwrap_or(json!({}));
                     let message = reply(&req);
+                    // A scripted reply may say how it ended (`finish_reason` on the message); `stop` otherwise.
+                    let finish = message["finish_reason"].as_str().unwrap_or("stop").to_string();
                     let body = json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
-                        "choices": [{ "index": 0, "message": message, "finish_reason": "stop" }] }).to_string();
+                        "choices": [{ "index": 0, "message": message, "finish_reason": finish }] }).to_string();
                     let out = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     let _ = sock.write_all(out.as_bytes()).await;
                     let _ = sock.shutdown().await;
@@ -2702,6 +2858,155 @@ mod tests {
             }
         });
         base
+    }
+
+    /// A reply the limit cut off while the model was still thinking: no answer, no tool call.
+    fn cut_off_thinking() -> Value {
+        json!({ "role": "assistant", "content": null, "reasoning": "First I list the docs.\n`ls docs/scrs`\n`ls docs/features`", "finish_reason": "length" })
+    }
+
+    async fn hardening_run(base: &str, skills: &[Skill]) -> (Result<String, String>, Vec<Value>) {
+        let cfg = LlmConfig { base_url: base.into(), fallback_base_url: base.into(), api_key: "k".into(), model: "thinker:26b".into(), max_tokens: 256 };
+        let client = make_client(base, "k");
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "improve the attachment dialog" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, skills, ToolMode::All, None, 0, None).await.map_err(|e| e.to_string());
+        (answer, messages)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_step_lost_to_thinking_is_tried_again_without_thinking_and_the_run_goes_on() {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let base = scripted_model(move |req| {
+            let mut seen = log.lock().unwrap();
+            seen.push(req.clone());
+            match seen.len() {
+                1 => cut_off_thinking(),
+                2 => call_message("r1", "Read", json!({ "file_path": "/etc/hostname" })),
+                _ => text_message("The dialog is directory-browser-dialog.tsx."),
+            }
+        }).await;
+        let (answer, messages) = hardening_run(&base, &[]).await;
+        assert_eq!(answer.as_deref(), Ok("The dialog is directory-browser-dialog.tsx."));
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].get("reasoning_effort").is_none(), "the model thinks as it is set up to until it stalls");
+        assert_eq!(seen[1]["reasoning_effort"], "none", "the retry is sent with thinking off");
+        assert_eq!(last_message(&seen[1])["content"], format!("improve the attachment dialog\n\n{STALL_NUDGE}").as_str(), "and is told to act");
+        assert!(seen[2].get("reasoning_effort").is_none(), "only the retry: the next step thinks again");
+        let said: Vec<String> = messages.iter().map(|m| m["content"].as_str().unwrap_or("").to_string()).collect();
+        assert!(said.iter().all(|t| t != STALL_NUDGE && !t.contains("ls docs")), "neither the nudge nor the thinking enters the conversation: {said:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_that_only_ever_thinks_ends_the_run_with_an_error_that_names_it() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let base = scripted_model(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            cut_off_thinking()
+        }).await;
+        let (answer, _) = hardening_run(&base, &[]).await;
+        let err = answer.unwrap_err();
+        assert!(err.contains("thinker:26b") && err.contains("spent its whole reply thinking") && err.contains("NOMAD_THINKING"), "{err}");
+        assert!(!err.contains("ls docs"), "the thinking is not passed off as the answer: {err}");
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "the step and two retries");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_reply_is_tried_again_and_thinking_that_ended_by_itself_is_still_an_answer() {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let base = scripted_model(move |req| {
+            let mut seen = log.lock().unwrap();
+            seen.push(req.clone());
+            if seen.len() == 1 { json!({ "role": "assistant", "content": "" }) } else { text_message("DONE") }
+        }).await;
+        let (answer, _) = hardening_run(&base, &[]).await;
+        assert_eq!(answer.as_deref(), Ok("DONE"));
+        assert!(seen.lock().unwrap()[1].get("reasoning_effort").is_none(), "nothing to switch off: it was not thinking");
+
+        // Some models put the answer in `reasoning` and stop by themselves: that is kept as it was.
+        let base = scripted_model(|_| json!({ "role": "assistant", "content": "", "reasoning": "working it out\n42" })).await;
+        let (answer, _) = hardening_run(&base, &[]).await;
+        assert_eq!(answer.as_deref(), Ok("42"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_manager_that_stops_on_a_promise_to_delegate_is_reminded_once_and_then_delegates() {
+        let nudges = Arc::new(AtomicUsize::new(0));
+        let count = nudges.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            let content = last["content"].as_str().unwrap_or("").to_string();
+            if system.contains("agent `developer`") {
+                return text_message("found it");
+            }
+            if content == DELEGATION_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+                return call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "find dialog", "prompt": "find the attachment dialog" }));
+            }
+            if last["role"] == "tool" { text_message("The developer found it. I will now review the result.") } else {
+                text_message("1. Task Classification\n2. Execution Strategy: I will delegate a task to a developer.\n3. Initializing")
+            }
+        }).await;
+        let skills = vec![skill("developer", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found it. I will now review the result."), "after delegating it is not reminded again");
+        assert_eq!(nudges.load(Ordering::SeqCst), 1);
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("found it"))), "the task really ran");
+
+        // A model that ignores the reminder is not asked twice, and an agent with nobody to delegate to is not asked at all.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let base = scripted_model(move |req| {
+            if last_message(req)["content"] == DELEGATION_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            text_message("I will now delegate this to the developer.")
+        }).await;
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("I will now delegate this to the developer."));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        // An agent with no tool that hands work on has nothing to be reminded of.
+        assert!(can_hand_on(Some(&json!([{ "function": { "name": "Read" } }, { "function": { "name": "Task" } }]))));
+        assert!(!can_hand_on(Some(&json!([{ "function": { "name": "Read" } }]))));
+        assert!(!can_hand_on(None));
+    }
+
+    #[test]
+    fn promises_of_work_are_told_from_results_and_questions() {
+        assert!(announces_unstarted_work("3. Initializing"));
+        assert!(announces_unstarted_work("I\u{2019}ll delegate the investigation to the developer."));
+        assert!(announces_unstarted_work("The task file is written. I will now move it to Active and prepare it for the Technical Architect to review."));
+        assert!(!announces_unstarted_work("The dialog is `directory-browser-dialog.tsx`; it sorts by name only."));
+        assert!(!announces_unstarted_work("I will delegate this to the developer. Shall I proceed?"), "it is waiting for the user");
+        assert!(!announces_unstarted_work(""));
+        let long = format!("I will now delegate.\n{}", "The result is in the table above. ".repeat(40));
+        assert!(!announces_unstarted_work(&long), "only how the answer ends counts");
+    }
+
+    #[test]
+    fn the_thinking_setting_and_what_counts_as_a_stall() {
+        assert_eq!(thinking_effort(None), None);
+        assert_eq!(thinking_effort(Some("off")), Some("none"));
+        assert_eq!(thinking_effort(Some(" Low ")), Some("low"));
+        assert_eq!(thinking_effort(Some("maximum")), None, "an unknown value sends nothing");
+        assert_eq!(stall_of(&cut_off_thinking()), Some(Stall::Thinking));
+        assert_eq!(stall_of(&json!({ "content": null, "reasoning": "round and round", "finish_reason": stream::RUNAWAY })), Some(Stall::Thinking));
+        assert_eq!(stall_of(&json!({ "content": "", "finish_reason": "stop" })), Some(Stall::Empty));
+        assert_eq!(stall_of(&json!({ "content": "", "reasoning": "42", "finish_reason": "stop" })), None);
+        assert_eq!(stall_of(&json!({ "content": "half an ans", "finish_reason": "length" })), None, "a cut-off answer is still text");
+        assert_eq!(stall_of(&call_message("c", "Read", json!({}))), None);
+
+        // The nudge is its own turn after a tool result, and the end of the user's message when that is last.
+        let mut after_tool = vec![json!({ "role": "tool", "content": "x" })];
+        add_user_note(&mut after_tool, "N");
+        assert_eq!(after_tool[1], json!({ "role": "user", "content": "N" }));
+        let mut after_user = vec![json!({ "role": "user", "content": [{ "type": "text", "text": "look" }] })];
+        add_user_note(&mut after_user, "N");
+        assert_eq!(after_user.len(), 1);
+        assert_eq!(after_user[0]["content"][1]["text"], "N");
     }
 
     fn call_message(id: &str, name: &str, args: Value) -> Value {
