@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.7-labs
-FROM gcc:15.2.0-trixie
+FROM gcc:16.2.0-trixie
 
 # Ensures the container is re-built if dependency files change
 ENV CODECRAFTERS_DEPENDENCY_FILE_PATHS="CMakeLists.txt,vcpkg.json,vcpkg-configuration.json"
 
 RUN apt-get update && \
-    apt-get install --no-install-recommends -y zip=3.* g++=4:* build-essential=12.* && \
+    apt-get install --no-install-recommends -y python3=3.* zip=3.* g++=4:* build-essential=12.* && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     wget --progress=dot:giga https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-Linux-x86_64.tar.gz && \

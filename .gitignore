@@ -25,3 +25,6 @@ playground/persistence/bun.lock
 .claude/skills/codenomad-architecture-guide
 .claude/skills/sidecar-management
 .claude/skills/set-agent-model
+
+# Python
+__pycache__/

@@ -104,6 +104,15 @@ extensions:
       [agent-skills]: https://agentskills.io/home
       [progressive-disclosure]: https://agentskills.io/specification#progressive-disclosure
 
+  - slug: "lsp"
+    name: "Language Server Protocol"
+    description_markdown: |-
+      In this challenge extension, you'll add support for [LSP][lsp] to your Claude Code implementation.
+
+      Along the way, you'll learn symbol navigation, document synchronization, and diagnostic feedback to repair changes across files.
+
+      [lsp]: https://microsoft.github.io/language-server-protocol/
+
 stages:
   - slug: "yy2"
     name: "Communicate with the LLM"
@@ -190,3 +199,39 @@ stages:
     primary_extension_slug: "skills"
     marketing_md: |-
       In this stage, you'll add support for skills that are handed to a subagent, which works through them and reports back a single answer.
+
+  # Extension: Language Server Protocol
+  - slug: "iy3"
+    name: "Add the LSP tool"
+    difficulty: easy
+    primary_extension_slug: "lsp"
+    marketing_md: |-
+      In this stage, you'll make the `LSP` tool available to the model.
+
+  - slug: "gz6"
+    name: "Find the implementation"
+    difficulty: medium
+    primary_extension_slug: "lsp"
+    marketing_md: |-
+      In this stage, you'll implement `goToDefinition`, which tells the model where a function is defined.
+
+  - slug: "rb6"
+    name: "Find the affected callers"
+    difficulty: easy
+    primary_extension_slug: "lsp"
+    marketing_md: |-
+      In this stage, you'll implement `findReferences` to find the callers affected by an API change.
+
+  - slug: "bn2"
+    name: "Keep the analysis current"
+    difficulty: medium
+    primary_extension_slug: "lsp"
+    marketing_md: |-
+      In this stage, you'll synchronize `Write` edits so definition and reference lookups use the updated code.
+
+  - slug: "ql9"
+    name: "Repair edits with diagnostics"
+    difficulty: medium
+    primary_extension_slug: "lsp"
+    marketing_md: |-
+      In this stage, you'll return language-server diagnostics to the model so it can repair an API migration.

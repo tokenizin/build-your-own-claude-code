@@ -1,0 +1,47 @@
+name: LSP helpers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  transport-and-clients:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6.1.0
+        with:
+          go-version: 1.25.5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install C and Java client dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libcurl4-openssl-dev libcjson-dev libjackson2-databind-java
+      - name: Install Rust client dependencies
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: Install Zig client dependencies
+        run: |
+          curl -fsSL https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+      - name: Build and check the supplied transport
+        working-directory: extension_helpers/lsp_transport
+        run: |
+          go build ./...
+          go vet ./...
+      - name: Exercise native clients
+        run: python3 extension_helpers/verify_clients.py
+      - name: Verify client error handling
+        run: python3 extension_helpers/verify_client_errors.py
