@@ -370,7 +370,8 @@ fn build_initial_run(prompt: &str, skills: &[Skill]) -> InitialRun {
         if invocations.len() == 1 && invocations[0].fork {
             let inv = &invocations[0];
             if let Some(skill) = skill_by_name(skills, &inv.skill_name) {
-                let messages = agents::build_fork_messages(skill, &inv.body);
+                // The top-level run: the user is on the other end, there is no parent agent.
+                let messages = agents::build_primary_messages(skill, &inv.body);
                 return InitialRun {
                     messages,
                     // Agents (pma, product_manager, …) delegate, so they need Skill + Task.
@@ -2302,6 +2303,16 @@ mod tests {
             policies: Vec::new(),
             model: None,
         }
+    }
+
+    #[test]
+    fn the_top_level_agent_is_started_as_primary_not_as_a_subagent() {
+        let skills = vec![skill("pma", true)];
+        let run = build_initial_run("/pma plan the work", &skills);
+        let system: String = run.messages.iter().filter(|m| m["role"] == "system").map(|m| m["content"].as_str().unwrap_or("").to_string()).collect();
+        assert!(!system.contains("parent agent"), "the manager would report to a parent that does not exist: {system}");
+        assert!(system.contains("talking directly to the user"), "{system}");
+        assert_eq!(run.agent.as_deref(), Some("pma"));
     }
 
     #[test]

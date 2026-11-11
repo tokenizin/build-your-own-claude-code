@@ -327,8 +327,19 @@ pub fn discover_agent_skills() -> Vec<Skill> {
     }
 }
 
-/// Build forked subagent messages: system(policies) + user(role body + args).
+/// Build forked subagent messages: system(policies) + user(role body + args). For an agent that has a parent: a delegated
+/// task, a workflow runner, a forked skill.
 pub fn build_fork_messages(skill: &Skill, body: &str) -> Vec<serde_json::Value> {
+    build_agent_messages(skill, body, false)
+}
+
+/// The same for the agent the user is talking to directly (the top-level run, `--agent product_manager`): it has no parent
+/// to report to, and told it did a model wrote a "final answer for the parent agent" instead of delegating.
+pub fn build_primary_messages(skill: &Skill, body: &str) -> Vec<serde_json::Value> {
+    build_agent_messages(skill, body, true)
+}
+
+fn build_agent_messages(skill: &Skill, body: &str, primary: bool) -> Vec<serde_json::Value> {
     use serde_json::json;
 
     let roots = collect_nomadworks_roots();
@@ -342,16 +353,25 @@ pub fn build_fork_messages(skill: &Skill, body: &str) -> Vec<serde_json::Value> 
         }));
     }
 
-    messages.push(json!({
-        "role": "system",
-        "content": format!(
+    let role = if primary {
+        format!(
+            "You are running as NomadWorks/OpenCode agent `{}` (Rust playground engine), talking directly to the user, \
+not to another agent. \
+Use Read/Write/Bash and NomadWorks tools when needed, and delegate to specialist subagents with the Task tool when your \
+instructions say to (several Task calls in one reply run at the same time). \
+When you are finished, answer the user.",
+            skill.name
+        )
+    } else {
+        format!(
             "You are running as NomadWorks/OpenCode agent `{}` in a forked subagent context \
 (Rust playground engine). You do not see the parent conversation. \
 Use Read/Write/Bash and NomadWorks tools when needed. \
 When finished, respond with a concise final answer for the parent agent.",
             skill.name
-        ),
-    }));
+        )
+    };
+    messages.push(json!({ "role": "system", "content": role }));
 
     messages.push(json!({
         "role": "user",
@@ -363,6 +383,31 @@ When finished, respond with a concise final answer for the parent agent.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn role_text(messages: &[serde_json::Value]) -> String {
+        messages.iter().filter(|m| m["role"] == "system").map(|m| m["content"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_agent_the_user_talks_to_is_not_told_it_has_a_parent() {
+        let skill = Skill {
+            name: "product_manager".into(),
+            description: String::new(),
+            body: "role body".into(),
+            directory: std::path::PathBuf::from("/tmp"),
+            context: Some("fork".into()),
+            policies: Vec::new(),
+            model: None,
+        };
+        let primary = role_text(&build_primary_messages(&skill, "do it"));
+        assert!(!primary.contains("parent agent") && !primary.contains("forked subagent"), "{primary}");
+        assert!(primary.contains("`product_manager`") && primary.contains("Task tool") && primary.contains("answer the user"), "{primary}");
+        // A delegated task, a runner and a forked skill do have a parent.
+        let forked = role_text(&build_fork_messages(&skill, "do it"));
+        assert!(forked.contains("parent agent") && forked.contains("forked subagent"), "{forked}");
+        // The role body is the user message in both.
+        assert_eq!(build_primary_messages(&skill, "do it").last().unwrap()["content"], "do it");
+    }
 
     #[test]
     fn policy_filename_maps_dots() {
