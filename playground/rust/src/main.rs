@@ -332,14 +332,15 @@ fn execute_bash(args: &Value) -> String {
 
 fn assistant_text(message: &Value) -> String {
     if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+        let visible = stream::visible_text(content);
+        if !visible.is_empty() {
+            return visible;
         }
     }
     // Some Ollama cloud / thinking models put the answer in `reasoning` with empty content.
     if let Some(reasoning) = message.get("reasoning").and_then(|v| v.as_str()) {
-        let last = reasoning
+        // Gemma's thinking ends on its channel token: that is not the last line of the answer.
+        let last = stream::visible_text(reasoning)
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -348,6 +349,12 @@ fn assistant_text(message: &Value) -> String {
             .trim_matches('`')
             .trim_matches('"')
             .to_string();
+        if !last.is_empty() {
+            return last;
+        }
+        // Nothing but the token after the thinking: the last line of the thinking itself.
+        let thought = stream::strip_channel_tokens(reasoning);
+        let last = thought.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or("").trim_matches('`').trim_matches('"').to_string();
         if !last.is_empty() {
             return last;
         }
@@ -693,14 +700,17 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // already out; emit the reasoning-fallback text only if no content streamed.
             let streamed_content = message["content"]
                 .as_str()
-                .is_some_and(|c| !c.trim().is_empty());
-            if !was_streamed || !streamed_content {
+                .is_some_and(|c| !stream::visible_text(c).is_empty());
+            // A step that made a call and wrote no text has nothing to say: the last line of its thinking is not narration.
+            let from_thinking_only = !streamed_content && message["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
+            if (!was_streamed || !streamed_content) && !from_thinking_only {
                 top.emitter.delta(&text);
             }
         }
         let mut assistant = json!({
             "role": "assistant",
-            "content": if text.is_empty() {
+            "content": if text.is_empty() || (message["tool_calls"].as_array().is_some_and(|c| !c.is_empty())
+                && !message["content"].as_str().is_some_and(|c| !stream::visible_text(c).is_empty())) {
                 message.get("content").cloned().unwrap_or(Value::Null)
             } else {
                 Value::String(text.clone())
@@ -1887,6 +1897,12 @@ async fn handle_skill(
     Ok(body)
 }
 
+/// The model a Workflow Runner runs on: its own agent file's model (remapped for the endpoint), else the endpoint's default.
+/// `run_delegated` picks it the same way (`skill.model`), so the label and the request cannot differ.
+fn workflow_runner_model(skills: &[Skill], cfg: &LlmConfig) -> String {
+    skill_by_name(skills, "workflow_runner").and_then(|s| s.model.clone()).unwrap_or_else(|| cfg.model.clone())
+}
+
 /// `NOMAD_THINKING` as the `reasoning_effort` every request carries: `off` / `none`, `low`, `medium`, `high`. Unset (or
 /// anything else): nothing is sent and the model thinks as it is set up to.
 fn thinking_effort(raw: Option<&str>) -> Option<&'static str> {
@@ -2112,10 +2128,13 @@ async fn main() -> std::process::ExitCode {
             stream: stream_enabled(),
             protocol2: protocol2_enabled(),
         });
+        // The model the runner really runs on (its own pin, as remapped for this endpoint), not the endpoint's default: the
+        // page labels the runner's replies with what these events say.
+        let runner_model = workflow_runner_model(&skills, &cfg);
         if stream_mode {
             emitter.emit(json!({
                 "type": "meta",
-                "model": cfg.model,
+                "model": runner_model,
                 "agent": "workflow_runner",
                 "baseUrl": active_base,
                 "protocol": if protocol2_enabled() { 2 } else { 1 },
@@ -2124,7 +2143,7 @@ async fn main() -> std::process::ExitCode {
         return match run_workflow_session(&client, &cfg, &skills, top.as_ref(), &args.prompt.clone().unwrap_or_default()).await {
             Ok(answer) => {
                 if stream_mode {
-                    emitter.emit(json!({ "type": "final", "text": answer, "model": cfg.model }));
+                    emitter.emit(json!({ "type": "final", "text": answer, "model": runner_model }));
                 } else {
                     println!("{answer}");
                 }
@@ -2972,6 +2991,53 @@ mod tests {
         assert!(can_hand_on(Some(&json!([{ "function": { "name": "Read" } }, { "function": { "name": "Task" } }]))));
         assert!(!can_hand_on(Some(&json!([{ "function": { "name": "Read" } }]))));
         assert!(!can_hand_on(None));
+    }
+
+    #[test]
+    fn a_workflow_runner_is_announced_with_the_model_it_runs_on() {
+        let cfg = LlmConfig { base_url: "http://x/v1".into(), fallback_base_url: "http://x/v1".into(), api_key: "k".into(), model: "endpoint-default".into(), max_tokens: 256 };
+        let mut runner = skill("workflow_runner", true);
+        runner.model = Some("qwen2.5:14b".into());
+        assert_eq!(workflow_runner_model(&[runner], &cfg), "qwen2.5:14b", "its own (remapped) model, not the endpoint's default");
+        assert_eq!(workflow_runner_model(&[skill("workflow_runner", true)], &cfg), "endpoint-default", "no pin: the default");
+        assert_eq!(workflow_runner_model(&[], &cfg), "endpoint-default");
+    }
+
+    /// A Gemma step as the endpoint sent it: no answer text, a call, and thinking that ends on the channel token.
+    fn gemma_step_with_a_call() -> Value {
+        json!({ "role": "assistant", "content": null,
+            "reasoning": "Okay, let's check `api-types.ts`.\n\n<channel|>",
+            "tool_calls": [{ "id": "r1", "type": "function", "function": { "name": "Read", "arguments": json!({ "file_path": "/etc/hostname" }).to_string() } }] })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_thinking_of_a_step_that_made_a_call_is_not_shown_as_its_text_and_the_token_never_is() {
+        let steps = Arc::new(AtomicUsize::new(0));
+        let count = steps.clone();
+        let base = scripted_model(move |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 { gemma_step_with_a_call() } else { text_message("The dialog is directory-browser-dialog.tsx.") }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "gemma4:26b".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.clone(), stream: false, protocol2: false };
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "find the dialog" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, Some(&top), 0, None).await.map_err(|e| e.to_string());
+        assert_eq!(answer.as_deref(), Ok("The dialog is directory-browser-dialog.tsx."));
+        let shown: Vec<String> = sink.lock().unwrap().iter().filter(|e| e["type"] == "delta").map(|e| e["text"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(shown, vec!["The dialog is directory-browser-dialog.tsx.".to_string()], "only the answer is shown: {shown:?}");
+        let said: Vec<String> = messages.iter().map(|m| m["content"].as_str().unwrap_or("").to_string()).collect();
+        assert!(said.iter().all(|t| !t.contains("channel") && !t.contains("api-types")), "neither the token nor the thinking enters the conversation: {said:?}");
+    }
+
+    #[test]
+    fn a_reply_that_is_only_thinking_ending_on_the_token_is_still_read_as_its_last_line() {
+        // Without a call, thinking that ends by itself is the answer some models give (kept as it was), minus the token.
+        assert_eq!(assistant_text(&json!({ "content": "", "reasoning": "working it out\n42\n<channel|>" })), "42");
+        assert_eq!(assistant_text(&json!({ "content": "", "reasoning": "<|channel>thought\nthe result is 7<channel|>" })), "the result is 7");
+        assert_eq!(assistant_text(&json!({ "content": "A <channel|>B" })), "B");
+        assert_eq!(assistant_text(&json!({ "content": "plain" })), "plain");
+        assert_eq!(assistant_text(&json!({ "content": null })), "");
     }
 
     #[test]

@@ -169,6 +169,43 @@ pub struct StreamAccumulator {
     checked_at: usize,
 }
 
+/// Gemma's channel tokens: `<|channel>thought` opens its thinking and `<channel|>` closes it. Ollama normally turns them into the
+/// `reasoning` field, but they also arrive as text, alone or around the thinking.
+const CHANNEL_OPEN: &str = "<|channel>";
+const CHANNEL_CLOSE: &str = "<channel|>";
+
+/// `text` without the channel tokens (and without the `thought` label that follows an opening one). The thinking between them stays.
+pub fn strip_channel_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(CHANNEL_OPEN) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + CHANNEL_OPEN.len()..];
+        rest = after.strip_prefix("thought").unwrap_or(after);
+    }
+    out.push_str(rest);
+    out.replace(CHANNEL_CLOSE, "")
+}
+
+/// What a reader should see of `text`: what follows the last closing channel token (what comes before it is Gemma's thinking, whose
+/// opening token was lost), and nothing of a thinking block that was opened and never closed. Trimmed.
+pub fn visible_text(text: &str) -> String {
+    let after_close = match text.rfind(CHANNEL_CLOSE) {
+        Some(at) => &text[at + CHANNEL_CLOSE.len()..],
+        None => text,
+    };
+    let visible = match after_close.find(CHANNEL_OPEN) {
+        Some(at) => &after_close[..at],
+        None => after_close,
+    };
+    strip_channel_tokens(visible).trim().to_string()
+}
+
+/// A piece of streamed answer text as it is shown: a channel token arrives as one piece of text and is never shown.
+pub fn shown_delta(text: String) -> String {
+    if text.contains(CHANNEL_OPEN) || text.contains(CHANNEL_CLOSE) { strip_channel_tokens(&text) } else { text }
+}
+
 /// `finish_reason` this agent gives a reply it cut off because the thinking was repeating itself.
 pub const RUNAWAY: &str = "runaway";
 
@@ -358,7 +395,7 @@ pub async fn stream_chat(
     let mut got_data = false;
     let handle = |line: &str, acc: &mut StreamAccumulator| -> Result<(), String> {
         if let SseEvent::Delta(text) = acc.feed_line(line)? {
-            emitter.delta(&text);
+            emitter.delta(&shown_delta(text));
         }
         Ok(())
     };
@@ -398,6 +435,68 @@ pub async fn stream_chat(
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn gemmas_channel_tokens_are_never_the_answer() {
+        // As seen: the thinking ended on the token, and the token became its own reply.
+        let thinking = "Okay, let's check `api-types.ts`.\n\n<channel|>";
+        assert_eq!(visible_text(thinking), "", "what comes before the closing token is thinking");
+        assert_eq!(strip_channel_tokens(thinking).trim(), "Okay, let's check `api-types.ts`.");
+        assert_eq!(visible_text("<|channel>thought\nplanning<channel|>Here is the answer."), "Here is the answer.");
+        assert_eq!(visible_text("The answer is 42.<|channel>thought\nunfinished"), "The answer is 42.");
+        assert_eq!(visible_text("Plain text, no tokens."), "Plain text, no tokens.");
+        assert_eq!(strip_channel_tokens("a<|channel>thoughtb<channel|>c"), "abc");
+        assert_eq!(visible_text("<channel|>"), "");
+        // Streamed pieces: the token is dropped, other text passes untouched (spaces and line breaks included).
+        assert_eq!(shown_delta("<channel|>".into()), "");
+        assert_eq!(shown_delta("<|channel>thought".into()), "");
+        assert_eq!(shown_delta(" and then\n".into()), " and then\n");
+    }
+
+    /// Serves `body` once as a server-sent-event stream and returns the base URL.
+    async fn sse_once(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 65536];
+            let mut got = Vec::new();
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 { break; }
+                got.extend_from_slice(&buf[..n]);
+            }
+            // The request body follows the headers: read it so the client is not cut off mid-send.
+            let head = String::from_utf8_lossy(&got).to_lowercase();
+            let want: usize = head.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+            let start = got.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(got.len());
+            while got.len() < start + want {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 { break; }
+                got.extend_from_slice(&buf[..n]);
+            }
+            let out = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = sock.write_all(out.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_channel_token_in_a_streamed_answer_is_never_shown() {
+        let base = sse_once(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"The answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<channel|>\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" is 42.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )).await;
+        let (emitter, sink) = Emitter::capturing();
+        let message = stream_chat(&base, "k", &serde_json::json!({ "model": "gemma4:26b", "messages": [] }), &emitter).await.ok().expect("a streamed message");
+        let shown: String = sink.lock().unwrap().iter().filter(|e| e["type"] == "delta").map(|e| e["text"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(shown, "The answer is 42.", "what the page is sent");
+        assert_eq!(visible_text(message["content"].as_str().unwrap_or("")), "is 42.", "after the token is what a reader of the saved message sees");
+    }
 
     #[test]
     fn thinking_that_repeats_itself_is_told_from_long_thinking() {
