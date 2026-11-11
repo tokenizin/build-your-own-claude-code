@@ -584,7 +584,7 @@ async fn run_agent_loop(
     let tools = tool_specs(tool_mode, skills, depth, workflow.is_some(), &cfg.model);
 
     let step_cap = max_steps(workflow.is_some());
-    let effort = thinking_effort(env::var("NOMAD_THINKING").ok().as_deref());
+    let effort = thinking_effort(thinking_setting().as_deref());
     // A stalled step (no answer, no tool call) is tried again, differently, a few times per run.
     let mut stalls = 0u32;
     let mut retry_after: Option<Stall> = None;
@@ -608,7 +608,8 @@ async fn run_agent_loop(
             request["tools"] = tools.clone();
         }
         // A step lost to thinking is tried again without it; otherwise the user's setting, if any.
-        if let Some(effort) = if retrying == Some(Stall::Thinking) { Some("none") } else { effort } {
+        // A thinking level a model has already refused ("does not support thinking") is not sent to it again.
+        if let Some(effort) = if retrying == Some(Stall::Thinking) { Some("none") } else { effort.filter(|_| !knows_no_thinking(&cfg.model)) } {
             request["reasoning_effort"] = json!(effort);
         }
 
@@ -643,6 +644,15 @@ async fn run_agent_loop(
                             attempt += 1;
                             eprintln!("model endpoint: {err} — trying again ({attempt}/{})", gateway_retries());
                             tokio::time::sleep(gateway_backoff(attempt)).await;
+                        }
+                        // A model with no thinking mode refuses `reasoning_effort` (NOMAD_THINKING): ask again without it, and do not
+                        // send it to that model again. Other models keep their setting.
+                        Err(err) if request.get("reasoning_effort").is_some() && rejects_thinking(&err.to_string()) => {
+                            eprintln!("model: {} does not support thinking — asking again without NOMAD_THINKING for it", cfg.model);
+                            remember_no_thinking(&cfg.model);
+                            if let Some(object) = request.as_object_mut() {
+                                object.remove("reasoning_effort");
+                            }
                         }
                         Err(err) => return Err(format_api_error(err)),
                     }
@@ -1903,6 +1913,42 @@ fn workflow_runner_model(skills: &[Skill], cfg: &LlmConfig) -> String {
     skill_by_name(skills, "workflow_runner").and_then(|s| s.model.clone()).unwrap_or_else(|| cfg.model.clone())
 }
 
+/// Models that answered a request carrying `reasoning_effort` with "does not support thinking" (Ollama does that for a model
+/// with no thinking mode, e.g. `qwen2.5:14b`): `NOMAD_THINKING` is not sent to them again for the rest of the run.
+static NO_THINKING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether an endpoint's error says the model has no thinking mode.
+fn rejects_thinking(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("support") && (lower.contains("thinking") || lower.contains("reasoning"))
+}
+
+fn knows_no_thinking(model: &str) -> bool {
+    NO_THINKING.lock().map(|m| m.iter().any(|x| x == model)).unwrap_or(false)
+}
+
+fn remember_no_thinking(model: &str) {
+    if let Ok(mut m) = NO_THINKING.lock() {
+        if !m.iter().any(|x| x == model) {
+            m.push(model.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_THINKING: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// `NOMAD_THINKING`, as set (a test can override it for its own thread).
+fn thinking_setting() -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = TEST_THINKING.with(|t| t.get()) {
+        return Some(v.to_string());
+    }
+    env::var("NOMAD_THINKING").ok()
+}
+
 /// `NOMAD_THINKING` as the `reasoning_effort` every request carries: `off` / `none`, `low`, `medium`, `high`. Unset (or
 /// anything else): nothing is sent and the model thinks as it is set up to.
 fn thinking_effort(raw: Option<&str>) -> Option<&'static str> {
@@ -2868,9 +2914,13 @@ mod tests {
                     let message = reply(&req);
                     // A scripted reply may say how it ended (`finish_reason` on the message); `stop` otherwise.
                     let finish = message["finish_reason"].as_str().unwrap_or("stop").to_string();
-                    let body = json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
-                        "choices": [{ "index": 0, "message": message, "finish_reason": finish }] }).to_string();
-                    let out = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    // `{ "__status": 400, "__body": {…} }` is answered as that error instead of a completion.
+                    let (status, body) = match message["__status"].as_u64() {
+                        Some(code) => (format!("{code} Bad Request"), message["__body"].to_string()),
+                        None => ("200 OK".to_string(), json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                            "choices": [{ "index": 0, "message": message, "finish_reason": finish }] }).to_string()),
+                    };
+                    let out = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     let _ = sock.write_all(out.as_bytes()).await;
                     let _ = sock.shutdown().await;
                 });
@@ -3038,6 +3088,43 @@ mod tests {
         assert_eq!(assistant_text(&json!({ "content": "A <channel|>B" })), "B");
         assert_eq!(assistant_text(&json!({ "content": "plain" })), "plain");
         assert_eq!(assistant_text(&json!({ "content": null })), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_with_no_thinking_mode_is_asked_again_without_it_and_not_asked_again() {
+        TEST_THINKING.with(|t| t.set(Some("low")));
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        // Ollama's answer for a model with no thinking mode (qwen2.5:14b) when a request carries `reasoning_effort`.
+        let base = scripted_model(move |req| {
+            let mut seen = log.lock().unwrap();
+            seen.push(req.clone());
+            if req.get("reasoning_effort").is_some() {
+                return json!({ "__status": 400, "__body": { "error": { "message": "\"nothink-model\" does not support thinking", "type": "invalid_request_error" } } });
+            }
+            if seen.len() == 2 { call_message("r1", "Read", json!({ "file_path": "/etc/hostname" })) } else { text_message("DONE") }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "nothink-model".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, None, 0, None).await.map_err(|e| e.to_string());
+        TEST_THINKING.with(|t| t.set(None));
+        assert_eq!(answer.as_deref(), Ok("DONE"), "the run goes on: the model is not failed for a setting it cannot use");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "the refused request, the same step again, the next step");
+        assert_eq!(seen[0]["reasoning_effort"], "low", "the first request carries the setting");
+        assert!(seen[1].get("reasoning_effort").is_none(), "asked again without it");
+        assert!(seen[2].get("reasoning_effort").is_none(), "and not sent to that model again");
+        assert!(knows_no_thinking("nothink-model") && !knows_no_thinking("some-other-model"));
+    }
+
+    #[test]
+    fn an_error_that_says_the_model_has_no_thinking_mode_is_told_from_other_errors() {
+        assert!(rejects_thinking("invalid_request_error: \"qwen2.5:14b\" does not support thinking"));
+        assert!(rejects_thinking("400 Bad Request: this model does not support reasoning_effort"));
+        assert!(!rejects_thinking("upstream request failed"));
+        assert!(!rejects_thinking("context length exceeded"));
+        assert!(!rejects_thinking("\"qwen3:8b\" not found, try pulling it first"));
     }
 
     #[test]
