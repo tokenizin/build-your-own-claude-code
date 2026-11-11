@@ -592,6 +592,9 @@ async fn run_agent_loop(
     // Whether this run has handed work on, and whether it was already reminded to.
     let mut handed_on = false;
     let mut reminded = false;
+    // What this run's last `TodoWrite` left unfinished, and whether the agent was already told about it.
+    let mut open_todos: Vec<String> = Vec::new();
+    let mut todo_reminded = false;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
         let retrying = retry_after.take();
@@ -767,6 +770,16 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                 messages.push(json!({ "role": "user", "content": DELEGATION_NUDGE }));
                 continue;
             }
+            // A turn that ends with the agent's own todo list unfinished has not ended: say so once.
+            if !todo_reminded && !open_todos.is_empty() && workflow.is_none() && delegation_nudge_on() {
+                todo_reminded = true;
+                eprintln!("agent: the turn ended with {} unfinished todo item(s) and no tool call — reminding it once", open_todos.len());
+                if let Some(top) = top {
+                    top.emitter.delta("\n\n");
+                }
+                messages.push(json!({ "role": "user", "content": todo_nudge(&open_todos) }));
+                continue;
+            }
             return Ok(text);
         }
 
@@ -804,6 +817,9 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                 Box::pin(execute_call(client, cfg, skills, tools.as_ref(), call, depth, scope)).await?
             };
             emit_tool_result(top, call, &result);
+            if call.name == "TodoWrite" && !result.starts_with("Error") {
+                open_todos = tools::unfinished_todos(&call.args);
+            }
             outputs[idx] = Some(result);
             idx += 1;
         }
@@ -2027,15 +2043,27 @@ fn announces_unstarted_work(text: &str) -> bool {
     }
     let chars: Vec<char> = trimmed.chars().collect();
     let tail: String = chars[chars.len().saturating_sub(700)..].iter().collect::<String>().to_lowercase().replace('\u{2019}', "'");
-    const PROMISES: [&str; 18] = [
+    const PROMISES: &[&str] = &[
         "i will now", "i'll now", "i will delegate", "i'll delegate", "i am delegating", "i'm delegating", "delegating to",
         "i will task", "i will dispatch", "i will hand", "i will orchestrate", "i will start by", "i will begin", "i will proceed",
         "i will initiate", "next, i will", "initializing", "prepare it for the",
+        // A plan left open: "I will update the todo list as I progress", an unchecked or in-progress box.
+        "i will update", "i will continue", "as i progress", "- [ ]", "- [/]",
     ];
     PROMISES.iter().any(|p| tail.contains(p))
 }
 
-/// `NOMAD_DELEGATION_NUDGE=off` switches the reminder off.
+/// Said once to an agent that ended its turn while its own todo list (its last `TodoWrite`) still had unfinished items.
+fn todo_nudge(open: &[String]) -> String {
+    format!(
+        "You ended your turn, but your todo list still has unfinished items:\n{}\n\nContinue with them now: call the tools they need \
+(delegate to specialists with Task; several Task calls in one reply run at the same time) and update the list with TodoWrite as you go. \
+If an item is no longer needed, mark it completed or cancelled with TodoWrite and say why.",
+        open.iter().map(|i| format!("- {i}")).collect::<Vec<_>>().join("\n")
+    )
+}
+
+/// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
 fn delegation_nudge_on() -> bool {
     !matches!(env::var("NOMAD_DELEGATION_NUDGE").ok().as_deref().map(str::trim), Some("off" | "0" | "false"))
 }
@@ -3138,9 +3166,66 @@ mod tests {
         assert!(!rejects_thinking("\"qwen3:8b\" not found, try pulling it first"));
     }
 
+    /// A model that plans with TodoWrite, ends its turn with items open, and then follows (or ignores) the reminder.
+    async fn plan_then_stop(comply: bool) -> (Result<String, String>, Vec<Value>) {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let plan = json!({ "todos": [{ "content": "Investigate the dialog", "status": "in_progress" }, { "content": "Draft the SCR", "status": "pending" }] });
+        let done = json!({ "todos": [{ "content": "Investigate the dialog", "status": "completed" }, { "content": "Draft the SCR", "status": "completed" }] });
+        let base = scripted_model(move |req| {
+            let mut seen = log.lock().unwrap();
+            seen.push(req.clone());
+            match seen.len() {
+                1 => call_message("w1", "TodoWrite", plan.clone()),
+                2 => text_message("Here is the plan."),
+                3 if comply => call_message("w2", "TodoWrite", done.clone()),
+                3 => text_message("Still just the plan."),
+                _ => text_message("All done."),
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "plan and do it" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, None, 0, None).await.map_err(|e| e.to_string());
+        let requests = seen.lock().unwrap().clone();
+        (answer, requests)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_ends_with_the_agents_own_todo_list_unfinished_is_not_over() {
+        let (answer, seen) = plan_then_stop(true).await;
+        assert_eq!(answer.as_deref(), Ok("All done."), "after the reminder it carried on and finished");
+        assert_eq!(seen.len(), 4);
+        let reminder = last_message(&seen[2])["content"].as_str().unwrap_or("").to_string();
+        assert!(reminder.contains("still has unfinished items") && reminder.contains("[in_progress] Investigate the dialog") && reminder.contains("[pending] Draft the SCR"), "{reminder}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unfinished_todo_reminder_is_said_once_and_a_finished_list_is_left_alone() {
+        // Ignored: the run ends with what the model said, and it was told only once.
+        let (answer, seen) = plan_then_stop(false).await;
+        assert_eq!(answer.as_deref(), Ok("Still just the plan."));
+        assert_eq!(seen.len(), 3);
+
+        // Nothing unfinished: no reminder at all.
+        let base = scripted_model(|req| {
+            if last_message(req)["role"] == "tool" { text_message("ANSWER") } else {
+                call_message("w1", "TodoWrite", json!({ "todos": [{ "content": "Only item", "status": "completed" }] }))
+            }
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base.clone(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(&base, "k");
+        let mut messages = vec![json!({ "role": "user", "content": "go" })];
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::All, None, 0, None).await.map_err(|e| e.to_string());
+        assert_eq!(answer.as_deref(), Ok("ANSWER"));
+        assert!(messages.iter().all(|m| !m["content"].as_str().unwrap_or("").contains("unfinished items")));
+    }
+
     #[test]
     fn promises_of_work_are_told_from_results_and_questions() {
         assert!(announces_unstarted_work("3. Initializing"));
+        // The reply B's manager ended on in the Mac browser run: a plan left open.
+        assert!(announces_unstarted_work("- [/] Investigating component structure\n- [ ] Draft the SCR\n\nI will update the todo list as I progress."));
         assert!(announces_unstarted_work("I\u{2019}ll delegate the investigation to the developer."));
         assert!(announces_unstarted_work("The task file is written. I will now move it to Active and prepare it for the Technical Architect to review."));
         assert!(!announces_unstarted_work("The dialog is `directory-browser-dialog.tsx`; it sorts by name only."));

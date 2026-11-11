@@ -903,6 +903,19 @@ pub fn parse_todos(args: &Value) -> Result<Vec<Value>, Vec<String>> {
     if errors.is_empty() { Ok(todos) } else { Err(errors) }
 }
 
+/// The items of a `TodoWrite` call's list that are not finished (`pending`, `in_progress`), as `[status] content`.
+pub fn unfinished_todos(args: &Value) -> Vec<String> {
+    parse_todos(args)
+        .map(|todos| {
+            todos
+                .iter()
+                .filter(|t| matches!(t["status"].as_str(), Some("pending" | "in_progress")))
+                .map(|t| format!("[{}] {}", t["status"].as_str().unwrap_or(""), t["content"].as_str().unwrap_or("")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The call's arguments with the todo list in canonical form (what the model is told and what the UI shows).
 pub fn normalize_todo_args(args: Value) -> Value {
     match parse_todos(&args) {
@@ -1260,6 +1273,19 @@ pub(crate) mod tests {
     }
 
     // ------------------------------------------------------------ Todos
+
+    #[test]
+    fn the_unfinished_items_of_a_todo_list_are_found_in_any_dialect() {
+        let args = json!({ "todos": [
+            { "content": "Investigate", "status": "doing" },
+            { "content": "Draft the SCR", "status": "todo" },
+            { "content": "Read the dialog", "status": "done" },
+            { "content": "Old idea", "status": "cancelled" },
+        ] });
+        assert_eq!(unfinished_todos(&args), vec!["[in_progress] Investigate".to_string(), "[pending] Draft the SCR".to_string()]);
+        assert!(unfinished_todos(&json!({ "todos": [{ "content": "x", "status": "completed" }] })).is_empty());
+        assert!(unfinished_todos(&json!({ "nothing": 1 })).is_empty(), "a rejected list says nothing is open");
+    }
 
     #[test]
     fn todos_are_normalized_and_bad_lists_are_rejected_whole() {
