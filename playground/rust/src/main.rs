@@ -496,9 +496,9 @@ async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Stri
     catalog::parse_model_list(&body).map_err(|e| format!("GET {url}: {e}"))
 }
 
-/// Context window of each model, from Ollama's `/api/show` next to the `/v1` base. Models that do not answer
-/// within a few seconds (a cloud model, another kind of endpoint) are left out.
-async fn fetch_contexts(base_url: &str, api_key: &str, models: &[String]) -> std::collections::HashMap<String, u64> {
+/// Ollama's `/api/show` answer for each model, next to the `/v1` base. Models that do not answer within a few seconds (a cloud model, another
+/// kind of endpoint) are left out. The context window and the thinking options of a model come from it.
+async fn fetch_shows(base_url: &str, api_key: &str, models: &[String]) -> std::collections::HashMap<String, Value> {
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
     let url = format!("{root}/api/show");
     let client = reqwest::Client::new();
@@ -514,14 +514,26 @@ async fn fetch_contexts(base_url: &str, api_key: &str, models: &[String]) -> std
                     .send()
                     .await
                     .ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
                 let body: Value = response.json().await.ok()?;
-                catalog::context_from_show(&body).map(|context| (id, context))
+                Some((id, body))
             }
         })
         .buffer_unordered(8)
         .filter_map(|found| async move { found })
         .collect()
         .await
+}
+
+/// Context window of each model (from `fetch_shows`).
+async fn fetch_contexts(base_url: &str, api_key: &str, models: &[String]) -> std::collections::HashMap<String, u64> {
+    fetch_shows(base_url, api_key, models)
+        .await
+        .into_iter()
+        .filter_map(|(id, body)| catalog::context_from_show(&body).map(|context| (id, context)))
+        .collect()
 }
 
 /// List models from the primary base, then the fallback. Returns (base used, result).
@@ -2045,11 +2057,13 @@ fn thinking_setting() -> Option<String> {
     env::var("NOMAD_THINKING").ok()
 }
 
-/// `NOMAD_THINKING` as the `reasoning_effort` every request carries: `off` / `none`, `low`, `medium`, `high`. Unset (or
+/// `NOMAD_THINKING` as the `reasoning_effort` every request carries: `off` / `none`, `on`, `low`, `medium`, `high`. Unset (or
 /// anything else): nothing is sent and the model thinks as it is set up to.
 fn thinking_effort(raw: Option<&str>) -> Option<&'static str> {
     match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("off" | "none" | "false" | "0") => Some("none"),
+        // "on": think, at the model's usual depth (Ollama treats low, medium and high alike for all but gpt-oss).
+        Some("on" | "true" | "1" | "yes") => Some("medium"),
         Some("low") => Some("low"),
         Some("medium") => Some("medium"),
         Some("high") => Some("high"),
@@ -2390,10 +2404,14 @@ async fn main() -> std::process::ExitCode {
         }
         // Context sizes, best effort: an endpoint that is not Ollama simply has none to give.
         let wanted = catalog::merge_models(&cfg.model, listed.as_deref().unwrap_or_default(), &skills);
-        let contexts = fetch_contexts(&base, &cfg.api_key, &wanted).await;
+        let shows = fetch_shows(&base, &cfg.api_key, &wanted).await;
+        let contexts: std::collections::HashMap<String, u64> =
+            shows.iter().filter_map(|(id, body)| catalog::context_from_show(body).map(|context| (id.clone(), context))).collect();
         let mut catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed, &contexts);
         let missing = context::missing_among(&LlmConfig { base_url: base.clone(), ..cfg.clone() }, &wanted).await;
         catalog::drop_missing(&mut catalog, &missing, &opencode_config::load_adapter().default_fork_model);
+        catalog::drop_unsupported(&mut catalog, &shows, &opencode_config::load_adapter().default_fork_model);
+        catalog::add_thinking(&mut catalog, &shows);
         catalog::drop_small_contexts(&mut catalog, context::min_context(), &opencode_config::load_adapter().default_fork_model);
         println!("{catalog}");
         return ExitCode::SUCCESS;
@@ -3891,6 +3909,8 @@ mod tests {
     fn the_thinking_setting_and_what_counts_as_a_stall() {
         assert_eq!(thinking_effort(None), None);
         assert_eq!(thinking_effort(Some("off")), Some("none"));
+        assert_eq!(thinking_effort(Some("on")), Some("medium"), "on thinks at the usual depth");
+        assert_eq!(thinking_effort(Some(" ON ")), Some("medium"));
         assert_eq!(thinking_effort(Some(" Low ")), Some("low"));
         assert_eq!(thinking_effort(Some("maximum")), None, "an unknown value sends nothing");
         assert_eq!(stall_of(&cut_off_thinking()), Some(Stall::Thinking));

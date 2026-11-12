@@ -108,6 +108,81 @@ pub fn drop_missing(catalog: &mut Value, missing: &[String], fallback: &str) {
     }
 }
 
+/// Takes the models that cannot serve the agent out of a catalog: the agent sends its tools with every request, so a model whose `/api/show` answer lists
+/// capabilities without `tools` (a vision-only or text-only model) is refused by the endpoint every time, and an embedding model does not chat. They are
+/// listed under `unsupported` with the reason, and `fallback` replaces one as the default model or as an agent's model. A model that did not answer
+/// (a cloud model, another kind of endpoint) is kept: nothing says it cannot.
+pub fn drop_unsupported(catalog: &mut Value, shows: &HashMap<String, Value>, fallback: &str) {
+    let why = |id: &str| -> Option<&'static str> {
+        let caps = shows.get(id)?["capabilities"].as_array()?.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>();
+        if caps.is_empty() {
+            return None;
+        }
+        if caps.contains(&"embedding") {
+            Some("an embedding model")
+        } else if !caps.contains(&"tools") {
+            Some("no tool calling")
+        } else {
+            None
+        }
+    };
+    let dropped: Vec<(String, &'static str)> = catalog["models"]
+        .as_array()
+        .map(|models| models.iter().filter_map(|m| m["id"].as_str()).filter_map(|id| why(id).map(|reason| (id.to_string(), reason))).collect())
+        .unwrap_or_default();
+    let agent_or_default_unsupported = catalog["model"].as_str().is_some_and(|m| why(m).is_some())
+        || catalog["agents"].as_array().is_some_and(|agents| agents.iter().any(|a| a["model"].as_str().is_some_and(|m| why(m).is_some())));
+    if dropped.is_empty() && !agent_or_default_unsupported {
+        return;
+    }
+    if let Some(models) = catalog["models"].as_array_mut() {
+        models.retain(|m| !m["id"].as_str().is_some_and(|id| why(id).is_some()));
+    }
+    catalog["unsupported"] = json!(dropped.iter().map(|(id, reason)| json!({ "id": id, "why": reason })).collect::<Vec<_>>());
+    if catalog["model"].as_str().is_some_and(|m| why(m).is_some()) {
+        catalog["model"] = json!(fallback);
+    }
+    if let Some(agents) = catalog["agents"].as_array_mut() {
+        for agent in agents {
+            if agent["model"].as_str().is_some_and(|m| why(m).is_some()) {
+                agent["model"] = json!(fallback);
+            }
+        }
+    }
+}
+
+/// The thinking options a model offers, from its `/api/show` answer (`capabilities` has `thinking`): `off` and `on` for a model that can think or not
+/// (Ollama reads low, medium and high alike there, so they are not offered), `low` / `medium` / `high` for gpt-oss (the one family where the level
+/// changes the depth, and that cannot be switched off), none for a model without a thinking mode or one that always thinks (`deepseek-r1`).
+pub fn thinking_options(model_id: &str, show: &Value) -> Vec<&'static str> {
+    let can_think = show["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|c| c == "thinking"));
+    if !can_think {
+        return Vec::new();
+    }
+    let name = model_id.rsplit('/').next().unwrap_or(model_id).to_ascii_lowercase();
+    if name.starts_with("gpt-oss") {
+        vec!["low", "medium", "high"]
+    } else if name.starts_with("deepseek-r1") {
+        // Measured on the endpoint: it reasons with `reasoning_effort: none` too, so an "Off" would be a lie. Only the default.
+        Vec::new()
+    } else {
+        vec!["off", "on"]
+    }
+}
+
+/// Puts each model's thinking options (see `thinking_options`) in the catalog as `thinking`; a model with none gets no field.
+pub fn add_thinking(catalog: &mut Value, shows: &HashMap<String, Value>) {
+    if let Some(models) = catalog["models"].as_array_mut() {
+        for model in models {
+            let Some(id) = model["id"].as_str().map(str::to_string) else { continue };
+            let options = shows.get(&id).map(|show| thinking_options(&id, show)).unwrap_or_default();
+            if !options.is_empty() {
+                model["thinking"] = json!(options);
+            }
+        }
+    }
+}
+
 pub fn is_agent(skill: &Skill) -> bool {
     skill.context.as_deref() == Some("fork")
 }
@@ -217,6 +292,46 @@ mod tests {
         let mut untouched = build_catalog("gemma4:26b", "http://x/v1", &skills, Ok(vec![]), &HashMap::new());
         drop_missing(&mut untouched, &[], "gemma4:26b");
         assert!(untouched.get("notServed").is_none());
+    }
+
+    #[test]
+    fn a_model_that_can_think_offers_off_and_on_and_one_that_cannot_offers_nothing() {
+        let thinker = json!({ "capabilities": ["completion", "tools", "thinking"] });
+        let plain = json!({ "capabilities": ["completion", "tools"] });
+        assert_eq!(thinking_options("gemma4:26b", &thinker), vec!["off", "on"]);
+        assert_eq!(thinking_options("gpt-oss:20b", &thinker), vec!["low", "medium", "high"], "the family where the level matters");
+        assert_eq!(thinking_options("ollama/gpt-oss:120b", &thinker), vec!["low", "medium", "high"]);
+        assert!(thinking_options("deepseek-r1:32b", &thinker).is_empty(), "it always thinks: no Off to offer");
+        assert!(thinking_options("hermes3:latest", &plain).is_empty());
+        assert!(thinking_options("x", &json!({})).is_empty(), "no capabilities answer: no options");
+
+        let skills: Vec<Skill> = Vec::new();
+        let mut cat = build_catalog("gemma4:26b", "http://x/v1", &skills, Ok(vec!["gemma4:26b".into(), "hermes3:latest".into(), "unknown:1b".into()]), &HashMap::new());
+        add_thinking(&mut cat, &HashMap::from([("gemma4:26b".to_string(), thinker), ("hermes3:latest".to_string(), plain)]));
+        let get = |id: &str| cat["models"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone();
+        assert_eq!(get("gemma4:26b")["thinking"], json!(["off", "on"]));
+        assert!(get("hermes3:latest").get("thinking").is_none() && get("unknown:1b").get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_model_without_tool_calling_or_an_embedding_model_is_not_offered() {
+        let skills = vec![skill("designer", true, Some("qwen2.5vl:7b")), skill("dev", true, Some("gemma4:26b"))];
+        let listed: Vec<String> = ["gemma4:26b", "qwen2.5vl:7b", "qwen3-embedding:0.6b", "gemma4:31b-cloud"].iter().map(|s| s.to_string()).collect();
+        let shows = HashMap::from([
+            ("gemma4:26b".to_string(), json!({ "capabilities": ["completion", "vision", "tools", "thinking"] })),
+            ("qwen2.5vl:7b".to_string(), json!({ "capabilities": ["completion", "vision"] })),
+            ("qwen3-embedding:0.6b".to_string(), json!({ "capabilities": ["tools", "thinking", "embedding"] })),
+        ]);
+        let mut cat = build_catalog("gemma4:26b", "http://x/v1", &skills, Ok(listed), &HashMap::new());
+        drop_unsupported(&mut cat, &shows, "gemma4:26b");
+        let mut ids: Vec<&str> = cat["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["gemma4:26b", "gemma4:31b-cloud"], "a model that did not answer is kept");
+        let why: Vec<(String, String)> = cat["unsupported"].as_array().unwrap().iter().map(|u| (u["id"].as_str().unwrap().into(), u["why"].as_str().unwrap().into())).collect();
+        assert!(why.contains(&("qwen2.5vl:7b".into(), "no tool calling".into())) && why.contains(&("qwen3-embedding:0.6b".into(), "an embedding model".into())), "{why:?}");
+        let model_of = |name: &str| cat["agents"].as_array().unwrap().iter().find(|a| a["name"] == name).unwrap()["model"].clone();
+        assert_eq!(model_of("designer"), "gemma4:26b", "an agent on a model that cannot do tools moves to the fallback");
+        assert_eq!(model_of("dev"), "gemma4:26b");
     }
 
     #[test]
