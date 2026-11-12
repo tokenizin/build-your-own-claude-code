@@ -20,10 +20,12 @@ pub struct OpencodeAdapter {
     pub agent_mode: String,
 }
 
-/// The model an agent runs on when its own model is one this endpoint cannot serve. Chosen by timing the
-/// Product Manager (its real prompt and tools) on every usable model of the endpoint: see
-/// `evidences/TASK-2026-11-05-001/model-benchmark/`.
-pub const DEFAULT_ORCHESTRATOR_MODEL: &str = "qwen2.5:14b";
+/// The model an agent runs on when its own model is one this endpoint cannot serve, and the model of a fork. It was `qwen2.5:14b`, chosen
+/// by timing the Product Manager (its real prompt and tools) on every usable model of the endpoint (see
+/// `evidences/TASK-2026-11-05-001/model-benchmark/`), but that model's context window is 32,768 tokens: too small for the Product Manager's
+/// ~16K-token prompt plus a few tool results, and the agents it ran drifted and made things up. `gemma4:26b` has 262,144 and runs on the
+/// same endpoint. Needs to exist on the endpoint (`opencode-rust.json` can name another: `defaultForkModel`, `modelRemap`).
+pub const DEFAULT_ORCHESTRATOR_MODEL: &str = "gemma4:26b";
 
 impl Default for OpencodeAdapter {
     fn default() -> Self {
@@ -498,6 +500,6 @@ mod tests {
             remap_model(&a, Some("opencode/space-bunny-free")).as_deref(),
             Some(DEFAULT_ORCHESTRATOR_MODEL)
         );
-        assert_eq!(DEFAULT_ORCHESTRATOR_MODEL, "qwen2.5:14b");
+        assert_eq!(DEFAULT_ORCHESTRATOR_MODEL, "gemma4:26b");
     }
 }
