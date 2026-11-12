@@ -595,6 +595,8 @@ async fn run_agent_loop(
     // What this run's last `TodoWrite` left unfinished, and whether the agent was already told about it.
     let mut open_todos: Vec<String> = Vec::new();
     let mut todo_reminded = false;
+    // Whether an agent that handed work on and then ended on a plan or its own thinking was already told to write the answer.
+    let mut summary_reminded = false;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
         let retrying = retry_after.take();
@@ -778,6 +780,16 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                     top.emitter.delta("\n\n");
                 }
                 messages.push(json!({ "role": "user", "content": todo_nudge(&open_todos) }));
+                continue;
+            }
+            // An agent that handed work on and then ends on a plan, an open checklist or its own thinking has not answered: say so, once.
+            if !summary_reminded && handed_on && workflow.is_none() && delegation_nudge_on() && is_weak_finish(&text) {
+                summary_reminded = true;
+                eprintln!("agent: the turn ended after handing work on without an answer (a plan or its own thinking) — asking for the answer once");
+                if let Some(top) = top {
+                    top.emitter.delta("\n\n");
+                }
+                messages.push(json!({ "role": "user", "content": SUMMARY_NUDGE }));
                 continue;
             }
             return Ok(text);
@@ -2063,6 +2075,28 @@ If an item is no longer needed, mark it completed or cancelled with TodoWrite an
     )
 }
 
+/// Said once to an agent that handed work on and then ended on a plan or on its own thinking.
+const SUMMARY_NUDGE: &str = "The specialists you delegated to have reported back. Your last message is not an answer: it is a plan, a checklist \
+with open items, or you thinking aloud. Write your final answer to the user now, in plain prose: what each specialist found or did, \
+what changed (files, results), and anything still open and why. No checklist, no \"Wait\" or \"Executing\", and no further tool calls unless a \
+result is missing and you cannot answer without it.";
+
+/// Whether a final reply is a plan or the model's own thinking, not an answer: an unfinished checklist item, a promise of work
+/// still to do, or the self-talk local models leak ("**Wait!**", "**Executing...**", "**Actually, I'll ...**").
+fn is_weak_finish(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let open_item = lower.lines().any(|l| {
+        let l = l.trim_start_matches(|c: char| c == '-' || c == '*' || c.is_whitespace());
+        l.starts_with("[ ]") || l.starts_with("[/]") || l.contains("[pending]") || l.contains("[in_progress]") || l.contains("[in progress]")
+    });
+    const SELF_TALK: [&str; 6] = ["**wait!**", "**wait,", "**executing", "**actually,", "let's see if", "i can't do all in one turn"];
+    let talking = SELF_TALK.iter().filter(|p| lower.contains(*p)).count() >= 2;
+    // Waiting for a report that has already come in ("I am currently waiting for the Developer's implementation report").
+    let tail: String = lower.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+    let waiting = ["i am currently waiting", "i'm currently waiting", "i am waiting for", "i'm waiting for", "waiting for the developer", "waiting for the report"].iter().any(|p| tail.contains(p));
+    open_item || talking || waiting
+}
+
 /// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
 fn delegation_nudge_on() -> bool {
     !matches!(env::var("NOMAD_DELEGATION_NUDGE").ok().as_deref().map(str::trim), Some("off" | "0" | "false"))
@@ -3082,6 +3116,45 @@ mod tests {
         assert!(!can_hand_on(None));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_manager_that_delegates_and_then_ends_on_a_plan_is_asked_for_its_answer_once() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `developer`") {
+                return text_message("found it");
+            }
+            if last["content"] == SUMMARY_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+                return text_message("The developer found the dialog in ui/attach.tsx; nothing else is open.");
+            }
+            if last["role"] == "tool" {
+                text_message("- [in_progress] Create a plan\n**Wait!** **Executing...** **Actually, I'll do the Task first.**")
+            } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "find dialog", "prompt": "find the attachment dialog" }))
+            }
+        }).await;
+        let skills = vec![skill("developer", true)];
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found the dialog in ui/attach.tsx; nothing else is open."));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // Asked once only: a model that answers with the plan again keeps that answer. And with nothing handed on, no request is made.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let base = scripted_model(move |req| {
+            if last_message(req)["content"] == SUMMARY_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            text_message("- [pending] verify it")
+        }).await;
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("- [pending] verify it"));
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "it never handed work on");
+    }
+
     #[test]
     fn a_workflow_runner_is_announced_with_the_model_it_runs_on() {
         let cfg = LlmConfig { base_url: "http://x/v1".into(), fallback_base_url: "http://x/v1".into(), api_key: "k".into(), model: "endpoint-default".into(), max_tokens: 256 };
@@ -3231,6 +3304,17 @@ mod tests {
         assert!(!announces_unstarted_work("The dialog is `directory-browser-dialog.tsx`; it sorts by name only."));
         assert!(!announces_unstarted_work("I will delegate this to the developer. Shall I proceed?"), "it is waiting for the user");
         assert!(!announces_unstarted_work(""));
+    }
+
+    #[test]
+    fn a_plan_or_self_talk_is_a_weak_finish_and_an_answer_is_not() {
+        assert!(is_weak_finish("- [pending] Verify implementation with tests\n\nI am currently waiting for the Developer's implementation report."));
+        assert!(is_weak_finish("Plan:\n- [in_progress] Create a rigorous technical implementation plan for `file-attachment-dialog.tsx`"));
+        assert!(is_weak_finish("- [ ] write the tests"));
+        assert!(is_weak_finish("**Wait!** I can't do all in one turn. **Executing...** **Actually, I'll do the `Task` first.**"));
+        assert!(!is_weak_finish("The developer added the attach dialog in ui/attach.tsx and the tests pass. Three files changed."));
+        assert!(!is_weak_finish("Wait times are down 20%: the dialog now loads lazily."), "one word of the self-talk list is not self-talk");
+        assert!(!is_weak_finish(""));
         let long = format!("I will now delegate.\n{}", "The result is in the table above. ".repeat(40));
         assert!(!announces_unstarted_work(&long), "only how the answer ends counts");
     }
