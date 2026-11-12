@@ -84,6 +84,30 @@ pub fn drop_small_contexts(catalog: &mut Value, floor: u64, fallback: &str) {
     }
 }
 
+/// Takes the models the endpoint says it does not have (`missing`, see `context::missing_among`) out of a catalog (a stale or invented name cannot be
+/// run, and the pickers must not offer it), lists them under `notServed`, and puts `fallback` in their place as the default model or as an agent's
+/// model. A model that is only absent from the model list is NOT missing: a cloud model can be served and not listed.
+pub fn drop_missing(catalog: &mut Value, missing: &[String], fallback: &str) {
+    if missing.is_empty() {
+        return;
+    }
+    let is_missing = |m: &str| missing.iter().any(|x| x == m);
+    if let Some(models) = catalog["models"].as_array_mut() {
+        models.retain(|m| !m["id"].as_str().is_some_and(is_missing));
+    }
+    catalog["notServed"] = json!(missing);
+    if catalog["model"].as_str().is_some_and(is_missing) {
+        catalog["model"] = json!(fallback);
+    }
+    if let Some(agents) = catalog["agents"].as_array_mut() {
+        for agent in agents {
+            if agent["model"].as_str().is_some_and(is_missing) {
+                agent["model"] = json!(fallback);
+            }
+        }
+    }
+}
+
 pub fn is_agent(skill: &Skill) -> bool {
     skill.context.as_deref() == Some("fork")
 }
@@ -173,6 +197,26 @@ mod tests {
         let mut all = build_catalog("qwen2.5:14b", "http://x/v1", &skills, Ok(vec!["qwen2.5:14b".into()]), &contexts);
         drop_small_contexts(&mut all, 0, "gemma4:26b");
         assert!(all.get("tooSmall").is_none() && all["model"] == "qwen2.5:14b");
+    }
+
+    #[test]
+    fn a_model_the_endpoint_says_it_does_not_have_is_not_offered_and_agents_move_to_the_fallback() {
+        let skills = vec![skill("ui_ux_designer", true, Some("ornith-31b-dense:latest")), skill("developer", true, Some("gemma4:26b")), skill("cto", true, Some("gemma4:31b-cloud"))];
+        let listed = vec!["gemma4:26b".to_string(), "ornith-31b-dense:latest".to_string()];
+        let mut cat = build_catalog("gemma4:31b-cloud", "http://x/v1", &skills, Ok(listed), &HashMap::new());
+        drop_missing(&mut cat, &["ornith-31b-dense:latest".to_string()], "gemma4:26b");
+        let ids: Vec<&str> = cat["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(!ids.contains(&"ornith-31b-dense:latest"), "{ids:?}");
+        assert!(ids.contains(&"gemma4:31b-cloud"), "a served cloud model that is not in the list stays: {ids:?}");
+        assert_eq!(cat["notServed"][0], "ornith-31b-dense:latest");
+        assert_eq!(cat["model"], "gemma4:31b-cloud", "the default is served, so it stays");
+        let model_of = |name: &str| cat["agents"].as_array().unwrap().iter().find(|a| a["name"] == name).unwrap()["model"].clone();
+        assert_eq!(model_of("ui_ux_designer"), "gemma4:26b", "the agent pinned to a model that is not there moves to the fallback");
+        assert_eq!(model_of("cto"), "gemma4:31b-cloud");
+        // Nothing missing: the catalog is left alone.
+        let mut untouched = build_catalog("gemma4:26b", "http://x/v1", &skills, Ok(vec![]), &HashMap::new());
+        drop_missing(&mut untouched, &[], "gemma4:26b");
+        assert!(untouched.get("notServed").is_none());
     }
 
     #[test]

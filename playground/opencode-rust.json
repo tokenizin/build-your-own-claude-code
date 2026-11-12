@@ -15,7 +15,9 @@
     "ollama/qwen3:8b": "qwen3:8b",
     "ollama/qwen3.6:latest": "qwen3.6:latest",
     "ollama/hermes3:latest": "hermes3:latest",
-    "ollama/ornith-31b-dense:latest": "ornith-31b-dense:latest"
+    "ollama/ornith-31b-dense:latest": "qwen3.6:latest",
+    "ollama/ornith-31b-dense": "qwen3.6:latest",
+    "ornith/ornith-31b-dense": "qwen3.6:latest"
   },
   "aliases": {
     "pma": "product_manager",

@@ -28,64 +28,128 @@ pub fn too_small(context: Option<u64>) -> bool {
     too_small_for(min_context(), context)
 }
 
-/// What each model's window was last found to be (`None` = it did not say), so `/api/show` is asked once per model per process.
-static KNOWN: Mutex<Option<HashMap<String, Option<u64>>>> = Mutex::new(None);
+/// What the endpoint said about a model: it does not have it, or it has it with this window (`None` = it did not say).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Seen {
+    Missing,
+    Window(Option<u64>),
+}
 
-pub async fn context_of(cfg: &LlmConfig, model: &str) -> Option<u64> {
-    if min_context() == 0 {
-        return None;
-    }
+/// What each model was last found to be, so `/api/show` is asked once per model per process.
+static KNOWN: Mutex<Option<HashMap<String, Seen>>> = Mutex::new(None);
+
+/// Ollama's answer to `/api/show` for a model it does not have: HTTP 404 and `{"error":"model \"x\" not found, try pulling it first"}`. A 404
+/// that is not that (an endpoint with no `/api/show` at all answers `404 page not found` for everything) says nothing about the model.
+pub fn says_model_missing(status: u16, body: &str) -> bool {
+    let lower = body.to_lowercase();
+    status == 404 && lower.contains("model") && lower.contains("not found")
+}
+
+async fn seen(cfg: &LlmConfig, model: &str) -> Seen {
     if let Some(hit) = KNOWN.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(model).copied())) {
         return hit;
     }
-    let found = crate::fetch_contexts(&cfg.base_url, &cfg.api_key, &[model.to_string()]).await.get(model).copied();
+    let root = cfg.base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let answer = reqwest::Client::new()
+        .post(format!("{root}/api/show"))
+        .bearer_auth(&cfg.api_key)
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await;
+    let found = match answer {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            if says_model_missing(status, &text) {
+                Seen::Missing
+            } else if status < 300 {
+                Seen::Window(serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|body| crate::catalog::context_from_show(&body)))
+            } else {
+                Seen::Window(None)
+            }
+        }
+        Err(_) => Seen::Window(None),
+    };
     if let Ok(mut guard) = KNOWN.lock() {
         guard.get_or_insert_with(HashMap::new).insert(model.to_string(), found);
     }
     found
 }
 
-fn too_small_message(model: &str, context: Option<u64>) -> String {
-    format!(
-        "model {model} has a context window of {} tokens, below the {} an agent needs (its prompt, tool results and conversation do not fit: the context is \
-trimmed and reloaded again and again, and the agent drifts and invents things). Use a model with a larger window, or set NOMAD_MIN_CONTEXT=0 to allow it.",
-        context.unwrap_or(0),
-        min_context()
-    )
+/// Of `models`, those the endpoint says it does not have (`/api/show` answers "not found"): not those that are merely absent from the model
+/// list (a cloud model can be served and not listed) and not those it did not answer for.
+pub async fn missing_among(cfg: &LlmConfig, models: &[String]) -> Vec<String> {
+    use futures_util::StreamExt;
+    futures_util::stream::iter(models.iter().take(80).cloned())
+        .map(|model| async move { (seen(cfg, &model).await == Seen::Missing).then_some(model) })
+        .buffer_unordered(8)
+        .filter_map(|found| async move { found })
+        .collect()
+        .await
 }
 
-/// The model a delegated agent or a fork should run on: `wanted`, or the fallback model when `wanted`'s window is below the floor.
-/// An error only when the fallback is too small as well.
+fn unusable(seen: Seen) -> bool {
+    match seen {
+        Seen::Missing => true,
+        Seen::Window(context) => too_small(context),
+    }
+}
+
+fn refusal(model: &str, seen: Seen) -> String {
+    match seen {
+        Seen::Missing => format!(
+            "model {model} is not served by the endpoint (it answered that the model was not found). Use a model the endpoint lists; a stale or invented name \
+(for example a legacy alias that no longer exists) fails every request."
+        ),
+        Seen::Window(context) => format!(
+            "model {model} has a context window of {} tokens, below the {} an agent needs (its prompt, tool results and conversation do not fit: the context is \
+trimmed and reloaded again and again, and the agent drifts and invents things). Use a model with a larger window, or set NOMAD_MIN_CONTEXT=0 to allow it.",
+            context.unwrap_or(0),
+            min_context()
+        ),
+    }
+}
+
+/// The model a delegated agent or a fork should run on: `wanted`, or the fallback model when `wanted` is not served by the endpoint or its window
+/// is below the floor. An error only when the fallback is unusable as well.
 pub async fn usable_model(cfg: &LlmConfig, wanted: &str) -> Result<String, String> {
-    let context = context_of(cfg, wanted).await;
-    if !too_small(context) {
+    let first = seen(cfg, wanted).await;
+    if !unusable(first) {
         return Ok(wanted.to_string());
     }
     let fallback = crate::opencode_config::load_adapter().default_fork_model;
     if fallback != wanted {
-        let fallback_context = context_of(cfg, &fallback).await;
-        if !too_small(fallback_context) {
-            eprintln!(
-                "context: model {wanted} has a window of {} tokens (< {}); running on {fallback} ({} tokens) instead",
-                context.unwrap_or(0),
-                min_context(),
-                fallback_context.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
-            );
+        let second = seen(cfg, &fallback).await;
+        if !unusable(second) {
+            let why = match first {
+                Seen::Missing => "is not served by the endpoint".to_string(),
+                Seen::Window(context) => format!("has a window of {} tokens (< {})", context.unwrap_or(0), min_context()),
+            };
+            eprintln!("context: model {wanted} {why}; running on {fallback} instead");
             return Ok(fallback);
         }
     }
-    Err(too_small_message(wanted, context))
+    Err(refusal(wanted, first))
 }
 
 /// For the model a run was asked to use (a person chose it, or it is the configured default): not replaced, refused.
-pub async fn refuse_if_small(cfg: &LlmConfig, model: &str) -> Result<(), String> {
-    let context = context_of(cfg, model).await;
-    if too_small(context) { Err(too_small_message(model, context)) } else { Ok(()) }
+pub async fn refuse_if_unusable(cfg: &LlmConfig, model: &str) -> Result<(), String> {
+    let found = seen(cfg, model).await;
+    if unusable(found) { Err(refusal(model, found)) } else { Ok(()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ollamas_own_not_found_answer_counts_as_a_missing_model() {
+        assert!(says_model_missing(404, "{\"error\":\"model \\\"ornith-31b-dense:latest\\\" not found, try pulling it first\"}"));
+        assert!(!says_model_missing(404, "404 page not found"), "an endpoint with no /api/show says that about everything");
+        assert!(!says_model_missing(200, "{\"error\":\"model not found\"}"));
+        assert!(!says_model_missing(500, "model not found"));
+    }
 
     #[test]
     fn only_a_known_small_window_is_too_small() {

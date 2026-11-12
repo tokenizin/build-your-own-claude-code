@@ -2392,6 +2392,8 @@ async fn main() -> std::process::ExitCode {
         let wanted = catalog::merge_models(&cfg.model, listed.as_deref().unwrap_or_default(), &skills);
         let contexts = fetch_contexts(&base, &cfg.api_key, &wanted).await;
         let mut catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed, &contexts);
+        let missing = context::missing_among(&LlmConfig { base_url: base.clone(), ..cfg.clone() }, &wanted).await;
+        catalog::drop_missing(&mut catalog, &missing, &opencode_config::load_adapter().default_fork_model);
         catalog::drop_small_contexts(&mut catalog, context::min_context(), &opencode_config::load_adapter().default_fork_model);
         println!("{catalog}");
         return ExitCode::SUCCESS;
@@ -2467,6 +2469,9 @@ async fn main() -> std::process::ExitCode {
     }
 
     let initial = build_initial_run(&prompt, &skills);
+    // A model somebody asked for (--model, a fork override) is refused if the endpoint does not serve it or its window is too small; the
+    // configured default is not a request, so it is replaced by the fallback model instead.
+    let model_was_requested = args.model.is_some() || initial.model_override.is_some();
     let run_cfg = if let Some(model) = &args.model {
         eprintln!("model: {model} (--model)");
         cfg.with_model(model)
@@ -2478,9 +2483,18 @@ async fn main() -> std::process::ExitCode {
         cfg
     };
 
-    if let Err(message) = context::refuse_if_small(&run_cfg, &run_cfg.model).await {
-        return fail(2, message);
-    }
+    let run_cfg = if model_was_requested {
+        if let Err(message) = context::refuse_if_unusable(&run_cfg, &run_cfg.model).await {
+            return fail(2, message);
+        }
+        run_cfg
+    } else {
+        match context::usable_model(&run_cfg, &run_cfg.model).await {
+            Ok(usable) if usable != run_cfg.model => run_cfg.with_model(usable),
+            Ok(_) => run_cfg,
+            Err(message) => return fail(2, message),
+        }
+    };
 
     let mut messages = initial.messages;
     if !args.images.is_empty() {
@@ -3670,11 +3684,39 @@ mod tests {
             text_message("unused")
         }).await;
         let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base, api_key: "k".into(), model: "tiny-refuse:1b".into(), max_tokens: 256 };
-        let refused = context::refuse_if_small(&cfg, "tiny-refuse:1b").await;
+        let refused = context::refuse_if_unusable(&cfg, "tiny-refuse:1b").await;
         let message = refused.expect_err("a 4,096-token model is refused");
         assert!(message.contains("tiny-refuse:1b") && message.contains("4096") && message.contains("NOMAD_MIN_CONTEXT"), "{message}");
         // A model that does not say its window (no /api/show answer with one) is let through.
-        assert!(context::refuse_if_small(&cfg, "unknown-window:3b").await.is_ok());
+        assert!(context::refuse_if_unusable(&cfg, "unknown-window:3b").await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_agent_on_a_model_the_endpoint_does_not_have_runs_on_the_fallback_model() {
+        let used = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = used.clone();
+        let base = scripted_model(move |req| {
+            // /api/show (no messages): Ollama's answer for a model it does not have is a 404 with this error; any other model is big.
+            if req.get("messages").is_none() {
+                if req["model"] == "ghost-alias:31b" {
+                    return json!({ "__status": 404, "__body": { "error": "model \"ghost-alias:31b\" not found, try pulling it first" } });
+                }
+                return json!({ "__status": 200, "__body": { "model_info": { "gemma4.context_length": 262144 } } });
+            }
+            let system = system_text(req);
+            if system.contains("agent `ui_ux_designer`") {
+                record.lock().unwrap().push(req["model"].as_str().unwrap_or("").to_string());
+                return text_message("The dialog needs a sort control and a search box; the layout is a header row with a toggle.");
+            }
+            if last_message(req)["role"] == "tool" { text_message("The designer described the dialog.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "ui_ux_designer", "description": "d", "prompt": "design the dialog", "model": "ghost-alias:31b" }))
+            }
+        }).await;
+        let (answer, messages) = hardening_run(&base, &[skill("ui_ux_designer", true)]).await;
+        assert_eq!(answer.as_deref(), Ok("The designer described the dialog."));
+        let used = used.lock().unwrap().clone();
+        assert!(!used.is_empty() && used.iter().all(|m| m == "gemma4:26b"), "the designer ran on the fallback, not on the model that is not there: {used:?}");
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("sort control"))), "and it reported");
     }
 
     #[test]

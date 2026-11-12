@@ -39,6 +39,10 @@ impl Default for OpencodeAdapter {
             DEFAULT_ORCHESTRATOR_MODEL.into(),
         );
         model_remap.insert("opencode-go/mimo-v2.5".into(), DEFAULT_ORCHESTRATOR_MODEL.into());
+        // `ornith-31b-dense` was a local alias of Qwen 3.6 and is no longer served: what it pointed at is the model to use.
+        for legacy in ["ollama/ornith-31b-dense:latest", "ollama/ornith-31b-dense", "ornith/ornith-31b-dense"] {
+            model_remap.insert(legacy.into(), "qwen3.6:latest".into());
+        }
 
         let mut aliases = HashMap::new();
         for (a, c) in [
@@ -487,6 +491,15 @@ mod tests {
         let v: Value = serde_json::from_str(&cleaned).unwrap();
         assert_eq!(v["a"], 1);
         assert_eq!(v["b"]["c"], true);
+    }
+
+    #[test]
+    fn the_legacy_ornith_alias_maps_to_the_model_it_pointed_at() {
+        let adapter = OpencodeAdapter::default();
+        for legacy in ["ollama/ornith-31b-dense:latest", "ollama/ornith-31b-dense", "ornith/ornith-31b-dense"] {
+            assert_eq!(remap_model(&adapter, Some(legacy)).as_deref(), Some("qwen3.6:latest"), "{legacy}");
+        }
+        assert_eq!(remap_model(&adapter, Some("ollama/ornith:latest")).as_deref(), Some("ornith:latest"), "the model that does exist is untouched");
     }
 
     #[test]
