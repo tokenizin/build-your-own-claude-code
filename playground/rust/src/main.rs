@@ -809,7 +809,9 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                 continue;
             }
             // Any agent, a subagent too, that ends on "Let's start by running X" without a tool call has done nothing: say so, once.
-            if action_reminders < nudge_repeats() && workflow.is_none() && delegation_nudge_on() && announces_unstarted_action(&text) {
+            if action_reminders < nudge_repeats() && workflow.is_none() && delegation_nudge_on()
+                && (announces_unstarted_action(&text) || (depth > 0 && subagent_announces_step(&text)))
+            {
                 action_reminders += 1;
                 log_nudge("action", depth, &text);
                 eprintln!("agent: the turn ended on \"let's start...\" with no tool call — reminding it once");
@@ -2180,7 +2182,42 @@ fn announces_unstarted_action(text: &str) -> bool {
     }
     let chars: Vec<char> = trimmed.chars().collect();
     let tail: String = chars[chars.len().saturating_sub(300)..].iter().collect::<String>().to_lowercase().replace('\u{2019}', "'");
-    ["let's start", "let's proceed", "let's begin", "let's implement", "let's execute", "let's run", "let's continue", "let's investigate"].iter().any(|p| tail.contains(p))
+    [
+        "let's start", "let's proceed", "let's begin", "let's implement", "let's execute", "let's run", "let's continue", "let's investigate",
+        "let's try", "let's search", "let's look", "let's check", "let's find", "let's see", "let's examine", "let's explore",
+        "let's verify", "let's test", "let's review", "let's analy", "let's dig", "let's use", "let's do",
+    ]
+    .iter()
+    .any(|p| tail.contains(p))
+}
+
+/// A subagent's reply that ends on a step it announced and did not take, in the shapes the "let's …" list does not cover:
+/// it ends on a colon ("Let's try this refined search:"), its last sentence is a promise ("I will refine the search…"), or it
+/// promises ("I'll proceed by searching…") and then shows a code block (the command, or the tool call written as text) that nobody ran.
+/// A question is not this (it is asked, see `asks_the_user`).
+fn subagent_announces_step(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.ends_with('?') {
+        return false;
+    }
+    if trimmed.ends_with(':') || ends_on_a_promise(trimmed) {
+        return true;
+    }
+    let flat = trimmed.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().replace('\u{2019}', "'");
+    let chars: Vec<char> = flat.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(600)..].iter().collect();
+    // The last promise in the tail ("i will ..." / "i'll ..."), unless it is a refusal, with a code block somewhere after it.
+    let promise = ["i will ", "i'll "]
+        .iter()
+        .filter_map(|p| tail.rfind(p).map(|at| (at, p.len())))
+        .max_by_key(|(at, _)| *at);
+    match promise {
+        Some((at, len)) => {
+            let after = &tail[at + len..];
+            !(after.starts_with("not ") || after.starts_with("never ")) && after.contains("```")
+        }
+        None => false,
+    }
 }
 
 /// Said once to an agent that handed work on and then ended on a plan or on its own thinking.
@@ -3480,6 +3517,59 @@ mod tests {
         let skills = vec![skill("business_analyst", true)];
         let (_, _) = hardening_run(&base, &skills).await;
         assert_eq!(reminders.load(Ordering::SeqCst), 3, "exactly the cap: no endless loop");
+    }
+
+    #[test]
+    fn a_subagent_ending_on_a_promise_a_colon_or_a_command_it_did_not_run_is_recognised() {
+        // The endings of a real browser run (gemma4:26b): a promise, a tool call written as text, and "let's try ...:" after a command.
+        let call_as_text = "I'll proceed by searching for files containing the patterns \"file picker\" and \"dialog\".\n\n```json\n{ \"tool\": \"grep\", \"args\": { \"include\": \"*.tsx\", \"path\": \"src\", \"pattern\": \"dialog\" } }\n```\n\nThis will help us locate the file picker components and dialog management logic.";
+        assert!(subagent_announces_step(call_as_text));
+        let refined = "I will refine the search to focus on these directories:\n\n```bash\ngrep -r --include='*.tsx' -e 'attachment' -e 'file picker' src/components src/dialogs\n```\n\nLet's try this refined search:";
+        assert!(subagent_announces_step(refined));
+        assert!(announces_unstarted_action("Here is the command.\n\nLet's try this refined search"), "let's try is an announced step");
+        assert!(subagent_announces_step("The dialog is in ui/attach.tsx. I will now look at the sort code."), "a last sentence that promises");
+        // Not these: a report, a refusal before a code block, a question (asked, not announced), nothing.
+        assert!(!subagent_announces_step("The dialog is in ui/attach.tsx; it sorts by name only.\n\n```ts\nitems.sort(byName)\n```\n\nA sort control and a search box are needed."));
+        assert!(!subagent_announces_step("I will not repeat the code here.\n\n```ts\nconst a = 1\n```\n\nThe fix is two lines."));
+        assert!(!subagent_announces_step("The plan is ready. Would you like to continue?"));
+        assert!(!subagent_announces_step(""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_that_promises_and_shows_a_command_is_reminded_and_then_reports() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `developer`") {
+                if last["content"] == ACTION_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return text_message("The dialog is in ui/attach.tsx; the search helper is searchWorkspaceFiles. A sort control and a search box are needed.");
+                }
+                return text_message("I'll proceed by searching for the dialog.\n\n```bash\ngrep -r attachment src\n```\n\nThis will help us locate the component.");
+            }
+            if last["role"] == "tool" { text_message("The developer found the dialog.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "d", "prompt": "find the dialog" }))
+            }
+        }).await;
+        let skills = vec![skill("developer", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found the dialog."));
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "reminded once, then it reported");
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("searchWorkspaceFiles"))), "the manager got the report, not the promise");
+
+        // The top-level agent that answers with a code block after a promise is not treated this way (only subagents).
+        let nudged = Arc::new(AtomicUsize::new(0));
+        let count = nudged.clone();
+        let base = scripted_model(move |req| {
+            if last_message(req)["content"] == ACTION_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            text_message("I will show the command you can run yourself:\n\n```bash\nls -la\n```")
+        }).await;
+        let (_, _) = hardening_run(&base, &[]).await;
+        assert_eq!(nudged.load(Ordering::SeqCst), 0);
     }
 
     #[test]
