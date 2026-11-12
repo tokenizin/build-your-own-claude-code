@@ -597,6 +597,8 @@ async fn run_agent_loop(
     let mut todo_reminded = false;
     // Whether an agent that handed work on and then ended on a plan or its own thinking was already told to write the answer.
     let mut summary_reminded = false;
+    // Whether any agent (a subagent too) that ended on "let's start by running X" with no tool call was already told to run it.
+    let mut action_reminded = false;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
         let retrying = retry_after.take();
@@ -790,6 +792,16 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                     top.emitter.delta("\n\n");
                 }
                 messages.push(json!({ "role": "user", "content": SUMMARY_NUDGE }));
+                continue;
+            }
+            // Any agent, a subagent too, that ends on "Let's start by running X" without a tool call has done nothing: say so, once.
+            if !action_reminded && workflow.is_none() && delegation_nudge_on() && announces_unstarted_action(&text) {
+                action_reminded = true;
+                eprintln!("agent: the turn ended on \"let's start...\" with no tool call — reminding it once");
+                if let Some(top) = top {
+                    top.emitter.delta("\n\n");
+                }
+                messages.push(json!({ "role": "user", "content": ACTION_NUDGE }));
                 continue;
             }
             return Ok(text);
@@ -2075,6 +2087,23 @@ If an item is no longer needed, mark it completed or cancelled with TodoWrite an
     )
 }
 
+/// Said once to an agent that ended on "Let's start by running X" (or "let's implement…") without making a tool call.
+const ACTION_NUDGE: &str = "You ended your message by saying what you will do next, but you made no tool call, so nothing was done. \
+If there is work left, call the tool for it now. If you have finished, give your final report instead: what you found or did, \
+what changed (files, results), and anything still open and why. Do not describe work you have not done.";
+
+/// Whether a reply ends on "Let's start/proceed/implement/run…": a step announced and not taken. Only the end counts, so a report
+/// that quotes the phrase in passing is not caught; a question ("Shall we proceed?") is waiting for the user, not announcing.
+fn announces_unstarted_action(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.ends_with('?') {
+        return false;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(300)..].iter().collect::<String>().to_lowercase().replace('\u{2019}', "'");
+    ["let's start", "let's proceed", "let's begin", "let's implement", "let's execute", "let's run", "let's continue", "let's investigate"].iter().any(|p| tail.contains(p))
+}
+
 /// Said once to an agent that handed work on and then ended on a plan or on its own thinking.
 const SUMMARY_NUDGE: &str = "Your last message is not an answer: it is a plan, a checklist with open items, a status report that says work is \
 still in progress, or you thinking aloud. The specialists you delegated to have finished and reported back. If work remains, do it now: \
@@ -2097,7 +2126,10 @@ fn is_weak_finish(text: &str) -> bool {
     let waiting = ["i am currently waiting", "i'm currently waiting", "i am waiting for", "i'm waiting for", "waiting for the developer", "waiting for the report"].iter().any(|p| tail.contains(p));
     // A status report that hands the rest to a later turn that never comes ("I will move to the frontend phase", "remain in progress").
     let moving_on = ["i will move to", "i'll move to", "i will then move", "next, i will", "next i will", "remain in progress", "remains in progress", "still in progress", "currently working on"].iter().any(|p| tail.contains(p));
-    open_item || talking || waiting || moving_on
+    // A brief written to another agent instead of a report ("To the Developer Agent: … Execute the investigation now. Task ID: …").
+    let brief = lower.lines().any(|l| { let l = l.trim_start_matches(|c: char| !c.is_alphanumeric()); l.starts_with("to the ") && l.contains(" agent") })
+        || (tail.contains("execute the") && tail.contains(" now")) || tail.contains("**task id");
+    open_item || talking || waiting || moving_on || brief
 }
 
 /// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
@@ -3156,6 +3188,60 @@ mod tests {
         let (answer, _) = hardening_run(&base, &skills).await;
         assert_eq!(answer.as_deref(), Ok("- [pending] verify it"));
         assert_eq!(asked.load(Ordering::SeqCst), 0, "it never handed work on");
+    }
+
+    #[test]
+    fn a_step_announced_and_not_taken_is_detected_and_a_report_is_not() {
+        assert!(announces_unstarted_action("### Phase 1\n\nLet's start by executing this command."));
+        assert!(announces_unstarted_action("Let\u{2019}s implement these changes in the file and proceed with testing."));
+        assert!(!announces_unstarted_action("Shall we proceed? Let's start when you are ready?"), "a question waits for the user");
+        let report = format!("The handler is in fs.ts. Let's start from the premise that the listing is cached: it is not.\n\n{}", "The fix is a two-line change in fs.ts and the tests pass. ".repeat(8));
+        assert!(!announces_unstarted_action(&report), "a phrase early in a long report is not how it ends");
+        assert!(!announces_unstarted_action(""));
+        assert!(is_weak_finish("I am redirecting the developer.\n\n**To the Developer Agent:**\n\nYour plan is rejected.\n\n**Execute the investigation now.**\n\n**Task ID:** `T-1`"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_that_ends_on_lets_start_is_reminded_once_and_then_runs_it() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `developer`") {
+                if last["content"] == ACTION_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return text_message("The dialog is in ui/attach.tsx; it sorts by name only.");
+                }
+                return text_message("### Phase 1\n\nLet's start by executing this command.");
+            }
+            if last["role"] == "tool" { text_message("The developer found the dialog in ui/attach.tsx.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "find dialog", "prompt": "find the attachment dialog" }))
+            }
+        }).await;
+        let skills = vec![skill("developer", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found the dialog in ui/attach.tsx."));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("sorts by name only"))), "the manager got the subagent's report, not its announcement");
+
+        // Asked once only: a subagent that announces again keeps that reply.
+        let again = Arc::new(AtomicUsize::new(0));
+        let count = again.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            if system.contains("agent `developer`") {
+                if last_message(req)["content"] == ACTION_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                return text_message("Let's start by executing this command.");
+            }
+            if last_message(req)["role"] == "tool" { text_message("done") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "d", "prompt": "p" }))
+            }
+        }).await;
+        let (_, _) = hardening_run(&base, &skills).await;
+        assert_eq!(again.load(Ordering::SeqCst), 1);
     }
 
     #[test]
