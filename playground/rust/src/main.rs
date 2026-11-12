@@ -599,6 +599,8 @@ async fn run_agent_loop(
     let mut summary_reminded = false;
     // Whether any agent (a subagent too) that ended on "let's start by running X" with no tool call was already told to run it.
     let mut action_reminded = false;
+    // Whether a subagent that ended by asking a question nobody can answer was already told to decide and report.
+    let mut asked_reminded = false;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
         let retrying = retry_after.take();
@@ -792,6 +794,13 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                     top.emitter.delta("\n\n");
                 }
                 messages.push(json!({ "role": "user", "content": SUMMARY_NUDGE }));
+                continue;
+            }
+            // A subagent has no one to ask: a question at the end of its reply is a report not made. Say so, once.
+            if !asked_reminded && depth > 0 && workflow.is_none() && delegation_nudge_on() && asks_the_user(&text) {
+                asked_reminded = true;
+                eprintln!("agent: a subagent ended by asking a question — telling it once that nobody can answer");
+                messages.push(json!({ "role": "user", "content": ASK_NUDGE }));
                 continue;
             }
             // Any agent, a subagent too, that ends on "Let's start by running X" without a tool call has done nothing: say so, once.
@@ -2087,6 +2096,33 @@ If an item is no longer needed, mark it completed or cancelled with TodoWrite an
     )
 }
 
+/// Said once to a subagent that ended by asking a question. It reports to the agent that called it, and nobody answers in between.
+const ASK_NUDGE: &str = "Nobody can answer questions in this run: you report to the agent that called you, and it is waiting for your result. \
+Do not ask. Make the reasonable choice, do the work with tools, and give your report: what you found or did, what changed \
+(files, results), the assumptions you made, and anything still open and why.";
+
+/// Whether a reply ends by asking someone something ("Would you like to continue with this plan?", "Let me know…").
+fn asks_the_user(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(250)..].iter().collect::<String>().to_lowercase().replace('\u{2019}', "'");
+    trimmed.ends_with('?')
+        || ["would you like", "do you want", "shall i", "shall we", "let me know", "please confirm", "please provide", "please specify", "please clarify", "if not, please"]
+            .iter().any(|p| tail.contains(p))
+}
+
+/// Whether the last sentence of a reply is a first-person promise ("I will report back once the implementation is verified.").
+fn ends_on_a_promise(text: &str) -> bool {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let last = flat.rsplit(|c| matches!(c, '.' | '!' | '?')).find(|p| !p.trim().is_empty()).unwrap_or("");
+    let last = last.trim_start_matches(|c: char| !c.is_alphanumeric()).to_lowercase().replace('\u{2019}', "'");
+    // Only the last sentence, and only when the reply does not end on a question mark (that is a question to the user).
+    !flat.ends_with('?') && (last.starts_with("i will ") || last.starts_with("i'll ") || last.starts_with("i will,"))
+}
+
 /// Said once to an agent that ended on "Let's start by running X" (or "let's implement…") without making a tool call.
 const ACTION_NUDGE: &str = "You ended your message by saying what you will do next, but you made no tool call, so nothing was done. \
 If there is work left, call the tool for it now. If you have finished, give your final report instead: what you found or did, \
@@ -2129,7 +2165,7 @@ fn is_weak_finish(text: &str) -> bool {
     // A brief written to another agent instead of a report ("To the Developer Agent: … Execute the investigation now. Task ID: …").
     let brief = lower.lines().any(|l| { let l = l.trim_start_matches(|c: char| !c.is_alphanumeric()); l.starts_with("to the ") && l.contains(" agent") })
         || (tail.contains("execute the") && tail.contains(" now")) || tail.contains("**task id");
-    open_item || talking || waiting || moving_on || brief
+    open_item || talking || waiting || moving_on || brief || ends_on_a_promise(text)
 }
 
 /// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
@@ -3123,13 +3159,14 @@ mod tests {
                 count.fetch_add(1, Ordering::SeqCst);
                 return call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "find dialog", "prompt": "find the attachment dialog" }));
             }
+            if content == SUMMARY_NUDGE { return text_message("The developer found the attachment dialog; nothing else is open."); }
             if last["role"] == "tool" { text_message("The developer found it. I will now review the result.") } else {
                 text_message("1. Task Classification\n2. Execution Strategy: I will delegate a task to a developer.\n3. Initializing")
             }
         }).await;
         let skills = vec![skill("developer", true)];
         let (answer, messages) = hardening_run(&base, &skills).await;
-        assert_eq!(answer.as_deref(), Ok("The developer found it. I will now review the result."), "after delegating it is not reminded again");
+        assert_eq!(answer.as_deref(), Ok("The developer found the attachment dialog; nothing else is open."), "after delegating, ending on \"I will now review\" is asked for the report once");
         assert_eq!(nudges.load(Ordering::SeqCst), 1);
         assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("found it"))), "the task really ran");
 
@@ -3242,6 +3279,56 @@ mod tests {
         }).await;
         let (_, _) = hardening_run(&base, &skills).await;
         assert_eq!(again.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_question_or_a_last_sentence_promise_is_recognised() {
+        assert!(asks_the_user("The plan is ready. Would you like to continue with this plan? If not, please provide additional instructions."));
+        assert!(asks_the_user("Done with the survey. Let me know if you want the tests too."));
+        assert!(asks_the_user("Should the search be case-insensitive?"));
+        assert!(!asks_the_user("The search is case-insensitive; the tests pass."));
+        assert!(!asks_the_user(""));
+        assert!(ends_on_a_promise("Both are in progress. I'll report back when the build passes."));
+        assert!(!ends_on_a_promise("I will keep it short. The dialog is in ui/attach.tsx."));
+        assert!(!ends_on_a_promise("I will write the spec. Shall I proceed?"), "a question is for the user");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_that_ends_by_asking_a_question_is_told_once_to_decide_and_report() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `business_analyst`") {
+                if last["content"] == ASK_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return text_message("The dialog lives in ui/attach.tsx; it needs a sort control and a search box.");
+                }
+                return text_message("The plan is ready. Would you like to continue with this plan? If not, please provide additional instructions.");
+            }
+            if last["role"] == "tool" { text_message("The analyst found the dialog in ui/attach.tsx.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "business_analyst", "description": "d", "prompt": "analyse the dialog" }))
+            }
+        }).await;
+        let skills = vec![skill("business_analyst", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The analyst found the dialog in ui/attach.tsx."));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("needs a sort control"))), "the manager got the report, not the question");
+
+        // The top-level agent may ask the user: it is not told otherwise.
+        let nudged = Arc::new(AtomicUsize::new(0));
+        let count = nudged.clone();
+        let base = scripted_model(move |req| {
+            if last_message(req)["content"] == ASK_NUDGE {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            text_message("Which dialog do you mean? Would you like me to look at both?")
+        }).await;
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("Which dialog do you mean? Would you like me to look at both?"));
+        assert_eq!(nudged.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3402,7 +3489,9 @@ mod tests {
         assert!(is_weak_finish("- [ ] write the tests"));
         assert!(is_weak_finish("**Wait!** I can't do all in one turn. **Executing...** **Actually, I'll do the `Task` first.**"));
         assert!(is_weak_finish("At this stage the following remain in progress:\n* UI\n* tests\n\nOnce the server side is verified, I will move to the frontend implementation phase."));
-        assert!(!is_weak_finish("The developer is done. I will now review the result."), "that promise is left to the delegation reminder");
+        assert!(is_weak_finish("The developer is done. I will now review the result."), "after delegating, a last sentence that promises is not a report");
+        assert!(is_weak_finish("The Developer started the server side.\n\nI will report back once the implementation is verified."));
+        assert!(!is_weak_finish("I will keep the sort stable, as asked. The developer added the dialog in ui/attach.tsx and the tests pass."), "a promise earlier in a report is fine");
         assert!(!is_weak_finish("The developer added the attach dialog in ui/attach.tsx and the tests pass. Three files changed."));
         assert!(!is_weak_finish("Wait times are down 20%: the dialog now loads lazily."), "one word of the self-talk list is not self-talk");
         assert!(!is_weak_finish(""));
