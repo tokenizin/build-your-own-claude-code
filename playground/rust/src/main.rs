@@ -598,9 +598,9 @@ async fn run_agent_loop(
     // Whether an agent that handed work on and then ended on a plan or its own thinking was already told to write the answer.
     let mut summary_reminded = false;
     // Whether any agent (a subagent too) that ended on "let's start by running X" with no tool call was already told to run it.
-    let mut action_reminded = false;
+    let mut action_reminders = 0u32;
     // Whether a subagent that ended by asking a question nobody can answer was already told to decide and report.
-    let mut asked_reminded = false;
+    let mut ask_reminders = 0u32;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
         without_null_content(&mut outgoing);
@@ -801,16 +801,16 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
                 continue;
             }
             // A subagent has no one to ask: a question at the end of its reply is a report not made. Say so, once.
-            if !asked_reminded && depth > 0 && workflow.is_none() && delegation_nudge_on() && asks_the_user(&text) {
-                asked_reminded = true;
+            if ask_reminders < nudge_repeats() && depth > 0 && workflow.is_none() && delegation_nudge_on() && asks_the_user(&text) {
+                ask_reminders += 1;
                 log_nudge("ask", depth, &text);
                 eprintln!("agent: a subagent ended by asking a question — telling it once that nobody can answer");
                 messages.push(json!({ "role": "user", "content": ASK_NUDGE }));
                 continue;
             }
             // Any agent, a subagent too, that ends on "Let's start by running X" without a tool call has done nothing: say so, once.
-            if !action_reminded && workflow.is_none() && delegation_nudge_on() && announces_unstarted_action(&text) {
-                action_reminded = true;
+            if action_reminders < nudge_repeats() && workflow.is_none() && delegation_nudge_on() && announces_unstarted_action(&text) {
+                action_reminders += 1;
                 log_nudge("action", depth, &text);
                 eprintln!("agent: the turn ended on \"let's start...\" with no tool call — reminding it once");
                 if let Some(top) = top {
@@ -2211,6 +2211,13 @@ fn is_weak_finish(text: &str) -> bool {
     open_item || talking || waiting || moving_on || brief || ends_on_a_promise(text)
 }
 
+/// How many times the same reminder may be given to one agent in one run when it ends on the same kind of reply again
+/// (`NOMAD_NUDGE_REPEATS`, default 3, 1 to 5): a model that asks a question or says "let's run X" once often does it again after a
+/// single reminder. Each reminder costs one of the run's steps. Only the "ask" and "action" reminders repeat.
+fn nudge_repeats() -> u32 {
+    env::var("NOMAD_NUDGE_REPEATS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(3).clamp(1, 5)
+}
+
 /// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
 fn delegation_nudge_on() -> bool {
     !matches!(env::var("NOMAD_DELEGATION_NUDGE").ok().as_deref().map(str::trim), Some("off" | "0" | "false"))
@@ -3305,7 +3312,7 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 1);
         assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("sorts by name only"))), "the manager got the subagent's report, not its announcement");
 
-        // Asked once only: a subagent that announces again keeps that reply.
+        // A subagent that announces again after each reminder is reminded up to the cap (3 by default) and then keeps that reply.
         let again = Arc::new(AtomicUsize::new(0));
         let count = again.clone();
         let base = scripted_model(move |req| {
@@ -3321,7 +3328,7 @@ mod tests {
             }
         }).await;
         let (_, _) = hardening_run(&base, &skills).await;
-        assert_eq!(again.load(Ordering::SeqCst), 1);
+        assert_eq!(again.load(Ordering::SeqCst), 3, "the default cap, not a loop");
     }
 
     #[test]
@@ -3425,6 +3432,54 @@ mod tests {
         let (answer, _) = hardening_run(&base, &skills).await;
         assert_eq!(answer.as_deref(), Ok("The developer found the dialog in ui/attach.tsx."));
         assert_eq!(nulls.load(Ordering::SeqCst), 0, "no request carried an assistant message with content: null");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_that_asks_again_after_a_reminder_is_reminded_again_and_then_reports() {
+        // Asks, is reminded, asks again, is reminded again, and then reports: the same reminder twice, a real report at the end.
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `tech-lead`") {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                return text_message(match n {
+                    0 => "The dialog is in ui/attach.tsx. Would you like me to proceed with subtasks?",
+                    1 => "I checked the filesystem helpers. Would you like me to create the subtasks now?",
+                    _ => "The dialog is in ui/attach.tsx; the search helper is searchWorkspaceFiles in server/src/filesystem. A sort control and a search box are needed.",
+                });
+            }
+            if last["role"] == "tool" { text_message("The tech-lead found the dialog and the search helper.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "tech-lead", "description": "d", "prompt": "investigate the dialog" }))
+            }
+        }).await;
+        let skills = vec![skill("tech-lead", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The tech-lead found the dialog and the search helper."));
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "the original reply plus two reminders, then the report");
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("searchWorkspaceFiles"))), "the manager got the real report");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_that_keeps_asking_is_reminded_up_to_the_cap_and_no_further() {
+        let reminders = Arc::new(AtomicUsize::new(0));
+        let count = reminders.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            if system.contains("agent `business_analyst`") {
+                if last_message(req)["content"] == ASK_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                return text_message("The plan is ready. Would you like to continue with this plan?");
+            }
+            if last_message(req)["role"] == "tool" { text_message("done") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "business_analyst", "description": "d", "prompt": "p" }))
+            }
+        }).await;
+        let skills = vec![skill("business_analyst", true)];
+        let (_, _) = hardening_run(&base, &skills).await;
+        assert_eq!(reminders.load(Ordering::SeqCst), 3, "exactly the cap: no endless loop");
     }
 
     #[test]
