@@ -603,6 +603,7 @@ async fn run_agent_loop(
     let mut asked_reminded = false;
     for _ in 0..step_cap {
         let mut outgoing = inputs::merge_system_messages(messages);
+        without_null_content(&mut outgoing);
         let retrying = retry_after.take();
         // For this request only: the nudge is not part of the conversation.
         if retrying.is_some() {
@@ -769,6 +770,7 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // (A workflow session has its own reminders, for its handover.)
             if !reminded && !handed_on && workflow.is_none() && delegation_nudge_on() && can_hand_on(tools.as_ref()) && announces_unstarted_work(&text) {
                 reminded = true;
+                log_nudge("delegation", depth, &text);
                 eprintln!("agent: the turn ended on a promise of work with no tool call — reminding it once");
                 if let Some(top) = top {
                     top.emitter.delta("\n\n");
@@ -779,6 +781,7 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // A turn that ends with the agent's own todo list unfinished has not ended: say so once.
             if !todo_reminded && !open_todos.is_empty() && workflow.is_none() && delegation_nudge_on() {
                 todo_reminded = true;
+                log_nudge("todo", depth, &text);
                 eprintln!("agent: the turn ended with {} unfinished todo item(s) and no tool call — reminding it once", open_todos.len());
                 if let Some(top) = top {
                     top.emitter.delta("\n\n");
@@ -789,6 +792,7 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // An agent that handed work on and then ends on a plan, an open checklist or its own thinking has not answered: say so, once.
             if !summary_reminded && handed_on && workflow.is_none() && delegation_nudge_on() && is_weak_finish(&text) {
                 summary_reminded = true;
+                log_nudge("summary", depth, &text);
                 eprintln!("agent: the turn ended after handing work on without an answer (a plan or its own thinking) — asking for the answer once");
                 if let Some(top) = top {
                     top.emitter.delta("\n\n");
@@ -799,6 +803,7 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // A subagent has no one to ask: a question at the end of its reply is a report not made. Say so, once.
             if !asked_reminded && depth > 0 && workflow.is_none() && delegation_nudge_on() && asks_the_user(&text) {
                 asked_reminded = true;
+                log_nudge("ask", depth, &text);
                 eprintln!("agent: a subagent ended by asking a question — telling it once that nobody can answer");
                 messages.push(json!({ "role": "user", "content": ASK_NUDGE }));
                 continue;
@@ -806,6 +811,7 @@ Choose another model for this agent, or limit its thinking (NOMAD_THINKING=off o
             // Any agent, a subagent too, that ends on "Let's start by running X" without a tool call has done nothing: say so, once.
             if !action_reminded && workflow.is_none() && delegation_nudge_on() && announces_unstarted_action(&text) {
                 action_reminded = true;
+                log_nudge("action", depth, &text);
                 eprintln!("agent: the turn ended on \"let's start...\" with no tool call — reminding it once");
                 if let Some(top) = top {
                     top.emitter.delta("\n\n");
@@ -2096,6 +2102,43 @@ If an item is no longer needed, mark it completed or cancelled with TodoWrite an
     )
 }
 
+/// Some servers (a stricter route behind Ollama, for one) refuse `"content": null` ("invalid message content type: <nil>") on an assistant
+/// message that only carries tool calls. An empty string is accepted everywhere the null is.
+fn without_null_content(messages: &mut [Value]) {
+    for m in messages.iter_mut() {
+        if m["role"].as_str() == Some("assistant") && m["content"].is_null() {
+            m["content"] = Value::String(String::new());
+        }
+    }
+}
+
+/// One JSON line for the reminder log: when (ms since the epoch), which reminder, how deep the agent is (0 = the one the user talks
+/// to, more = a subagent), and the end of the reply that triggered it.
+fn nudge_line(kind: &str, depth: u8, text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(160)..].iter().collect();
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    json!({ "t": at, "kind": kind, "depth": depth, "tail": tail }).to_string()
+}
+
+fn append_line(path: &str, line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// `NOMAD_NUDGE_LOG=<file>`: every reminder the agent gives is appended to that file, so a test can tell a model that was reminded and
+/// repeated itself from one that was never reminded. Nothing is written without it, and the transcript is not changed.
+fn log_nudge(kind: &str, depth: u8, text: &str) {
+    if let Ok(path) = env::var("NOMAD_NUDGE_LOG") {
+        if !path.trim().is_empty() {
+            append_line(path.trim(), &nudge_line(kind, depth, text));
+        }
+    }
+}
+
 /// Said once to a subagent that ended by asking a question. It reports to the agent that called it, and nobody answers in between.
 const ASK_NUDGE: &str = "Nobody can answer questions in this run: you report to the agent that called you, and it is waiting for your result. \
 Do not ask. Make the reasonable choice, do the work with tools, and give your report: what you found or did, what changed \
@@ -3329,6 +3372,59 @@ mod tests {
         let (answer, _) = hardening_run(&base, &skills).await;
         assert_eq!(answer.as_deref(), Ok("Which dialog do you mean? Would you like me to look at both?"));
         assert_eq!(nudged.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_reminder_is_logged_as_one_json_line_and_null_content_becomes_empty() {
+        let line = nudge_line("ask", 2, "The plan is ready.\n\nWould   you like to continue?");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "ask");
+        assert_eq!(v["depth"], 2);
+        assert_eq!(v["tail"], "The plan is ready. Would you like to continue?");
+        assert!(v["t"].as_u64().unwrap() > 1_600_000_000_000);
+
+        let path = std::env::temp_dir().join(format!("nudge-log-{}.jsonl", std::process::id()));
+        let path = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+        append_line(&path, &line);
+        append_line(&path, &nudge_line("summary", 0, "x"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let _ = std::fs::remove_file(&path);
+        // A long reply keeps only its end.
+        let long = "word ".repeat(200);
+        assert!(serde_json::from_str::<Value>(&nudge_line("action", 0, &long)).unwrap()["tail"].as_str().unwrap().chars().count() <= 160);
+
+        let mut messages = vec![
+            json!({ "role": "assistant", "content": null, "tool_calls": [{ "id": "1" }] }),
+            json!({ "role": "assistant", "content": "kept" }),
+            json!({ "role": "tool", "content": "out" }),
+        ];
+        without_null_content(&mut messages);
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["content"], "kept");
+        assert!(messages[2]["content"] == "out");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_call_with_no_text_is_never_sent_back_with_null_content() {
+        let nulls = Arc::new(AtomicUsize::new(0));
+        let count = nulls.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let seen = req["messages"].as_array().map(|ms| ms.iter().filter(|m| m["role"] == "assistant" && m["content"].is_null()).count()).unwrap_or(0);
+            count.fetch_add(seen, Ordering::SeqCst);
+            if system.contains("agent `developer`") {
+                return text_message("found it in ui/attach.tsx");
+            }
+            if last_message(req)["role"] == "tool" { text_message("The developer found the dialog in ui/attach.tsx.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "d", "prompt": "p" }))
+            }
+        }).await;
+        let skills = vec![skill("developer", true)];
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found the dialog in ui/attach.tsx."));
+        assert_eq!(nulls.load(Ordering::SeqCst), 0, "no request carried an assistant message with content: null");
     }
 
     #[test]
