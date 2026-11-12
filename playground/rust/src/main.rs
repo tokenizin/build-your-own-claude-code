@@ -7,6 +7,7 @@ mod file_lease;
 mod handover;
 mod inputs;
 mod lanes;
+mod context;
 mod nomad_tools;
 mod opencode_config;
 mod patch;
@@ -1243,6 +1244,12 @@ async fn run_delegated(
         Some(model) => cfg.with_model(model),
         None => cfg.clone(),
     };
+    // A model whose context window is below the floor (NOMAD_MIN_CONTEXT, default 33K and under) is not used: the fallback model runs instead.
+    let task_cfg = match context::usable_model(&task_cfg, &task_cfg.model).await {
+        Ok(usable) if usable != task_cfg.model => task_cfg.with_model(usable),
+        Ok(_) => task_cfg,
+        Err(message) => return (Err(message), messages),
+    };
     eprintln!("{mode} `{}` ({task_id}): model {}", skill.name, task_cfg.model);
 
     // Protocol 2: this run's events are stamped with its id and go to the UI live.
@@ -1964,6 +1971,11 @@ async fn handle_skill(
             Some(model) => cfg.with_model(model),
             None => cfg.clone(),
         };
+        let fork_cfg = match context::usable_model(&fork_cfg, &fork_cfg.model).await {
+            Ok(usable) if usable != fork_cfg.model => fork_cfg.with_model(usable),
+            Ok(_) => fork_cfg,
+            Err(message) => return Ok(format!("Error: {message}")),
+        };
         if fork_cfg.model != cfg.model {
             eprintln!("fork `{}`: model {}", skill.name, fork_cfg.model);
         }
@@ -2379,7 +2391,8 @@ async fn main() -> std::process::ExitCode {
         // Context sizes, best effort: an endpoint that is not Ollama simply has none to give.
         let wanted = catalog::merge_models(&cfg.model, listed.as_deref().unwrap_or_default(), &skills);
         let contexts = fetch_contexts(&base, &cfg.api_key, &wanted).await;
-        let catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed, &contexts);
+        let mut catalog = catalog::build_catalog(&cfg.model, &base, &skills, listed, &contexts);
+        catalog::drop_small_contexts(&mut catalog, context::min_context(), &opencode_config::load_adapter().default_fork_model);
         println!("{catalog}");
         return ExitCode::SUCCESS;
     }
@@ -2424,6 +2437,7 @@ async fn main() -> std::process::ExitCode {
         // The model the runner really runs on (its own pin, as remapped for this endpoint), not the endpoint's default: the
         // page labels the runner's replies with what these events say.
         let runner_model = workflow_runner_model(&skills, &cfg);
+        let runner_model = context::usable_model(&cfg, &runner_model).await.unwrap_or(runner_model);
         if stream_mode {
             emitter.emit(json!({
                 "type": "meta",
@@ -2463,6 +2477,10 @@ async fn main() -> std::process::ExitCode {
         eprintln!("model: {}", cfg.model);
         cfg
     };
+
+    if let Err(message) = context::refuse_if_small(&run_cfg, &run_cfg.model).await {
+        return fail(2, message);
+    }
 
     let mut messages = initial.messages;
     if !args.images.is_empty() {
@@ -3612,6 +3630,51 @@ mod tests {
         assert_eq!(execute_bash(&json!({ "command": "true" })), "(the command succeeded and printed nothing)");
         assert_eq!(execute_bash(&json!({ "command": "echo hi" })), "hi\n");
         assert!(is_search_command("cat a | grep b") && is_search_command("cd x && find . -name y") && !is_search_command("echo grepper"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_agent_on_a_model_below_the_context_floor_runs_on_the_fallback_model() {
+        let used = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = used.clone();
+        let base = scripted_model(move |req| {
+            // Ollama's /api/show (no messages): the small model is set to a window of 8,192, anything else is big.
+            if req.get("messages").is_none() {
+                let body = if req["model"] == "tiny-window:7b" { json!({ "parameters": "num_ctx 8192" }) } else { json!({ "model_info": { "gemma4.context_length": 262144 } }) };
+                return json!({ "__status": 200, "__body": body });
+            }
+            let system = system_text(req);
+            if system.contains("agent `developer`") {
+                record.lock().unwrap().push(req["model"].as_str().unwrap_or("").to_string());
+                return text_message("The dialog is in ui/attach.tsx; the search helper is searchWorkspaceFiles.");
+            }
+            if last_message(req)["role"] == "tool" { text_message("The developer found the dialog.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "developer", "description": "d", "prompt": "find the dialog" }))
+            }
+        }).await;
+        let mut developer = skill("developer", true);
+        developer.model = Some("tiny-window:7b".into());
+        let (answer, messages) = hardening_run(&base, &[developer]).await;
+        assert_eq!(answer.as_deref(), Ok("The developer found the dialog."));
+        let used = used.lock().unwrap().clone();
+        assert!(!used.is_empty() && used.iter().all(|m| m == "gemma4:26b"), "the developer ran on the fallback, not on the 8K model: {used:?}");
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("searchWorkspaceFiles"))), "and it reported");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_asked_to_use_a_model_below_the_context_floor_is_refused_with_the_reason() {
+        let base = scripted_model(|req| {
+            if req.get("messages").is_none() {
+                let body = if req["model"] == "tiny-refuse:1b" { json!({ "parameters": "num_ctx 4096" }) } else { json!({}) };
+                return json!({ "__status": 200, "__body": body });
+            }
+            text_message("unused")
+        }).await;
+        let cfg = LlmConfig { base_url: base.clone(), fallback_base_url: base, api_key: "k".into(), model: "tiny-refuse:1b".into(), max_tokens: 256 };
+        let refused = context::refuse_if_small(&cfg, "tiny-refuse:1b").await;
+        let message = refused.expect_err("a 4,096-token model is refused");
+        assert!(message.contains("tiny-refuse:1b") && message.contains("4096") && message.contains("NOMAD_MIN_CONTEXT"), "{message}");
+        // A model that does not say its window (no /api/show answer with one) is let through.
+        assert!(context::refuse_if_small(&cfg, "unknown-window:3b").await.is_ok());
     }
 
     #[test]

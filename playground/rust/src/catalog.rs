@@ -45,6 +45,45 @@ pub fn context_from_show(body: &Value) -> Option<u64> {
     configured.or(trained).filter(|n| *n > 0)
 }
 
+/// Takes the models whose context window is known and below `floor` out of a catalog (the pickers must not offer them), lists them under
+/// `tooSmall`, and puts `fallback` in place of one as the default model or as an agent's model. `floor` 0 leaves the catalog as it is.
+pub fn drop_small_contexts(catalog: &mut Value, floor: u64, fallback: &str) {
+    if floor == 0 {
+        return;
+    }
+    let small: Vec<String> = catalog["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter(|m| m["context"].as_u64().is_some_and(|c| c < floor))
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if small.is_empty() {
+        return;
+    }
+    let dropped: Vec<Value> = catalog["models"]
+        .as_array()
+        .map(|models| models.iter().filter(|m| m["id"].as_str().is_some_and(|id| small.iter().any(|s| s == id))).cloned().collect())
+        .unwrap_or_default();
+    if let Some(models) = catalog["models"].as_array_mut() {
+        models.retain(|m| !m["id"].as_str().is_some_and(|id| small.iter().any(|s| s == id)));
+    }
+    catalog["tooSmall"] = json!({ "floor": floor, "models": dropped });
+    if catalog["model"].as_str().is_some_and(|m| small.iter().any(|s| s == m)) {
+        catalog["model"] = json!(fallback);
+    }
+    if let Some(agents) = catalog["agents"].as_array_mut() {
+        for agent in agents {
+            if agent["model"].as_str().is_some_and(|m| small.iter().any(|s| s == m)) {
+                agent["model"] = json!(fallback);
+            }
+        }
+    }
+}
+
 pub fn is_agent(skill: &Skill) -> bool {
     skill.context.as_deref() == Some("fork")
 }
@@ -114,6 +153,26 @@ mod tests {
         let body = json!({"object":"list","data":[{"id":"a"},{"id":"b"}]});
         assert_eq!(parse_model_list(&body).unwrap(), vec!["a", "b"]);
         assert!(parse_model_list(&json!({"x":1})).is_err());
+    }
+
+    #[test]
+    fn a_model_below_the_floor_is_not_offered_and_agents_move_to_the_fallback() {
+        let skills = vec![skill("developer", true, Some("qwen2.5:14b")), skill("pma", true, Some("qwen3:8b")), skill("cto", true, Some("gemma4:26b"))];
+        let contexts = HashMap::from([("qwen2.5:14b".to_string(), 32_768), ("qwen3:8b".to_string(), 40_960), ("gemma4:26b".to_string(), 262_144)]);
+        let mut cat = build_catalog("qwen2.5:14b", "http://x/v1", &skills, Ok(vec!["qwen2.5:14b".into(), "qwen3:8b".into(), "gemma4:26b".into()]), &contexts);
+        drop_small_contexts(&mut cat, 32_769, "gemma4:26b");
+        let mut ids: Vec<&str> = cat["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["gemma4:26b", "qwen3:8b"], "the 33K model is gone, the other two stay");
+        assert_eq!(cat["tooSmall"]["models"][0]["id"], "qwen2.5:14b");
+        assert_eq!(cat["model"], "gemma4:26b", "the default model was a small one");
+        let model_of = |name: &str| cat["agents"].as_array().unwrap().iter().find(|a| a["name"] == name).unwrap()["model"].clone();
+        assert_eq!(model_of("developer"), "gemma4:26b", "an agent on a small model moves to the fallback");
+        assert_eq!(model_of("pma"), "qwen3:8b", "40,960 is above the floor");
+        // Floor 0: the catalog is left alone.
+        let mut all = build_catalog("qwen2.5:14b", "http://x/v1", &skills, Ok(vec!["qwen2.5:14b".into()]), &contexts);
+        drop_small_contexts(&mut all, 0, "gemma4:26b");
+        assert!(all.get("tooSmall").is_none() && all["model"] == "qwen2.5:14b");
     }
 
     #[test]
