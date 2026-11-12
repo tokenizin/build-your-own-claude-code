@@ -2076,10 +2076,11 @@ If an item is no longer needed, mark it completed or cancelled with TodoWrite an
 }
 
 /// Said once to an agent that handed work on and then ended on a plan or on its own thinking.
-const SUMMARY_NUDGE: &str = "The specialists you delegated to have reported back. Your last message is not an answer: it is a plan, a checklist \
-with open items, or you thinking aloud. Write your final answer to the user now, in plain prose: what each specialist found or did, \
-what changed (files, results), and anything still open and why. No checklist, no \"Wait\" or \"Executing\", and no further tool calls unless a \
-result is missing and you cannot answer without it.";
+const SUMMARY_NUDGE: &str = "Your last message is not an answer: it is a plan, a checklist with open items, a status report that says work is \
+still in progress, or you thinking aloud. The specialists you delegated to have finished and reported back. If work remains, do it now: \
+call the tools it needs (delegate with Task; several Task calls in one reply run at the same time). If it is done, write your final answer \
+in plain prose: what each specialist found or did, what changed (files, results), and anything still open and why. \
+No checklist, and no \"Wait\" or \"Executing\".";
 
 /// Whether a final reply is a plan or the model's own thinking, not an answer: an unfinished checklist item, a promise of work
 /// still to do, or the self-talk local models leak ("**Wait!**", "**Executing...**", "**Actually, I'll ...**").
@@ -2094,7 +2095,9 @@ fn is_weak_finish(text: &str) -> bool {
     // Waiting for a report that has already come in ("I am currently waiting for the Developer's implementation report").
     let tail: String = lower.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
     let waiting = ["i am currently waiting", "i'm currently waiting", "i am waiting for", "i'm waiting for", "waiting for the developer", "waiting for the report"].iter().any(|p| tail.contains(p));
-    open_item || talking || waiting
+    // A status report that hands the rest to a later turn that never comes ("I will move to the frontend phase", "remain in progress").
+    let moving_on = ["i will move to", "i'll move to", "i will then move", "next, i will", "next i will", "remain in progress", "remains in progress", "still in progress", "currently working on"].iter().any(|p| tail.contains(p));
+    open_item || talking || waiting || moving_on
 }
 
 /// `NOMAD_DELEGATION_NUDGE=off` switches the reminders off (the promise of work, and the unfinished todo list).
@@ -3312,6 +3315,8 @@ mod tests {
         assert!(is_weak_finish("Plan:\n- [in_progress] Create a rigorous technical implementation plan for `file-attachment-dialog.tsx`"));
         assert!(is_weak_finish("- [ ] write the tests"));
         assert!(is_weak_finish("**Wait!** I can't do all in one turn. **Executing...** **Actually, I'll do the `Task` first.**"));
+        assert!(is_weak_finish("At this stage the following remain in progress:\n* UI\n* tests\n\nOnce the server side is verified, I will move to the frontend implementation phase."));
+        assert!(!is_weak_finish("The developer is done. I will now review the result."), "that promise is left to the delegation reminder");
         assert!(!is_weak_finish("The developer added the attach dialog in ui/attach.tsx and the tests pass. Three files changed."));
         assert!(!is_weak_finish("Wait times are down 20%: the dialog now loads lazily."), "one word of the self-talk list is not self-talk");
         assert!(!is_weak_finish(""));
