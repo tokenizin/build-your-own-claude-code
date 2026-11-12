@@ -300,6 +300,35 @@ fn execute_write(args: &Value) -> String {
     }
 }
 
+/// Whether a shell command is a search (grep, find, ...): when one prints nothing, that is an answer about the files, not an error.
+fn is_search_command(command: &str) -> bool {
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, '|' | '&' | ';' | '(' | ')'))
+        .any(|word| matches!(word, "grep" | "egrep" | "fgrep" | "rg" | "find" | "ack" | "fd" | "ag"))
+}
+
+/// What the model is told when a command printed nothing. A bare "Command failed with exit code 1" (what `grep` gives for "no matches") or an empty
+/// string leaves a small model with nothing to go on, and it tends to write a conclusion and stop. Say what the silence means and where the
+/// command ran, and for a search show what is at the top of that folder so the next call can use the right path.
+fn empty_command_note(command: &str, code: Option<i32>, success: bool, cwd: &Path) -> String {
+    let search = is_search_command(command);
+    let mut out = if success {
+        "(the command succeeded and printed nothing)".to_string()
+    } else if search && code == Some(1) {
+        "Command exited with code 1 and printed nothing: for grep, find and similar that means NO MATCHES, not a failure of the command.".to_string()
+    } else {
+        format!("Command failed with exit code {}", code.unwrap_or(-1))
+    };
+    if search && (success || code == Some(1)) {
+        out.push_str(&format!(" Working directory: {}. Do not stop here: try a shorter or case-insensitive pattern, another path, or the Glob tool.", cwd.display()));
+        let top = tools::top_level(cwd);
+        if !top.is_empty() {
+            out.push_str(&format!(" Top level: {top}"));
+        }
+    }
+    out
+}
+
 fn execute_bash(args: &Value) -> String {
     let command = args["command"].as_str().unwrap_or("");
     let cwd = env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
@@ -318,11 +347,8 @@ fn execute_bash(args: &Value) -> String {
                 }
                 text.push_str(stderr.trim_end());
             }
-            if !output.status.success() && text.is_empty() {
-                text = format!(
-                    "Command failed with exit code {}",
-                    output.status.code().unwrap_or(-1)
-                );
+            if text.is_empty() {
+                text = empty_command_note(command, output.status.code(), output.status.success(), &cwd);
             }
             text
         }
@@ -3570,6 +3596,22 @@ mod tests {
         }).await;
         let (_, _) = hardening_run(&base, &[]).await;
         assert_eq!(nudged.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_command_that_prints_nothing_says_what_that_means_and_where_it_ran() {
+        // The pattern is put together here so that it never appears in one piece in the files the grep reads (this one included).
+        let needle = ["zzz-no-such", "-text-anywhere-77"].concat();
+        let none = execute_bash(&json!({ "command": format!("grep -r {needle} src") }));
+        assert!(none.contains("NO MATCHES") && none.contains("Working directory") && none.contains("Top level:"), "{none}");
+        assert!(none.contains("src/") || none.contains("Cargo.toml"), "it lists what is there: {none}");
+        let found_nothing = execute_bash(&json!({ "command": "find . -name 'zzz-no-such-file-77*'" }));
+        assert!(found_nothing.contains("printed nothing") && found_nothing.contains("Working directory"), "{found_nothing}");
+        // Not a search: a plain failure keeps its short message, a success with no output says so, and real output is untouched.
+        assert_eq!(execute_bash(&json!({ "command": "exit 3" })), "Command failed with exit code 3");
+        assert_eq!(execute_bash(&json!({ "command": "true" })), "(the command succeeded and printed nothing)");
+        assert_eq!(execute_bash(&json!({ "command": "echo hi" })), "hi\n");
+        assert!(is_search_command("cat a | grep b") && is_search_command("cd x && find . -name y") && !is_search_command("echo grepper"));
     }
 
     #[test]

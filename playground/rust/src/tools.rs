@@ -386,6 +386,30 @@ pub fn edit(args: &Value) -> String {
 const MAX_RESULTS: usize = 100;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// What is at the top of `root`, for a search that found nothing: a model that is told only "No matches found." tends to take it as the
+/// answer and stop, or to guess another path. Directories first (with a trailing `/`), hidden and installed/built folders left out, at most 20.
+pub fn top_level(root: &Path) -> String {
+    let Ok(read) = fs::read_dir(root) else { return String::new() };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build") {
+            continue;
+        }
+        if entry.path().is_dir() { dirs.push(format!("{name}/")) } else { files.push(name) }
+    }
+    dirs.sort();
+    files.sort();
+    let all: Vec<String> = dirs.into_iter().chain(files).collect();
+    let shown: Vec<&str> = all.iter().take(20).map(String::as_str).collect();
+    let more = all.len().saturating_sub(shown.len());
+    if shown.is_empty() {
+        return String::new();
+    }
+    format!("{}{}", shown.join(", "), if more > 0 { format!(", ... and {more} more") } else { String::new() })
+}
+
 fn walker(root: &Path) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -439,6 +463,7 @@ pub fn grep(args: &Value) -> String {
 
     let mut found: Vec<(PathBuf, Vec<(usize, String)>)> = Vec::new();
     let mut total = 0usize;
+    let mut searched = 0usize;
     'files: for entry in walker(&root).build().flatten() {
         let file = entry.path();
         if !file.is_file() {
@@ -457,6 +482,7 @@ pub fn grep(args: &Value) -> String {
         if bytes.iter().take(8000).any(|b| *b == 0) {
             continue; // binary
         }
+        searched += 1;
         let text = String::from_utf8_lossy(&bytes);
         let mut hits = Vec::new();
         for (i, line) in text.lines().enumerate() {
@@ -475,7 +501,18 @@ pub fn grep(args: &Value) -> String {
         }
     }
     if total == 0 {
-        return "No matches found.".into();
+        let mut out = format!("No matches found for `{pattern}` in {} ({searched} file{} searched", root.display(), if searched == 1 { "" } else { "s" });
+        if let Some((_, raw)) = &include {
+            out.push_str(&format!(", only files matching `{raw}`"));
+        }
+        out.push_str("). The call worked: the pattern is not in those files. Do not stop here: try a shorter or case-insensitive pattern (`(?i)word`), a different `path` or `include`, or list what is there with Glob.");
+        if root.is_dir() {
+            let top = top_level(&root);
+            if !top.is_empty() {
+                out.push_str(&format!(" Top level of {}: {top}", root.display()));
+            }
+        }
+        return out;
     }
     let mut out = format!("Found {total} match{}", if total == 1 { "" } else { "es" });
     if total >= MAX_RESULTS {
@@ -513,7 +550,16 @@ pub fn glob(args: &Value) -> String {
         }
     }
     if files.is_empty() {
-        return "No files found".into();
+        let mut out = format!("No files found for `{}` under {}.", pattern.trim(), root.display());
+        if pattern.contains('/') {
+            out.push_str(" A pattern with a slash matches the path under that folder; a pattern without one (`*.tsx`, `name*`) matches names at any depth.");
+        }
+        out.push_str(" Do not stop here: try a broader pattern (for example `**/*name*`) or another `path`.");
+        let top = top_level(&root);
+        if !top.is_empty() {
+            out.push_str(&format!(" Top level of {}: {top}", root.display()));
+        }
+        return out;
     }
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let truncated = files.len() > MAX_RESULTS;
@@ -1132,7 +1178,9 @@ pub(crate) mod tests {
         assert!(re.contains("Line 2: const Beta = 2"), "{re}");
         let ci = grep(&json!({ "pattern": "(?i)BETA", "path": s(&dir) }));
         assert!(ci.contains("Beta"), "{ci}");
-        assert_eq!(grep(&json!({ "pattern": "zzz-nothing", "path": s(&dir) })), "No matches found.");
+        let none = grep(&json!({ "pattern": "zzz-nothing", "path": s(&dir) }));
+        assert!(none.starts_with("No matches found for `zzz-nothing`"), "{none}");
+        assert!(none.contains("Do not stop here") && none.contains("searched"), "{none}");
         assert!(grep(&json!({ "pattern": "(unclosed", "path": s(&dir) })).starts_with("Error: invalid regular expression"));
         assert!(grep(&json!({ "pattern": "a", "path": s(&dir.join("nope")) })).contains("does not exist"));
         assert!(grep(&json!({ "pattern": "" })).starts_with("Error: Grep requires"));
@@ -1162,7 +1210,7 @@ pub(crate) mod tests {
         let only_top = glob(&json!({ "pattern": "src/*.ts", "path": s(&dir) }));
         assert!(only_top.contains("a.ts") && !only_top.contains("b.ts"), "{only_top}");
         let ignored = glob(&json!({ "pattern": "*.js", "path": s(&dir) }));
-        assert_eq!(ignored, "No files found", "node_modules and build/ are skipped: {ignored}");
+        assert!(ignored.starts_with("No files found for"), "node_modules and build/ are skipped: {ignored}");
         assert!(glob(&json!({ "pattern": "[", "path": s(&dir) })).starts_with("Error: invalid glob"));
         assert!(glob(&json!({ "pattern": "*", "path": s(&dir.join("src/a.ts")) })).contains("not a directory"));
         let _ = fs::remove_dir_all(dir);
