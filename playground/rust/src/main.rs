@@ -2199,7 +2199,7 @@ Do not ask. Make the reasonable choice, do the work with tools, and give your re
 (files, results), the assumptions you made, and anything still open and why.";
 
 /// Whether a reply ends by asking someone something ("Would you like to continue with this plan?", "Let me know…").
-fn asks_the_user(text: &str) -> bool {
+pub(crate) fn asks_the_user(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return false;
@@ -2209,6 +2209,23 @@ fn asks_the_user(text: &str) -> bool {
     trimmed.ends_with('?')
         || ["would you like", "do you want", "shall i", "shall we", "let me know", "please confirm", "please provide", "please specify", "please clarify", "if not, please"]
             .iter().any(|p| tail.contains(p))
+        || waits_for_an_answer(trimmed, &tail)
+}
+
+/// A reply that stops until someone answers, without a question mark at the end: "Once you clarify these 3 points, I will
+/// immediately generate the full Design Brief", "Awaiting your decision", or an "ACTION REQUIRED: Clarification…" heading
+/// with questions under it. `tail` is the lower-cased end of the reply.
+fn waits_for_an_answer(text: &str, tail: &str) -> bool {
+    const CONDITIONAL: [&str; 12] = [
+        "once you clarify", "once you confirm", "once you decide", "once you provide", "once you answer", "once you approve",
+        "once i have your", "once i receive your", "awaiting your", "waiting for your", "i need your decision", "i cannot proceed without",
+    ];
+    if CONDITIONAL.iter().any(|p| tail.contains(p)) {
+        return true;
+    }
+    // A heading that demands an answer, with at least one question in the reply.
+    let lower = text.to_lowercase();
+    ["action required", "clarification required", "clarification needed", "decision required", "decisions needed"].iter().any(|p| lower.contains(p)) && lower.contains('?')
 }
 
 /// Whether the last sentence of a reply is a first-person promise ("I will report back once the implementation is verified.").
@@ -2275,7 +2292,9 @@ fn subagent_announces_step(text: &str) -> bool {
 /// Said once to an agent that handed work on and then ended on a plan or on its own thinking.
 const SUMMARY_NUDGE: &str = "Your last message is not an answer: it is a plan, a checklist with open items, a status report that says work is \
 still in progress, or you thinking aloud. The specialists you delegated to have finished and reported back. If work remains, do it now: \
-call the tools it needs (delegate with Task; several Task calls in one reply run at the same time). If it is done, write your final answer \
+call the tools it needs (delegate with Task; several Task calls in one reply run at the same time). A specialist never sees what you write \
+here: if one asked you something, or you have instructions for it, call Task again with its task_id and put your answer in the prompt. \
+If it is done, write your final answer \
 in plain prose: what each specialist found or did, what changed (files, results), and anything still open and why. \
 No checklist, and no \"Wait\" or \"Executing\".";
 
@@ -2291,12 +2310,20 @@ fn is_weak_finish(text: &str) -> bool {
     let talking = SELF_TALK.iter().filter(|p| lower.contains(*p)).count() >= 2;
     // Waiting for a report that has already come in ("I am currently waiting for the Developer's implementation report").
     let tail: String = lower.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-    let waiting = ["i am currently waiting", "i'm currently waiting", "i am waiting for", "i'm waiting for", "waiting for the developer", "waiting for the report"].iter().any(|p| tail.contains(p));
+    let waiting = [
+        "i am currently waiting", "i'm currently waiting", "i am waiting for", "i'm waiting for", "waiting for the developer", "waiting for the report",
+        // "Standing by for the completed Implementation and Evidence Packet": nothing is running that could deliver it.
+        "standing by", "i await ", "awaiting the ", "awaiting your report", "awaiting completion",
+    ].iter().any(|p| tail.contains(p));
     // A status report that hands the rest to a later turn that never comes ("I will move to the frontend phase", "remain in progress").
     let moving_on = ["i will move to", "i'll move to", "i will then move", "next, i will", "next i will", "remain in progress", "remains in progress", "still in progress", "currently working on"].iter().any(|p| tail.contains(p));
     // A brief written to another agent instead of a report ("To the Developer Agent: … Execute the investigation now. Task ID: …").
-    let brief = lower.lines().any(|l| { let l = l.trim_start_matches(|c: char| !c.is_alphanumeric()); l.starts_with("to the ") && l.contains(" agent") })
-        || (tail.contains("execute the") && tail.contains(" now")) || tail.contains("**task id");
+    let brief = lower.lines().any(|l| {
+        let l = l.trim_start_matches(|c: char| !c.is_alphanumeric());
+        // "To the Developer Agent: …", or a heading "Instructions to `ui_ux_designer`" / "Final Directive:" with the brief under it.
+        (l.starts_with("to the ") && l.contains(" agent")) || l.starts_with("instructions to ") || l.starts_with("final directive")
+    }) || (tail.contains("execute the") && tail.contains(" now")) || tail.contains("**task id")
+        || lower.contains("you are cleared to proceed") || lower.contains("you are now cleared to");
     open_item || talking || waiting || moving_on || brief || ends_on_a_promise(text)
 }
 
@@ -3853,6 +3880,101 @@ mod tests {
         assert_eq!(seen.len(), 4);
         let reminder = last_message(&seen[2])["content"].as_str().unwrap_or("").to_string();
         assert!(reminder.contains("still has unfinished items") && reminder.contains("[in_progress] Investigate the dialog") && reminder.contains("[pending] Draft the SCR"), "{reminder}");
+    }
+
+    // The two replies that stalled session ses_lcl_mwdkzl1k59664a401740 (patch 39), as the models wrote them.
+    const DESIGNER_ASKS: &str = "I have performed a preliminary investigation into the design system tokens.\n\n\u{26a0}\u{fe0f} ACTION REQUIRED: Clarification of Implementation Context\n\nI am ready to proceed to Step 1 (Design Brief), but I cannot design the interaction logic without the following decisions from you:\n\n1. Data Source: Should I design for a hardcoded array of objects, or should I specify a JSON schema?\n2. Media Strategy: I will design using placeholders. Is this acceptable?\n3. Vertical Storytelling Depth: Does this mean scroll-triggered entrance animations, or simply a one-column layout on mobile?\n\n**Once you clarify these 3 points, I will immediately generate the full Design Brief and proceed to implementation.**";
+    const MANAGER_STANDS_BY: &str = "The `ui_ux_designer` has requested three critical clarifications.\n\n### Responses to Clarification Requests\n\n1. Data Source: Hardcoded Array.\n2. Media Strategy: High-Quality Placeholders.\n3. Scroll-Triggered Entrance Animations.\n\n### Instructions to `ui_ux_designer`\n\nWith these decisions, you are cleared to proceed immediately to Step 2 and Step 3.\n\n**Final Directive:**\nPlease integrate the discovered premium tokens into your implementation.\n\nStanding by for the completed Implementation and Evidence Packet.";
+
+    #[test]
+    fn a_reply_that_waits_for_an_answer_without_a_question_mark_is_a_question() {
+        assert!(asks_the_user(DESIGNER_ASKS), "ends on 'Once you clarify these 3 points, I will…'");
+        assert!(asks_the_user("The schema is drafted. Awaiting your decision on the migration order."));
+        assert!(asks_the_user("## Decision required\n\nWhich database should the importer write to? Postgres or SQLite.\n\nBoth are supported by the code as it stands."));
+        // A report that only mentions such words is not a question.
+        assert!(!asks_the_user("ACTION REQUIRED labels were removed from the three templates; the tests pass."), "no question in it");
+        let report = format!("Once you clarify a search in the box, results appear below it. {}", "The dialog sorts by name, date and size, and the tests pass. ".repeat(8));
+        assert!(!asks_the_user(&report), "the phrase is not at the end");
+    }
+
+    #[test]
+    fn a_manager_that_stands_by_or_writes_its_instructions_as_text_has_not_answered() {
+        assert!(is_weak_finish(MANAGER_STANDS_BY));
+        assert!(is_weak_finish("The developer has the task. Standing by for its report."));
+        assert!(is_weak_finish("### Instructions to `developer`\n\nUse the existing search helper and add a sort control."));
+        assert!(is_weak_finish("Decisions are made. You are cleared to proceed with the implementation."));
+        assert!(!is_weak_finish("The designer built the gallery in src/pages/projects/index.html with a lightbox; the evidence packet is filed. Nothing is open."));
+    }
+
+    #[test]
+    fn a_task_result_that_ends_on_a_question_says_how_to_answer_it() {
+        let asked = delegation::task_result("task_18e7", DESIGNER_ASKS);
+        assert!(asked.contains("call Task again with task_id \"task_18e7\"") && asked.contains("never see text you write"), "{asked}");
+        assert!(asked.find("</task_result>").unwrap() < asked.find("NOTE:").unwrap(), "the note comes after the agent's own words");
+        let done = delegation::task_result("task_1", "The gallery is built; the tests pass.");
+        assert!(!done.contains("NOTE:"), "{done}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_designer_that_stops_for_clarification_is_told_to_decide_and_then_reports() {
+        // The subagent's first reply is the stalled one; the reminder makes it do the work and report.
+        let reminded = Arc::new(AtomicUsize::new(0));
+        let count = reminded.clone();
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `ui_ux_designer`") {
+                if last["content"] == ASK_NUDGE {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return text_message("I chose a hardcoded array in src/data/projects.js, placeholder media and scroll-triggered entrances. The gallery and lightbox are in src/pages/projects/index.html.");
+                }
+                return text_message(DESIGNER_ASKS);
+            }
+            if last["role"] == "tool" { text_message("The designer built the gallery with a lightbox; nothing is open.") } else {
+                call_message("t1", "Task", json!({ "subagent_type": "ui_ux_designer", "description": "gallery", "prompt": "implement the projects gallery" }))
+            }
+        }).await;
+        let skills = vec![skill("ui_ux_designer", true)];
+        let (answer, messages) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The designer built the gallery with a lightbox; nothing is open."));
+        assert_eq!(reminded.load(Ordering::SeqCst), 1, "reminded once");
+        assert!(messages.iter().any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("src/pages/projects/index.html") && !c.contains("NOTE:"))), "the manager got the report, with no note");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_manager_that_answers_a_specialist_in_prose_is_reminded_and_then_resumes_the_task() {
+        // The specialist keeps asking (every reminder used up), so its question reaches the manager, with the note. The manager
+        // first answers in prose and stands by; reminded, it calls Task again with the task_id, and the specialist finishes.
+        let summary = Arc::new(AtomicUsize::new(0));
+        let resumed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (summary_count, resume_seen) = (summary.clone(), resumed.clone());
+        let base = scripted_model(move |req| {
+            let system = system_text(req);
+            let last = last_message(req);
+            if system.contains("agent `ui_ux_designer`") {
+                let decided = req["messages"].as_array().is_some_and(|all| all.iter().any(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains("Hardcoded array"))));
+                return text_message(if decided { "The gallery and lightbox are in src/pages/projects/index.html; the evidence packet is filed." } else { DESIGNER_ASKS });
+            }
+            if last["content"] == SUMMARY_NUDGE {
+                summary_count.fetch_add(1, Ordering::SeqCst);
+                let tool = req["messages"].as_array().and_then(|all| all.iter().rev().find(|m| m["role"] == "tool")).and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
+                let task_id = tool.strip_prefix("task_id: ").and_then(|rest| rest.split_whitespace().next()).unwrap_or("").to_string();
+                resume_seen.lock().unwrap().push(tool);
+                return call_message("t2", "Task", json!({ "subagent_type": "ui_ux_designer", "description": "answers", "prompt": "Hardcoded array, placeholders, scroll-triggered entrances. Finish without asking again.", "task_id": task_id }));
+            }
+            if last["role"] == "tool" {
+                let content = last["content"].as_str().unwrap_or("");
+                if content.contains("evidence packet is filed") { text_message("The designer built the gallery; the evidence packet is filed. Nothing is open.") } else { text_message(MANAGER_STANDS_BY) }
+            } else {
+                call_message("t1", "Task", json!({ "subagent_type": "ui_ux_designer", "description": "gallery", "prompt": "implement the projects gallery" }))
+            }
+        }).await;
+        let skills = vec![skill("ui_ux_designer", true)];
+        let (answer, _) = hardening_run(&base, &skills).await;
+        assert_eq!(answer.as_deref(), Ok("The designer built the gallery; the evidence packet is filed. Nothing is open."));
+        assert_eq!(summary.load(Ordering::SeqCst), 1, "the manager was reminded once");
+        let seen = resumed.lock().unwrap();
+        assert!(seen[0].contains("NOTE: this agent stopped and is asking you something") && seen[0].contains("call Task again with task_id"), "the question came with the note: {}", seen[0]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

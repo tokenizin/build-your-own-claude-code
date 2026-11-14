@@ -577,7 +577,17 @@ pub fn save_task(task_id: &str, record: TaskRecord) {
 
 /// The Task tool's result, in OpenCode's shape.
 pub fn task_result(task_id: &str, answer: &str) -> String {
-    format!("task_id: {task_id} (for resuming to continue this task if needed)\n\n<task_result>\n{answer}\n</task_result>")
+    // A specialist that stopped to ask has done nothing more, and it cannot read the manager's reply: say how it is answered.
+    let note = if crate::asks_the_user(answer) {
+        format!(
+            "\n\nNOTE: this agent stopped and is asking you something. It is not running, and it will never see text you write in \
+             your reply. To answer it and have it continue, call Task again with task_id \"{task_id}\" and put your decisions in the prompt \
+             (tell it to finish the work without asking again)."
+        )
+    } else {
+        String::new()
+    };
+    format!("task_id: {task_id} (for resuming to continue this task if needed)\n\n<task_result>\n{answer}\n</task_result>{note}")
 }
 
 #[cfg(test)]
