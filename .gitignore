@@ -28,3 +28,4 @@ playground/persistence/bun.lock
 
 # Python
 __pycache__/
+playground/.env.*
