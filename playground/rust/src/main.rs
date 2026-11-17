@@ -12,6 +12,7 @@ mod nomad_tools;
 mod opencode_config;
 mod patch;
 mod permissions;
+mod scopes;
 mod skills;
 mod stream;
 mod tools;
@@ -1813,36 +1814,81 @@ fn headline_of(outcome: handover::Outcome) -> &'static str {
 /// instructions as a follow-up (a bounce-back), and records the reason in the handover's review log.
 /// By default this runs inside the call (the agent is one process per message, so a "background" session
 /// would end with it); with `NOMAD_WORKFLOW_MODE=async` the call only starts the workflow and the host runs it.
+/// What a start is admitted as: its track, and what its entry records about where and under what it runs.
+struct Admitted {
+    track: String,
+    lineage: workflows::Lineage,
+    scope: Option<scopes::Resolved>,
+}
+
+/// Decides whether workflow `id` (for `task_path`) may start now, and writes nothing. `known` is its entry when it is being
+/// sent back; `parent` is the workflow whose run starts it, if one does. The rules are the standard's §5: a workflow that
+/// is a scope of a contract takes its track and workspace from the contract; then, in this order, the workspace is valid
+/// (4), the workflows above it are not too deep below a scope (3), the contract's scopes are not too many at once (2), and
+/// an `implementation` workflow does not share its workspace with another (1; the ones that started it do not count).
+fn check_start(registry: &Path, meta_tree: &Path, id: &str, task_path: &str, known: Option<&workflows::Entry>, parent: Option<&str>) -> Result<Admitted, String> {
+    let earlier = if known.is_some() { workflows::lineage(registry, id) } else { workflows::Lineage::default() };
+    let scope = if known.is_some() { scopes::resolve_entry(registry, &earlier)? } else { scopes::resolve(registry, meta_tree, task_path)? };
+    let track = match (&scope, known) {
+        (Some(resolved), _) => resolved.scope.track.clone(),
+        (None, Some(entry)) => entry.track.clone(),
+        (None, None) => workflows::task_meta(meta_tree, task_path).track_or_default(),
+    };
+    let mut lineage = match &scope {
+        Some(resolved) => resolved.lineage(),
+        None => workflows::Lineage { workspace: earlier.workspace.clone(), ..workflows::Lineage::default() },
+    };
+    lineage.parent = parent.map(str::to_string);
+    if let Some(resolved) = &scope {
+        scopes::check_workspace(registry, resolved)?;
+    }
+    scopes::check_depth(registry, parent)?;
+    if let Some(resolved) = &scope {
+        scopes::check_concurrency(registry, resolved, id)?;
+    }
+    if track == "implementation" {
+        let mut except = workflows::ancestors(registry, parent);
+        except.push(id.to_string());
+        if let Some(blocker) = workflows::blocking_implementation(registry, lineage.workspace.as_deref(), &except) {
+            return Err(match lineage.workspace.as_deref() {
+                None => WORKTREE_BUSY.to_string(),
+                Some(workspace) => format!(
+                    "FAIL: Workflow '{}' is an implementation workflow already running in workspace {workspace}; only one implementation workflow can own a workspace at a time (rule 1: one implementation per workspace).",
+                    blocker.workflow_id
+                ),
+            });
+        }
+    }
+    Ok(Admitted { track, lineage, scope })
+}
+
 /// Admits a workflow that runs inside its caller's process and records it as running there (the host's own
 /// supervised workflows go through `nomadflow_in_background`). Only one `implementation` workflow may own a workspace;
 /// the ones that started this one are waiting for it, so they do not count. Refusing is a result for the caller.
 fn admit_in_process(registry: &Path, prepared: &Prepared, parent: Option<&str>) -> Result<(), String> {
     let id = workflows::workflow_id(&prepared.session_id);
-    let known = workflows::find(registry, &id);
     // A run is going already, here or in another process: a second one would be two runners on one session.
     if workflows::is_running(registry, &id) {
         return Err(format!("FAIL: Workflow '{}' is already running; wait for its notification or send it a prompt with nomadflow_prompt_workflow.", prepared.session_id));
     }
-    let track = match &known {
-        Some(entry) => entry.track.clone(),
-        None => workflows::task_meta(&prepared.worktree, &prepared.task_path).track_or_default(),
-    };
-    if track == "implementation" {
-        let mut except = workflows::ancestors(registry, parent);
-        except.push(id.clone());
-        if workflows::blocking_implementation(registry, None, &except).is_some() {
-            return Err(WORKTREE_BUSY.into());
-        }
+    let known = workflows::find(registry, &id);
+    let admitted = check_start(registry, &prepared.worktree, &id, &prepared.task_path, known.as_ref(), parent)?;
+    if let (Some(workspace), Some(resolved)) = (&admitted.lineage.workspace, &admitted.scope) {
+        // This process works in one folder; a scope with a folder of its own needs a runner started there.
+        return Err(format!(
+            "FAIL: Scope `{}` works in its own workspace ({workspace}), which a workflow that runs inside its caller's process cannot do. The Product Manager has to start it (asynchronous workflows, NOMAD_WORKFLOW_MODE=async).",
+            resolved.scope.scope_id
+        ));
     }
     let entry = match known {
         Some(mut entry) => {
             entry.state = "running".into();
             entry
         }
-        None => workflows::Entry { workflow_id: id.clone(), task_path: prepared.task_path.clone(), track, state: "running".into(), send_backs: 0 },
+        None => workflows::Entry { workflow_id: id.clone(), task_path: prepared.task_path.clone(), track: admitted.track.clone(), state: "running".into(), send_backs: 0 },
     };
     workflows::write_entry(registry, &entry).map_err(|err| format!("FAIL: Failed to initiate session: {err}"))?;
-    let lineage = workflows::Lineage { workspace: None, parent: parent.map(str::to_string), pid: Some(std::process::id()) };
+    let lineage = workflows::Lineage { pid: Some(std::process::id()), ..admitted.lineage };
     workflows::set_lineage(registry, &id, &lineage).map_err(|err| format!("FAIL: Failed to initiate session: {err}"))
 }
 
@@ -1911,7 +1957,6 @@ fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
         return format!("FAIL: Workflow Runner is unavailable in the current team configuration. Switch to full team mode to {asking}.");
     }
     let manager = env::var("CODENOMAD_SESSION_KEY").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "this session".into());
-    const BUSY: &str = WORKTREE_BUSY;
 
     // `nomadflow_run_workflow` with a session_id continues that session, as in the synchronous mode.
     let follow_up = if tool == "nomadflow_prompt_workflow" || text_of("session_id").is_some() { Some(text_of("session_id")) } else { None };
@@ -1939,8 +1984,8 @@ Tell the user where it stands (the latest handover's outcome and open issues) an
             top.emitter.emit(json!({ "type": "workflow.prompt", "workflow_id": id, "session_id": session, "text": text, "active": true, "call_id": call.id }));
             return format!("SUCCESS: Prompt sent to active session '{requested}'. Instructions added to queue. You will be notified on completion in this session ({manager}).");
         }
-        if entry.track == "implementation" && workflows::running_implementation(&worktree).is_some() {
-            return BUSY.into();
+        if let Err(refused) = check_start(&worktree, &worktree, &id, &entry.task_path, Some(&entry), None) {
+            return refused;
         }
         workflows::set_state(&worktree, &id, "running");
         log_workflow_event(&worktree, json!({ "event": "workflow:resumed", "session_id": id, "task": entry.task_path }));
@@ -1952,19 +1997,20 @@ Tell the user where it stands (the latest handover's outcome and open issues) an
         return "Error: nomadflow_run_workflow requires task_path and instructions.".into();
     };
     let meta = workflows::task_meta(&worktree, &task_path);
-    let track = meta.track_or_default();
-    if track == "implementation" && workflows::running_implementation(&worktree).is_some() {
-        return BUSY.into();
-    }
     let id = delegation::new_id("wf");
+    let admitted = match check_start(&worktree, &worktree, &id, &task_path, None, None) {
+        Ok(admitted) => admitted,
+        Err(refused) => return refused,
+    };
+    let track = admitted.track.clone();
     let session = workflows::session_id(&id);
     let entry = workflows::Entry { workflow_id: id.clone(), task_path: task_path.clone(), track: track.clone(), state: "running".into(), send_backs: 0 };
-    if let Err(err) = workflows::write_entry(&worktree, &entry) {
+    if let Err(err) = workflows::write_entry(&worktree, &entry).and_then(|_| workflows::set_lineage(&worktree, &id, &admitted.lineage)) {
         return format!("FAIL: Failed to initiate session: {err}");
     }
     let file_name = Path::new(&task_path).file_name().and_then(|n| n.to_str()).unwrap_or(&task_path).to_string();
     log_workflow_event(&worktree, json!({ "event": "workflow:queued", "session_id": id, "task": task_path, "track": track }));
-    top.emitter.emit(json!({
+    let mut start = json!({
         "type": "workflow.start",
         "workflow_id": id,
         "session_id": session,
@@ -1974,7 +2020,16 @@ Tell the user where it stands (the latest handover's outcome and open issues) an
         "instructions": instructions,
         "prompt": workflows::display_prompt(&task_path, &meta, &track, &instructions),
         "call_id": call.id,
-    }));
+    });
+    // A scope of a contract says where its runner works and which contract it is under (never from the model's arguments).
+    if let Some(workspace) = &admitted.lineage.workspace {
+        start["workspace"] = json!(workspace);
+    }
+    if let Some(resolved) = &admitted.scope {
+        start["scope_id"] = json!(resolved.scope.scope_id);
+        start["contract"] = json!(resolved.contract.id);
+    }
+    top.emitter.emit(start);
     format!("SUCCESS: Workflow Runner session started. ID: {session}\nTrack: {track}\nInstructions sent for {task_path}. You will be notified on completion in this session ({manager}).")
 }
 
@@ -4866,6 +4921,207 @@ mod tests {
         assert!(!wt.join(".codenomad/runtime/workflow-events.ndjson").exists());
         let _ = fs::remove_dir_all(wt);
         let _ = fs::remove_dir_all(manager_tree);
+    }
+
+    // ------------------------------------------------------------ scopes of a contract
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").args(["-c", "user.email=t@example.com", "-c", "user.name=t", "-C"]).arg(dir).args(args).output().expect("run git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// The manager's worktree as a git repository (with the parent task `TASK-P`), so that it can have worktrees.
+    fn git_manager(name: &str) -> PathBuf {
+        let wt = new_worktree(name);
+        fs::create_dir_all(wt.join("tasks/todo/TASK-P")).unwrap();
+        fs::write(wt.join("tasks/todo/TASK-P/TASK-P.md"), "# TASK-P\n").unwrap();
+        git_in(&wt, &["init", "-q"]);
+        git_in(&wt, &["add", "."]);
+        git_in(&wt, &["commit", "-q", "-m", "init"]);
+        wt
+    }
+
+    fn worktree_beside(wt: &Path, name: &str) -> String {
+        let path = wt.parent().unwrap().join(format!("{}-{name}", wt.file_name().unwrap().to_string_lossy()));
+        git_in(wt, &["worktree", "add", "-q", path.to_str().unwrap(), "-b", name]);
+        fs::canonicalize(path).unwrap().to_string_lossy().into_owned()
+    }
+
+    /// One scope's task file, naming its contract; returns its path.
+    fn scope_task(wt: &Path, scope: &str) -> String {
+        let path = format!("tasks/todo/TASK-P/{scope}/TASK-P-{scope}.md");
+        fs::create_dir_all(wt.join(&path).parent().unwrap()).unwrap();
+        fs::write(wt.join(&path), format!("---\nscope_contract: TASK-P\nscope_id: {scope}\n---\n# {scope}\n")).unwrap();
+        path
+    }
+
+    /// Writes the normalized contract (after the task files, so that it is the newer): `(scope, track, workspace, spawn_depth)`.
+    fn install_contract(wt: &Path, scopes: &[(&str, &str, &str, u64)], max_concurrency: u64) {
+        let scopes: Vec<Value> = scopes
+            .iter()
+            .map(|(id, track, workspace, depth)| json!({ "scope_id": id, "track": track, "task_path": format!("tasks/todo/TASK-P/{id}/TASK-P-{id}.md"), "workspace": workspace, "spawn_depth": depth }))
+            .collect();
+        let doc = json!({ "scope_contract_version": 1, "parent_task": "TASK-P", "source": "tasks/todo/TASK-P/TASK-P.md", "limits": { "max_concurrency": max_concurrency }, "scopes": scopes });
+        fs::create_dir_all(scopes::contracts_dir(wt)).unwrap();
+        fs::write(scopes::contracts_dir(wt).join("TASK-P.json"), doc.to_string()).unwrap();
+    }
+
+    async fn start_scope(wt: &Path, scope: &str) -> Run {
+        let task = format!("tasks/todo/TASK-P/{scope}/TASK-P-{scope}.md");
+        flow(wt, Runner::Happy, run_call(json!({ "task_path": task, "instructions": format!("do the {scope} part") })), Arc::new(AtomicUsize::new(0))).await
+    }
+
+    fn started(run: &Run) -> bool {
+        workflow_result(run).starts_with("SUCCESS: Workflow Runner session started.")
+    }
+
+    fn refusal(run: &Run) -> String {
+        assert!(event_of(run, "workflow.start").is_none(), "a refused start tells the host nothing");
+        workflow_result(run)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_implementation_scopes_in_their_own_workspaces_run_together() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-parallel");
+        let (api, ui) = (worktree_beside(&wt, "api"), worktree_beside(&wt, "ui"));
+        for scope in ["api", "ui", "notes"] {
+            scope_task(&wt, scope);
+        }
+        install_contract(&wt, &[("api", "implementation", &api, 0), ("ui", "implementation", &ui, 0), ("notes", "spec", "shared", 0)], 3);
+
+        let first = start_scope(&wt, "api").await;
+        assert!(started(&first), "{}", workflow_result(&first));
+        let second = start_scope(&wt, "ui").await;
+        assert!(started(&second), "a second implementation workflow, in another workspace: {}", workflow_result(&second));
+
+        // The host is told where each runner works and which contract it is under.
+        let (a, b) = (event_of(&first, "workflow.start").unwrap(), event_of(&second, "workflow.start").unwrap());
+        assert_eq!((a["workspace"].as_str(), a["scope_id"].as_str(), a["contract"].as_str()), (Some(api.as_str()), Some("api"), Some("TASK-P")));
+        assert_eq!((b["workspace"].as_str(), b["scope_id"].as_str()), (Some(ui.as_str()), Some("ui")));
+        let entries = registry_entries(&wt);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|(e, l)| e.running() && e.track == "implementation" && l.contract.as_deref() == Some("TASK-P") && l.pid.is_none()), "{entries:?}");
+
+        // The same scope cannot be started twice: one implementation workflow per workspace (rule 1).
+        let again = start_scope(&wt, "api").await;
+        let said = refusal(&again);
+        assert!(said.starts_with("FAIL:") && said.contains("rule 1") && said.contains(&api), "{said}");
+        assert_eq!(again.answer.as_deref(), Ok("PMA DONE"), "a refusal is a result, not the end of the run");
+        assert_eq!(registry_entries(&wt).len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contract_allows_only_max_concurrency_scopes_at_once_and_spec_scopes_count() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-concurrency");
+        let api = worktree_beside(&wt, "api");
+        scope_task(&wt, "api");
+        scope_task(&wt, "notes");
+        install_contract(&wt, &[("api", "implementation", &api, 0), ("notes", "spec", "shared", 0)], 1);
+
+        assert!(started(&start_scope(&wt, "api").await));
+        let notes = start_scope(&wt, "notes").await;
+        let said = refusal(&notes);
+        assert!(said.contains("allows 1 scope(s)") && said.contains("rule 2"), "a spec scope counts too: {said}");
+
+        // Once the implementation scope is done, the spec scope may start.
+        let running = registry_entries(&wt)[0].0.workflow_id.clone();
+        workflows::set_state(&wt, &running, "idle");
+        assert!(started(&start_scope(&wt, "notes").await));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sending_a_scope_back_is_held_to_the_contract_like_starting_it() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-resume");
+        let api = worktree_beside(&wt, "api");
+        scope_task(&wt, "api");
+        scope_task(&wt, "notes");
+        install_contract(&wt, &[("api", "implementation", &api, 0), ("notes", "spec", "shared", 0)], 1);
+        let first = start_scope(&wt, "api").await;
+        let api_id = event_of(&first, "workflow.start").unwrap()["workflow_id"].as_str().unwrap().to_string();
+        workflows::set_state(&wt, &api_id, "idle");
+        assert!(started(&start_scope(&wt, "notes").await));
+
+        let back = flow(&wt, Runner::Happy, json!({ "name": "nomadflow_prompt_workflow", "args": { "session_id": workflows::session_id(&api_id), "text": "fix the header" } }), Arc::new(AtomicUsize::new(0))).await;
+        let said = workflow_result(&back);
+        assert!(said.starts_with("FAIL:") && said.contains("rule 2"), "{said}");
+        assert!(!workflows::find(&wt, &api_id).unwrap().running(), "it stayed idle");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workspace_that_is_not_a_worktree_of_the_manager_is_refused_before_anything_starts() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-badws");
+        scope_task(&wt, "api");
+        let stranger = std::env::temp_dir().join(format!("wf-stranger-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&stranger).unwrap();
+        install_contract(&wt, &[("api", "implementation", fs::canonicalize(&stranger).unwrap().to_str().unwrap(), 0)], 1);
+        let said = refusal(&start_scope(&wt, "api").await);
+        assert!(said.starts_with("FAIL:") && said.contains("rule 4") && said.contains("not a git worktree"), "{said}");
+        assert!(registry_entries(&wt).is_empty(), "nothing was recorded");
+        let _ = fs::remove_dir_all(stranger);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_that_names_a_contract_with_no_usable_copy_is_refused_with_what_to_run() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-nocopy");
+        scope_task(&wt, "api");
+        let said = refusal(&start_scope(&wt, "api").await);
+        assert!(said.starts_with("FAIL:") && said.contains("bun run scope:check"), "{said}");
+        assert!(registry_entries(&wt).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_workspace_and_scope_come_from_the_contract_not_from_the_models_arguments() {
+        let _mode = AsyncMode::on();
+        let wt = git_manager("sc-args");
+        let api = worktree_beside(&wt, "api");
+        scope_task(&wt, "api");
+        install_contract(&wt, &[("api", "implementation", &api, 0)], 1);
+        let task = "tasks/todo/TASK-P/api/TASK-P-api.md";
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": task, "instructions": "go", "workspace": "/tmp/evil", "scope_id": "other", "track": "spec" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(started(&run), "{}", workflow_result(&run));
+        let start = event_of(&run, "workflow.start").unwrap();
+        assert_eq!((start["workspace"].as_str(), start["scope_id"].as_str(), start["track"].as_str()), (Some(api.as_str()), Some("api"), Some("implementation")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_started_under_a_scope_is_held_to_its_spawn_depth() {
+        let wt = git_manager("sc-depth");
+        let spec = add_task(&wt, "TASK-SPEC", "---\ntrack: spec\n---\n");
+        for (depth, allowed) in [(0u32, false), (1, true)] {
+            let id = format!("wf_scope{depth}");
+            workflows::write_entry(&wt, &workflows::Entry { workflow_id: id.clone(), task_path: "t.md".into(), track: "implementation".into(), state: "running".into(), send_backs: 0 }).unwrap();
+            workflows::set_lineage(&wt, &id, &workflows::Lineage { contract: Some("TASK-P".into()), scope_id: Some("api".into()), spawn_depth: Some(depth), ..Default::default() }).unwrap();
+            // The manager's loop runs inside that scope's workflow, as a runner's does: its starts are nested ones.
+            let run = CURRENT_WORKFLOW
+                .scope(id.clone(), flow(&wt, Runner::Happy, run_call(json!({ "task_path": spec, "instructions": "write it up" })), Arc::new(AtomicUsize::new(0))))
+                .await;
+            let said = workflow_result(&run);
+            if allowed {
+                assert!(said.starts_with("SUCCESS: Workflow completed"), "depth {depth}: {said}");
+            } else {
+                assert!(said.starts_with("FAIL:") && said.contains("rule 3") && said.contains("0 level(s)"), "depth {depth}: {said}");
+            }
+            workflows::set_state(&wt, &id, "idle");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scope_with_a_workspace_of_its_own_cannot_run_inside_its_callers_process() {
+        let wt = git_manager("sc-inproc");
+        let api = worktree_beside(&wt, "api");
+        scope_task(&wt, "api");
+        install_contract(&wt, &[("api", "implementation", &api, 0)], 1);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": "tasks/todo/TASK-P/api/TASK-P-api.md", "instructions": "go" })), requests.clone()).await;
+        let said = workflow_result(&run);
+        assert!(said.starts_with("FAIL:") && said.contains("own workspace") && said.contains("NOMAD_WORKFLOW_MODE=async"), "{said}");
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(registry_entries(&wt).is_empty());
     }
 
     /// The host's second process: this one is the Workflow Runner, and its events are the runner session's own.

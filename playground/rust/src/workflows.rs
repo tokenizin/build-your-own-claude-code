@@ -179,6 +179,7 @@ pub fn find(worktree: &Path, workflow_id: &str) -> Option<Entry> {
 }
 
 /// A workflow that is running on the `implementation` track, if there is one: only one may own the shared worktree.
+#[cfg(test)]
 pub fn running_implementation(worktree: &Path) -> Option<Entry> {
     blocking_implementation(worktree, None, &[])
 }
@@ -201,6 +202,23 @@ pub fn blocking_implementation(worktree: &Path, workspace: Option<&str>, except:
     found.into_iter().next()
 }
 
+/// The workflows with a run going now that are scopes of `contract`, other than `except`.
+pub fn running_scopes(worktree: &Path, contract: &str, except: &str) -> Vec<Entry> {
+    let mut found: Vec<Entry> = fs::read_dir(registry_dir(worktree))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| read_entry(&e.path()))
+        .filter(|e| e.running() && e.workflow_id != except)
+        .filter(|e| {
+            let lineage = lineage(worktree, &e.workflow_id);
+            lineage.contract.as_deref() == Some(contract) && is_live(&lineage)
+        })
+        .collect();
+    found.sort_by(|a, b| a.workflow_id.cmp(&b.workflow_id));
+    found
+}
+
 /// Whether workflow `workflow_id` has a run going now (its entry says `running` and the process running it, if it has one, exists).
 pub fn is_running(worktree: &Path, workflow_id: &str) -> bool {
     find(worktree, workflow_id).is_some_and(|entry| entry.running()) && is_live(&lineage(worktree, workflow_id))
@@ -218,19 +236,39 @@ pub struct Lineage {
     /// The process running it, for a workflow that runs inside its caller's process. None: the host supervises it and
     /// releases it when it ends or is cut off, so there is nothing to check.
     pub pid: Option<u32>,
+    /// The scope contract this workflow is one scope of (the parent task's id) and its id in it; none: it is not one.
+    pub contract: Option<String>,
+    pub scope_id: Option<String>,
+    /// How many levels of workflows this scope's runner may start, as the contract said when it started.
+    pub spawn_depth: Option<u32>,
 }
 
 pub fn lineage(worktree: &Path, workflow_id: &str) -> Lineage {
     let Some(doc) = entry_path(worktree, workflow_id).and_then(|p| read_document(&p)) else { return Lineage::default() };
     let text = |key: &str| doc.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
-    Lineage { workspace: text("workspace"), parent: text("parent"), pid: doc.get("pid").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()) }
+    let number = |key: &str| doc.get(key).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+    Lineage {
+        workspace: text("workspace"),
+        parent: text("parent"),
+        pid: number("pid"),
+        contract: text("contract"),
+        scope_id: text("scope_id"),
+        spawn_depth: number("spawn_depth"),
+    }
 }
 
 /// Records a workflow's lineage in its entry's file (the entry must exist).
 pub fn set_lineage(worktree: &Path, workflow_id: &str, lineage: &Lineage) -> Result<(), String> {
     let path = entry_path(worktree, workflow_id).ok_or_else(|| format!("bad workflow id `{workflow_id}`"))?;
     let mut doc = read_document(&path).ok_or_else(|| format!("no entry for workflow `{workflow_id}`"))?;
-    for (key, value) in [("workspace", lineage.workspace.clone().map(Value::String)), ("parent", lineage.parent.clone().map(Value::String)), ("pid", lineage.pid.map(|p| json!(p)))] {
+    for (key, value) in [
+        ("workspace", lineage.workspace.clone().map(Value::String)),
+        ("parent", lineage.parent.clone().map(Value::String)),
+        ("pid", lineage.pid.map(|p| json!(p))),
+        ("contract", lineage.contract.clone().map(Value::String)),
+        ("scope_id", lineage.scope_id.clone().map(Value::String)),
+        ("spawn_depth", lineage.spawn_depth.map(|d| json!(d))),
+    ] {
         match value {
             Some(value) => doc.insert(key.into(), value),
             None => doc.remove(key),
@@ -444,7 +482,7 @@ Please execute the full lifecycle (Sync -> Implementation -> Commit -> Archive) 
         let wt = worktree("lineage");
         write_entry(&wt, &entry_of("wf_a", "implementation", "running")).unwrap();
         assert_eq!(lineage(&wt, "wf_a"), Lineage::default(), "an entry nobody gave a lineage is the manager's, supervised by the host");
-        let given = Lineage { workspace: Some("/work/api".into()), parent: Some("wf_p".into()), pid: Some(4242) };
+        let given = Lineage { workspace: Some("/work/api".into()), parent: Some("wf_p".into()), pid: Some(4242), ..Lineage::default() };
         set_lineage(&wt, "wf_a", &given).unwrap();
         set_state(&wt, "wf_a", "idle");
         set_send_backs(&wt, "wf_a", 2);
