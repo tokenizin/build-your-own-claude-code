@@ -1,7 +1,8 @@
 //! Load OpenCode / CodeNomad `opencode.json(c)` agent catalogs for the Rust playground.
 //!
 //! StarWorld / CodeNomad remain source of truth. This module resolves `{file:…}` prompts,
-//! remaps provider-prefixed models to Ollama tags, and exposes agents as `context: fork` skills.
+//! keeps provider-prefixed models whose provider is configured (they are routed, see providers.rs), maps the rest to Ollama tags,
+//! and exposes agents as `context: fork` skills.
 
 use crate::skills::{Skill, parse_frontmatter};
 use serde_json::Value;
@@ -30,15 +31,8 @@ pub const DEFAULT_ORCHESTRATOR_MODEL: &str = "gemma4:26b";
 impl Default for OpencodeAdapter {
     fn default() -> Self {
         let mut model_remap = HashMap::new();
-        model_remap.insert(
-            "opencode/space-bunny-free".into(),
-            DEFAULT_ORCHESTRATOR_MODEL.into(),
-        );
-        model_remap.insert(
-            "openrouter-fallback/auto".into(),
-            DEFAULT_ORCHESTRATOR_MODEL.into(),
-        );
-        model_remap.insert("opencode-go/mimo-v2.5".into(), DEFAULT_ORCHESTRATOR_MODEL.into());
+        // Provider models (`openrouter/…`, `opencode/…`) are not remapped: they run on their own provider when it is configured (providers.rs)
+        // and on the fork model when it is not.
         // `ornith-31b-dense` was a local alias of Qwen 3.6 and is no longer served: what it pointed at is the model to use.
         for legacy in ["ollama/ornith-31b-dense:latest", "ollama/ornith-31b-dense", "ornith/ornith-31b-dense"] {
             model_remap.insert(legacy.into(), "qwen3.6:latest".into());
@@ -247,20 +241,47 @@ pub fn resolve_opencode_config_path(adapter: &OpencodeAdapter) -> Option<PathBuf
 }
 
 pub fn remap_model(adapter: &OpencodeAdapter, raw: Option<&str>) -> Option<String> {
+    remap_model_with(adapter, &crate::providers::registry(), raw)
+}
+
+/// The model an OpenCode model pin runs on here: an explicit `modelRemap` entry; an `ollama/` model on the default endpoint; a
+/// `provider/model` whose provider is configured and ready (providers.rs) as it is written, so it is routed to that provider; any
+/// other `provider/model` on the fork model (with a note on stderr saying why), since the default endpoint cannot serve it.
+pub fn remap_model_with(adapter: &OpencodeAdapter, registry: &crate::providers::Registry, raw: Option<&str>) -> Option<String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Some(adapter.default_fork_model.clone());
     };
     if let Some(mapped) = adapter.model_remap.get(raw) {
         return Some(mapped.clone());
     }
-    if let Some(rest) = raw.strip_prefix("ollama/") {
-        return Some(rest.to_string());
+    for default in crate::providers::DEFAULT_PROVIDER_IDS {
+        if let Some(rest) = raw.strip_prefix(default).and_then(|r| r.strip_prefix('/')) {
+            return Some(rest.to_string());
+        }
     }
-    // Unknown provider-prefixed models → default Ollama fork model
+    if registry.route(raw).is_some() {
+        return Some(raw.to_string());
+    }
     if raw.contains('/') {
+        let why = registry
+            .provider_of(raw)
+            .and_then(|p| p.not_ready_reason())
+            .unwrap_or_else(|| format!("provider `{}` is not configured", raw.split('/').next().unwrap_or(raw)));
+        note_fallback_once(raw, &format!("model {raw}: {why}; running on {} instead", adapter.default_fork_model));
         return Some(adapter.default_fork_model.clone());
     }
     Some(raw.to_string())
+}
+
+/// Says each fallback once per process (agents are discovered more than once).
+fn note_fallback_once(model: &str, message: &str) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut said) = SAID.lock() {
+        if !said.iter().any(|m| m == model) {
+            said.push(model.to_string());
+            eprintln!("opencode: {message}");
+        }
+    }
 }
 
 fn resolve_prompt_file(config_dir: &Path, prompt: &str) -> Option<PathBuf> {
@@ -509,10 +530,39 @@ mod tests {
             remap_model(&a, Some("ollama/qwen3:8b")).as_deref(),
             Some("qwen3:8b")
         );
-        assert_eq!(
-            remap_model(&a, Some("opencode/space-bunny-free")).as_deref(),
-            Some(DEFAULT_ORCHESTRATOR_MODEL)
-        );
         assert_eq!(DEFAULT_ORCHESTRATOR_MODEL, "gemma4:26b");
+    }
+
+    fn registry_with(provider: crate::providers::Provider) -> crate::providers::Registry {
+        let mut registry = crate::providers::Registry::default();
+        registry.merge(provider);
+        registry
+    }
+
+    #[test]
+    fn a_configured_provider_model_is_kept_so_it_is_routed_not_remapped() {
+        let a = OpencodeAdapter::default();
+        let ready = registry_with(crate::providers::Provider {
+            id: "opencode".into(),
+            base_url: Some("https://opencode.ai/zen/v1".into()),
+            api_key: Some("k".into()),
+            ..Default::default()
+        });
+        assert_eq!(remap_model_with(&a, &ready, Some("opencode/space-bunny-free")).as_deref(), Some("opencode/space-bunny-free"));
+        assert_eq!(remap_model_with(&a, &ready, Some("ollama/qwen3:8b")).as_deref(), Some("qwen3:8b"), "Ollama stays the default endpoint");
+        assert_eq!(remap_model_with(&a, &ready, Some("gemma4:26b")).as_deref(), Some("gemma4:26b"));
+    }
+
+    #[test]
+    fn a_provider_model_without_a_ready_provider_falls_back_to_the_fork_model() {
+        let a = OpencodeAdapter::default();
+        let keyless = registry_with(crate::providers::Provider {
+            id: "openrouter".into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            key_env: vec!["OPENROUTER_API_KEY".into()],
+            ..Default::default()
+        });
+        assert_eq!(remap_model_with(&a, &keyless, Some("openrouter/auto")).as_deref(), Some(DEFAULT_ORCHESTRATOR_MODEL));
+        assert_eq!(remap_model_with(&a, &keyless, Some("nobody/model")).as_deref(), Some(DEFAULT_ORCHESTRATOR_MODEL));
     }
 }

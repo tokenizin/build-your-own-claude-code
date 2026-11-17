@@ -9,6 +9,9 @@
 //! * a run whose own model is below it stops with a message that says so, rather than quietly running on something else;
 //! * the catalog does not offer such models (see `catalog::drop_small_contexts`).
 //!
+//! A model routed to another provider (`provider/model`, see providers.rs) is not asked about: its window is the `limit.context` its
+//! opencode.json entry gives, if any.
+//!
 //! Only a window that is KNOWN and small counts: a model that did not answer `/api/show` (a cloud model, an endpoint that is not Ollama)
 //! is let through, as there is nothing to go on.
 use crate::config::LlmConfig;
@@ -46,6 +49,11 @@ pub fn says_model_missing(status: u16, body: &str) -> bool {
 }
 
 async fn seen(cfg: &LlmConfig, model: &str) -> Seen {
+    // A model routed to another provider (providers.rs) is not Ollama's to know: asking the default endpoint would get "not found" and
+    // swap it for the fork model. Its window is what opencode.json says (`limit.context`), if anything.
+    if let Some(route) = crate::providers::route(model) {
+        return Seen::Window(route.context);
+    }
     if let Some(hit) = KNOWN.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(model).copied())) {
         return hit;
     }
@@ -97,6 +105,10 @@ fn unusable(seen: Seen) -> bool {
 }
 
 fn refusal(model: &str, seen: Seen) -> String {
+    // A `provider/model` that was not routed: its provider is missing a base URL or key, which is what to fix.
+    if let Some(why) = crate::providers::registry().provider_of(model).and_then(|p| p.not_ready_reason()) {
+        return format!("model {model} cannot run: {why}. Until then it is sent to the default endpoint, which does not serve it.");
+    }
     match seen {
         Seen::Missing => format!(
             "model {model} is not served by the endpoint (it answered that the model was not found). Use a model the endpoint lists; a stale or invented name \

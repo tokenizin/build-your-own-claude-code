@@ -1,5 +1,5 @@
 {
-  "$comment": "Rust playground adapter for StarWorld / CodeNomad OpenCode agent settings. StarWorld remains SoT; this file only remaps models + discovery.",
+  "$comment": "Rust playground adapter for StarWorld / CodeNomad OpenCode agent settings. StarWorld remains SoT; this file only remaps models + discovery. Provider models (openrouter/…, opencode/…) are not remapped here: they run on the provider configured in opencode.json `provider` (or a built-in one with its key set), and on defaultForkModel when that provider has no base URL or key.",
   "opencodeConfigCandidates": [
     "${STARWORLD}/CodeNomad/.opencode/opencode.jsonc",
     "${STARWORLD}/opencode.json",
@@ -9,9 +9,6 @@
   "defaultForkModel": "gemma4:26b",
   "smallModel": "qwen3:8b",
   "modelRemap": {
-    "opencode/space-bunny-free": "gemma4:26b",
-    "openrouter-fallback/auto": "gemma4:26b",
-    "opencode-go/mimo-v2.5": "gemma4:26b",
     "ollama/qwen3:8b": "qwen3:8b",
     "ollama/qwen3.6:latest": "qwen3.6:latest",
     "ollama/hermes3:latest": "hermes3:latest",

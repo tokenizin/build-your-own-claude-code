@@ -12,6 +12,7 @@ mod nomad_tools;
 mod opencode_config;
 mod patch;
 mod permissions;
+mod providers;
 mod skills;
 mod stream;
 mod tools;
@@ -622,6 +623,16 @@ async fn run_agent_loop(
     let workflow = scope.and_then(|s| s.workflow);
     let checkpoint = scope.and_then(|s| s.checkpoint);
     let tools = tool_specs(tool_mode, skills, depth, workflow.is_some(), &cfg.model);
+    // A `provider/model` of a configured provider (providers.rs) goes to that provider's endpoint, with its key and its id for the model;
+    // anything else goes to the default (Ollama) endpoint, as before.
+    let route = providers::route(&cfg.model);
+    let routed_client = route.as_ref().map(|r| make_client(&r.base_url, &r.api_key));
+    let client = routed_client.as_ref().unwrap_or(client);
+    let wire_model = route.as_ref().map(|r| r.model.clone()).unwrap_or_else(|| cfg.model.clone());
+    let api_key = route.as_ref().map(|r| r.api_key.as_str()).unwrap_or(cfg.api_key.as_str());
+    if let Some(r) = &route {
+        eprintln!("LLM: {} via provider {} ({})", cfg.model, r.provider, r.base_url);
+    }
 
     let step_cap = max_steps(workflow.is_some());
     let effort = thinking_effort(thinking_setting().as_deref());
@@ -649,7 +660,7 @@ async fn run_agent_loop(
             add_user_note(&mut outgoing, STALL_NUDGE);
         }
         let mut request = json!({
-            "model": cfg.model,
+            "model": wire_model,
             // One system message, first: strict chat templates reject any other layout.
             "messages": outgoing,
             "max_tokens": cfg.max_tokens,
@@ -666,7 +677,8 @@ async fn run_agent_loop(
         // stream-json top level: try SSE streaming first (deltas emitted live).
         let mut streamed: Option<Value> = None;
         if let Some(top) = top.filter(|t| t.stream) {
-            match stream::stream_chat(&top.base_url, &cfg.api_key, &request, top.emitter).await {
+            let base_url = route.as_ref().map(|r| r.base_url.as_str()).unwrap_or(top.base_url.as_str());
+            match stream::stream_chat(base_url, api_key, &request, top.emitter).await {
                 Ok(message) => streamed = Some(message),
                 Err(StreamError::BeforeData(err)) => {
                     eprintln!("stream: {err} — falling back to non-streaming request");
@@ -2440,6 +2452,7 @@ async fn main() -> std::process::ExitCode {
         catalog::drop_unsupported(&mut catalog, &shows, &opencode_config::load_adapter().default_fork_model);
         catalog::add_thinking(&mut catalog, &shows);
         catalog::drop_small_contexts(&mut catalog, context::min_context(), &opencode_config::load_adapter().default_fork_model);
+        catalog::add_providers(&mut catalog, &providers::registry());
         println!("{catalog}");
         return ExitCode::SUCCESS;
     }
@@ -2518,6 +2531,9 @@ async fn main() -> std::process::ExitCode {
     // configured default is not a request, so it is replaced by the fallback model instead.
     let model_was_requested = args.model.is_some() || initial.model_override.is_some();
     let run_cfg = if let Some(model) = &args.model {
+        // `provider/model` as OpenCode writes it (split on the first `/`; the model id may hold more): routed when the provider is
+        // configured (providers.rs); `ollama/x` is the default endpoint's `x`.
+        let model = delegation::endpoint_model(model).unwrap_or_else(|| model.clone());
         eprintln!("model: {model} (--model)");
         cfg.with_model(model)
     } else if let Some(model) = &initial.model_override {
@@ -2557,11 +2573,12 @@ async fn main() -> std::process::ExitCode {
         protocol2: protocol2_enabled(),
     });
     if stream_mode {
+        let base_url = providers::route(&run_cfg.model).map(|r| r.base_url).unwrap_or_else(|| active_base.clone());
         emitter.emit(json!({
             "type": "meta",
             "model": run_cfg.model,
             "agent": initial.agent,
-            "baseUrl": active_base,
+            "baseUrl": base_url,
             "protocol": if protocol2_enabled() { 2 } else { 1 },
         }));
     }
@@ -2779,6 +2796,98 @@ mod tests {
             }
         });
         base
+    }
+
+    /// An OpenAI-compatible endpoint that answers `text` to every request and records each request's
+    /// `Authorization` header and body.
+    async fn recording_endpoint(text: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let body_start = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break pos + 4; }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                    let lower = head.to_lowercase();
+                    let want: usize = lower.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                    while buf.len() < body_start + want {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let auth = head.lines().find(|l| l.to_lowercase().starts_with("authorization:")).map(|l| l[14..].trim().to_string()).unwrap_or_default();
+                    let req: Value = serde_json::from_slice(&buf[body_start..]).unwrap_or(Value::Null);
+                    let streamed = req["stream"] == true;
+                    record.lock().unwrap().push((auth, req));
+                    if streamed {
+                        let chunk = json!({ "choices": [{ "index": 0, "delta": { "role": "assistant", "content": text }, "finish_reason": "stop" }] });
+                        let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                        let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                        let _ = sock.write_all(reply.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+                    let body = json!({ "id": "x", "object": "chat.completion", "created": 0, "model": "m",
+                        "choices": [{ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": "stop" }] }).to_string();
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_model_runs_on_its_providers_endpoint_with_its_key_and_its_id() {
+        let (ollama, ollama_seen) = recording_endpoint("FROM OLLAMA").await;
+        let (provider, provider_seen) = recording_endpoint("FROM PROVIDER").await;
+        providers::install_for_test(providers::Provider {
+            id: "routetest".into(),
+            base_url: Some(provider.clone()),
+            api_key: Some("sk-route".into()),
+            models: vec![providers::ProviderModel { id: "alias".into(), upstream: "vendor/real-model".into(), name: "Alias".into(), context: Some(128_000) }],
+            ..Default::default()
+        });
+        let cfg = LlmConfig { base_url: ollama.clone(), fallback_base_url: ollama.clone(), api_key: "ollama".into(), model: "routetest/alias".into(), max_tokens: 64 };
+        let client = make_client(&ollama, "ollama");
+        let (emitter, _sink) = Emitter::capturing();
+        for stream in [false, true] {
+            let top = TopLevel { emitter: &emitter, base_url: ollama.clone(), stream, protocol2: false };
+            let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+            let answer = run_agent_loop(&client, &cfg, &mut messages, &[], ToolMode::None, Some(&top), 0, None).await.map_err(|e| e.to_string());
+            assert_eq!(answer.as_deref(), Ok("FROM PROVIDER"), "stream={stream}");
+        }
+        let calls = provider_seen.lock().unwrap().clone();
+        assert!(!calls.is_empty());
+        for (auth, req) in &calls {
+            assert_eq!(auth, "Bearer sk-route");
+            assert_eq!(req["model"], "vendor/real-model", "the provider's own id for the model is sent");
+        }
+        assert!(ollama_seen.lock().unwrap().is_empty(), "the default endpoint is not asked");
+
+        // The window comes from the provider's config; Ollama's /api/show is not asked, so the model is not swapped for the fork model.
+        assert_eq!(context::usable_model(&cfg, "routetest/alias").await.as_deref(), Ok("routetest/alias"));
+        assert!(ollama_seen.lock().unwrap().is_empty());
+
+        // A bare model still goes to the default endpoint.
+        let plain = cfg.with_model("gemma4:26b");
+        let top = TopLevel { emitter: &emitter, base_url: ollama.clone(), stream: false, protocol2: false };
+        let mut messages = vec![json!({ "role": "user", "content": "hi" })];
+        let answer = run_agent_loop(&client, &plain, &mut messages, &[], ToolMode::None, Some(&top), 0, None).await.map_err(|e| e.to_string());
+        assert_eq!(answer.as_deref(), Ok("FROM OLLAMA"));
     }
 
     struct Run {

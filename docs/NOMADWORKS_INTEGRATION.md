@@ -77,7 +77,7 @@ Run the Rust binary with **cwd = StarWorld** (or the target app) so `tasks/` and
 
 Implemented in `playground/rust` (`agents.rs`, `opencode_config.rs`) and `playground/python` (`agents.py`, `opencode_config.py`).
 
-**Default (`NOMAD_AGENTS=opencode`):** load the CodeNomad / StarWorld OpenCode agent catalog (`OPENCODE_CONFIG`, usually `CodeNomad/.opencode/opencode.jsonc` — ~68 primary/subagents). Prompt files (`{file:…}`) resolve to `.nomadworks/agents/*.md` or `.opencode/agents/*.md`. Provider models are remapped to Ollama via `playground/opencode-rust.json`.
+**Default (`NOMAD_AGENTS=opencode`):** load the CodeNomad / StarWorld OpenCode agent catalog (`OPENCODE_CONFIG`, usually `CodeNomad/.opencode/opencode.jsonc` — ~68 primary/subagents). Prompt files (`{file:…}`) resolve to `.nomadworks/agents/*.md` or `.opencode/agents/*.md`. Agent model pins keep their provider: see **Providers (Rust)** below.
 
 | Mode (`NOMAD_AGENTS`) | Behavior |
 | --- | --- |
@@ -97,7 +97,19 @@ Implemented in `playground/rust` (`agents.rs`, `opencode_config.rs`) and `playgr
 
 Also available when catalog loads: `/ceo`, `/cto`, `/opencoder`, `/copywriter`, `/codenomad_agent_runner`, … (every `agent` key in the JSON).
 
-Fork path injects policy markdown from `.nomadworks/policies/` (`NOMAD_POLICY_MAX_CHARS`, default 14000). Per-agent models use OpenCode pins remapped to Ollama (default fork model `qwen3.6:latest`). Disk skills still win on name collision.
+Fork path injects policy markdown from `.nomadworks/policies/` (`NOMAD_POLICY_MAX_CHARS`, default 14000). Per-agent models use OpenCode pins (see below; default fork model `gemma4:26b`). Disk skills still win on name collision.
+
+#### Providers (Rust)
+
+`playground/rust/src/providers.rs` gathers every provider configured for OpenCode / CodeNomad and routes each `provider/model` to that provider's own OpenAI-compatible `/chat/completions` endpoint. Ollama (`OLLAMA_BASE_URL`) stays the default: a bare model name or `ollama/…` runs there.
+
+Sources, earlier ones winning and later ones filling gaps:
+
+1. the `provider` section of every opencode.json(c) found: `OPENCODE_CONFIG`, `$STARWORLD/CodeNomad/.opencode/opencode.jsonc`, `$STARWORLD/opencode.json`, `$STARWORLD/.opencode/opencode.json`, `~/.config/opencode/opencode.json(c)`. Read per entry: `options.baseURL`, `options.apiKey` (`{env:VAR}` / `{file:path}` expanded), `env`, and `models.<id>` (`id` = the id sent upstream, `name`, `limit.context`);
+2. OpenCode's stored keys, `~/.local/share/opencode/auth.json` (`"type": "api"` entries);
+3. built-in base URLs for openai, anthropic, openrouter, opencode (Zen), groq, deepseek, mistral, xai, google, togetherai, fireworks, cerebras, used when their key variable (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, …) is set.
+
+A provider is ready with a base URL and a key (a localhost / LAN endpoint needs no key). A pin on a provider that is not ready runs on `defaultForkModel`, and stderr says which base URL or key variable is missing. `--model provider/model` (what CodeNomad passes) is split on the first `/`, so `openrouter/anthropic/claude-sonnet-4.5` works. `--catalog` lists every provider under `providers` (`ready`, `why`, `keyEnv`, `sources`, `models`) and adds the ready providers' models to `models` with a `provider` field. `SKILLS_DEBUG=1` prints the registry at startup.
 
 ### P3 — NomadWorks tools ✅
 

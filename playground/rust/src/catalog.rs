@@ -183,6 +183,34 @@ pub fn add_thinking(catalog: &mut Value, shows: &HashMap<String, Value>) {
     }
 }
 
+/// Lists every provider configured for OpenCode / CodeNomad under `providers` (ready or not, and why not), and adds the models of the ready
+/// ones to `models` as `provider/model` with their `provider`, so the pickers offer them. The default endpoint's models are already there.
+pub fn add_providers(catalog: &mut Value, registry: &crate::providers::Registry) {
+    catalog["providers"] = json!(registry.catalog_entries());
+    let Some(models) = catalog["models"].as_array_mut() else { return };
+    for (id, provider, model) in registry.routable_models() {
+        if models.iter().any(|m| m["id"] == id.as_str()) {
+            if let Some(existing) = models.iter_mut().find(|m| m["id"] == id.as_str()) {
+                existing["provider"] = json!(provider.id);
+            }
+            continue;
+        }
+        let mut entry = json!({ "id": id, "name": model.name, "provider": provider.id });
+        if let Some(context) = model.context {
+            entry["context"] = json!(context);
+        }
+        models.push(entry);
+    }
+    // An agent pinned to a routed model that is not in a provider's model list still shows which provider it runs on.
+    for entry in models.iter_mut() {
+        if entry.get("provider").is_none() {
+            if let Some(route) = entry["id"].as_str().and_then(|id| registry.route(id)) {
+                entry["provider"] = json!(route.provider);
+            }
+        }
+    }
+}
+
 pub fn is_agent(skill: &Skill) -> bool {
     skill.context.as_deref() == Some("fork")
 }
@@ -245,6 +273,36 @@ mod tests {
             policies: Vec::new(),
             model: model.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn the_catalog_lists_every_provider_and_offers_the_models_of_the_ready_ones() {
+        use crate::providers::{Provider, ProviderModel, Registry};
+        let mut registry = Registry::default();
+        registry.merge(Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            api_key: Some("k".into()),
+            models: vec![ProviderModel { id: "auto".into(), upstream: "openrouter/auto".into(), name: "Auto".into(), context: Some(200_000) }],
+            ..Default::default()
+        });
+        registry.merge(Provider { id: "groq".into(), base_url: Some("https://api.groq.com/openai/v1".into()), key_env: vec!["GROQ_API_KEY".into()], models: vec![ProviderModel { id: "llama".into(), upstream: "llama".into(), name: "llama".into(), context: None }], ..Default::default() });
+        let skills = vec![skill("developer", true, Some("openrouter/anthropic/claude-sonnet-4.5"))];
+        let mut cat = build_catalog("gemma4:26b", "http://x/v1", &skills, Ok(vec!["gemma4:26b".into()]), &HashMap::new());
+        add_providers(&mut cat, &registry);
+        let ids: Vec<&str> = cat["models"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"gemma4:26b") && ids.contains(&"openrouter/auto"), "{ids:?}");
+        assert!(!ids.contains(&"groq/llama"), "a provider with no key is listed, its models are not offered: {ids:?}");
+        let pinned = cat["models"].as_array().unwrap().iter().find(|m| m["id"] == "openrouter/anthropic/claude-sonnet-4.5").unwrap();
+        assert_eq!(pinned["provider"], "openrouter");
+        let auto = cat["models"].as_array().unwrap().iter().find(|m| m["id"] == "openrouter/auto").unwrap();
+        assert_eq!((auto["context"].as_u64(), auto["name"].as_str()), (Some(200_000), Some("Auto")));
+        let providers = cat["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        let groq = providers.iter().find(|p| p["id"] == "groq").unwrap();
+        assert_eq!(groq["ready"], false);
+        assert!(groq["why"].as_str().unwrap().contains("GROQ_API_KEY"));
     }
 
     #[test]
