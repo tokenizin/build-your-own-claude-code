@@ -128,7 +128,7 @@ Emits NDJSON: `meta` → `stderr`/`stdout` lines → `final` → `exit`. Set `CL
 | Method | Path | Body |
 | --- | --- | --- |
 | `GET` | `/api/playground/rust/status` | — |
-| `POST` | `/api/playground/rust/run` | `{ "prompt", "cwd"?, "agent"?, "jsonl"?, "persist"? }` → NDJSON stream |
+| `POST` | `/api/playground/rust/run` | `{ "prompt", "cwd"?, "agent"?, "model"?, "jsonl"?, "persist"? }` → NDJSON stream; `model` goes to the agent as `--model` unchanged (`provider/model` for an OpenCode / CodeNomad provider) |
 
 Route: `CodeNomad/packages/server/src/server/routes/playground-rust.ts` (registered in `http-server.ts`). Requires CodeNomad restart to pick up.
 

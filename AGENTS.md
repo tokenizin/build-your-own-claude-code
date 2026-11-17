@@ -19,5 +19,5 @@
 - NomadWorks core roles (`/pma`, `/ba`, `/tl`, `/dev`, `/qa`) load as `context: fork` skills with policy injection and optional per-agent model overrides; slash args must be appended via `fork_user_body` when agent bodies lack `$ARGUMENTS`.
 - OpenCode/CodeNomad agent catalog loads via `OPENCODE_CONFIG` + `NOMAD_AGENTS=opencode`; Ollama model remaps and aliases live in `playground/opencode-rust.json` (missing `{file:…}` prompts are skipped).
 - Integration plan and phase status: `docs/NOMADWORKS_INTEGRATION.md`; local run matrix: `docs/LOCAL_DEVELOPMENT.md`.
-- P4 CodeNomad bridge: `./scripts/codenomad-rust-bridge.sh --jsonl --prompt "…"` (optional `--agent`); route `POST /api/playground/rust/run` streams NDJSON; CodeNomad Settings → Claude Code (Rust) sets `useRustPlaygroundEngine` so chat uses that route. Set `CLAUDE_CODE_PLAYGROUND` when needed.
+- P4 CodeNomad bridge: `./scripts/codenomad-rust-bridge.sh --jsonl --prompt "…"` (optional `--agent`, `--model provider/model`); route `POST /api/playground/rust/run` streams NDJSON; CodeNomad Settings → Claude Code (Rust) sets `useRustPlaygroundEngine` so chat uses that route. Set `CLAUDE_CODE_PLAYGROUND` when needed.
 - Run persistence lives in `playground/persistence/` (ZenStack V3 ORM + Neon + MinIO); enable with bridge/CLI `--persist` or `PLAYGROUND_PERSIST=1`.

@@ -47,6 +47,12 @@ def main() -> int:
     parser.add_argument("-p", "--prompt", required=True)
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--agent", default="", help="Optional slash role: pma, ba, runner, …")
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Model picked in CodeNomad, passed to the agent as --model unchanged "
+        "(provider/model for an OpenCode / CodeNomad provider, a bare id for the agent's own endpoint)",
+    )
     parser.add_argument("--jsonl", action="store_true")
     parser.add_argument(
         "--persist",
@@ -69,6 +75,8 @@ def main() -> int:
     if agent and not prompt.lstrip().startswith("/"):
         prompt = f"/{agent} {prompt}"
 
+    model = (args.model or "").strip() or None
+
     cwd = Path(args.cwd).resolve()
     if not cwd.is_dir():
         print(f"ERROR: cwd is not a directory: {cwd}", file=sys.stderr)
@@ -82,6 +90,7 @@ def main() -> int:
                 "prompt": prompt,
                 "runner": str(runner),
                 "agent": agent or None,
+                "model": model,
             }
         )
 
@@ -91,8 +100,13 @@ def main() -> int:
     except OSError:
         pass
 
+    command = [str(runner), "-p", prompt]
+    if model:
+        # Kept exactly as picked: the provider prefix tells the engine where to route it.
+        command += ["--model", model]
+
     proc = subprocess.Popen(
-        [str(runner), "-p", prompt],
+        command,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -125,6 +139,7 @@ def main() -> int:
             "prompt": prompt,
             "runner": str(runner),
             "agent": agent or None,
+            "model": model,
         }
         transcript_lines.append(json.dumps(meta, ensure_ascii=False))
         for line in stderr_lines:
