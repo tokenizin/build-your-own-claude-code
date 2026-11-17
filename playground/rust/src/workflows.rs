@@ -11,7 +11,7 @@
 //! * the host marks it `idle` when the runner's process ends;
 //! * both read it: the one-implementation-workflow-at-a-time guard, and "is this session running?".
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -146,8 +146,21 @@ fn entry_path(worktree: &Path, workflow_id: &str) -> Option<PathBuf> {
 pub fn write_entry(worktree: &Path, entry: &Entry) -> Result<(), String> {
     let path = entry_path(worktree, &entry.workflow_id).ok_or_else(|| format!("bad workflow id `{}`", entry.workflow_id))?;
     fs::create_dir_all(registry_dir(worktree)).map_err(|e| e.to_string())?;
-    let doc = json!({ "workflow_id": entry.workflow_id, "task_path": entry.task_path, "track": entry.track, "state": entry.state, "send_backs": entry.send_backs });
-    fs::write(path, doc.to_string()).map_err(|e| e.to_string())
+    // The entry's own fields are written over the document; whatever else it holds (see `Lineage`) is kept.
+    let mut doc = read_document(&path).unwrap_or_default();
+    doc.insert("workflow_id".into(), json!(entry.workflow_id));
+    doc.insert("task_path".into(), json!(entry.task_path));
+    doc.insert("track".into(), json!(entry.track));
+    doc.insert("state".into(), json!(entry.state));
+    doc.insert("send_backs".into(), json!(entry.send_backs));
+    fs::write(path, Value::Object(doc).to_string()).map_err(|e| e.to_string())
+}
+
+fn read_document(path: &Path) -> Option<Map<String, Value>> {
+    match serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?).ok()? {
+        Value::Object(doc) => Some(doc),
+        _ => None,
+    }
 }
 
 fn read_entry(path: &Path) -> Option<Entry> {
@@ -167,14 +180,113 @@ pub fn find(worktree: &Path, workflow_id: &str) -> Option<Entry> {
 
 /// A workflow that is running on the `implementation` track, if there is one: only one may own the shared worktree.
 pub fn running_implementation(worktree: &Path) -> Option<Entry> {
+    blocking_implementation(worktree, None, &[])
+}
+
+/// The running `implementation` workflow that stops `workspace` (none: the manager's own worktree) from taking a
+/// second one, if any. `except` are workflows that do not count: the one being started, and the ones that started it,
+/// which wait for it and so are not a second writer. A workflow whose process has died does not count either.
+pub fn blocking_implementation(worktree: &Path, workspace: Option<&str>, except: &[String]) -> Option<Entry> {
     let mut found: Vec<Entry> = fs::read_dir(registry_dir(worktree))
         .ok()?
         .filter_map(|e| e.ok())
         .filter_map(|e| read_entry(&e.path()))
-        .filter(|e| e.running() && e.track == "implementation")
+        .filter(|e| e.running() && e.track == "implementation" && !except.contains(&e.workflow_id))
+        .filter(|e| {
+            let lineage = lineage(worktree, &e.workflow_id);
+            same_workspace(lineage.workspace.as_deref(), workspace) && is_live(&lineage)
+        })
         .collect();
     found.sort_by(|a, b| a.workflow_id.cmp(&b.workflow_id));
     found.into_iter().next()
+}
+
+/// Whether workflow `workflow_id` has a run going now (its entry says `running` and the process running it, if it has one, exists).
+pub fn is_running(worktree: &Path, workflow_id: &str) -> bool {
+    find(worktree, workflow_id).is_some_and(|entry| entry.running()) && is_live(&lineage(worktree, workflow_id))
+}
+
+/// Who started a workflow, where its runner works and which process runs it. Kept in the entry's own file but apart from
+/// `Entry`, so that the entry and what is built on it stay as they were; an entry without it is a workflow the manager
+/// started, in the manager's own worktree, that the host supervises.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lineage {
+    /// The folder the runner works in; none: the manager's own worktree.
+    pub workspace: Option<String>,
+    /// The workflow whose run started this one (a nested start); none: the manager started it.
+    pub parent: Option<String>,
+    /// The process running it, for a workflow that runs inside its caller's process. None: the host supervises it and
+    /// releases it when it ends or is cut off, so there is nothing to check.
+    pub pid: Option<u32>,
+}
+
+pub fn lineage(worktree: &Path, workflow_id: &str) -> Lineage {
+    let Some(doc) = entry_path(worktree, workflow_id).and_then(|p| read_document(&p)) else { return Lineage::default() };
+    let text = |key: &str| doc.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
+    Lineage { workspace: text("workspace"), parent: text("parent"), pid: doc.get("pid").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()) }
+}
+
+/// Records a workflow's lineage in its entry's file (the entry must exist).
+pub fn set_lineage(worktree: &Path, workflow_id: &str, lineage: &Lineage) -> Result<(), String> {
+    let path = entry_path(worktree, workflow_id).ok_or_else(|| format!("bad workflow id `{workflow_id}`"))?;
+    let mut doc = read_document(&path).ok_or_else(|| format!("no entry for workflow `{workflow_id}`"))?;
+    for (key, value) in [("workspace", lineage.workspace.clone().map(Value::String)), ("parent", lineage.parent.clone().map(Value::String)), ("pid", lineage.pid.map(|p| json!(p)))] {
+        match value {
+            Some(value) => doc.insert(key.into(), value),
+            None => doc.remove(key),
+        };
+    }
+    fs::write(path, Value::Object(doc).to_string()).map_err(|e| e.to_string())
+}
+
+/// `parent` and the workflows that started it, nearest first. Stops at a missing entry and at a cycle.
+pub fn ancestors(worktree: &Path, parent: Option<&str>) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut next = parent.map(str::to_string);
+    while let Some(id) = next {
+        if chain.contains(&id) || chain.len() >= 32 {
+            break;
+        }
+        next = lineage(worktree, &id).parent;
+        chain.push(id);
+    }
+    chain
+}
+
+/// Whether two workspaces are one folder (none: the manager's own worktree). Paths are compared as the file system
+/// sees them when they exist, as written when they do not.
+pub fn same_workspace(a: Option<&str>, b: Option<&str>) -> bool {
+    let resolve = |p: &str| fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => resolve(a) == resolve(b),
+        _ => false,
+    }
+}
+
+/// A workflow run by a process that is gone is not running. One without a process of its own is the host's to release.
+fn is_live(lineage: &Lineage) -> bool {
+    lineage.pid.is_none_or(|pid| pid == std::process::id() || process_alive(pid))
+}
+
+/// Whether process `pid` exists. When that cannot be told (not a Unix system, no `kill`), it does: a guard that
+/// wrongly frees a worktree is worse than one that wrongly holds it.
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// Marks a workflow `idle` (its runner is done) or `running` again.
@@ -310,6 +422,118 @@ Please execute the full lifecycle (Sync -> Implementation -> Commit -> Archive) 
         set_state(&wt, "wf_impl", "running");
         assert!(running_implementation(&wt).is_some());
         assert!(find(&wt, "../escape").is_none() && find(&wt, "").is_none());
+        let _ = fs::remove_dir_all(wt);
+    }
+    fn entry_of(id: &str, track: &str, state: &str) -> Entry {
+        Entry { workflow_id: id.into(), task_path: "t.md".into(), track: track.into(), state: state.into(), send_backs: 0 }
+    }
+
+    /// A process id that has ended.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().expect("run `true`");
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn lineage_is_kept_beside_the_entry_through_state_changes() {
+        let wt = worktree("lineage");
+        write_entry(&wt, &entry_of("wf_a", "implementation", "running")).unwrap();
+        assert_eq!(lineage(&wt, "wf_a"), Lineage::default(), "an entry nobody gave a lineage is the manager's, supervised by the host");
+        let given = Lineage { workspace: Some("/work/api".into()), parent: Some("wf_p".into()), pid: Some(4242) };
+        set_lineage(&wt, "wf_a", &given).unwrap();
+        set_state(&wt, "wf_a", "idle");
+        set_send_backs(&wt, "wf_a", 2);
+        assert_eq!(lineage(&wt, "wf_a"), given, "rewriting the entry does not lose it");
+        assert_eq!(find(&wt, "wf_a").unwrap().send_backs, 2);
+        set_lineage(&wt, "wf_a", &Lineage::default()).unwrap();
+        assert_eq!(lineage(&wt, "wf_a"), Lineage::default(), "and a lineage can be cleared");
+        assert!(set_lineage(&wt, "wf_missing", &given).is_err() && set_lineage(&wt, "../x", &given).is_err());
+        assert_eq!(lineage(&wt, "wf_missing"), Lineage::default());
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn writing_an_entry_keeps_keys_it_does_not_know() {
+        let wt = worktree("unknown-keys");
+        fs::create_dir_all(registry_dir(&wt)).unwrap();
+        fs::write(
+            registry_dir(&wt).join("wf_k.json"),
+            r#"{"workflow_id":"wf_k","task_path":"t.md","track":"spec","state":"idle","send_backs":1,"later_field":{"a":1}}"#,
+        )
+        .unwrap();
+        set_state(&wt, "wf_k", "running");
+        let doc: Value = serde_json::from_str(&fs::read_to_string(registry_dir(&wt).join("wf_k.json")).unwrap()).unwrap();
+        assert_eq!(doc["state"], "running");
+        assert_eq!(doc["later_field"], json!({ "a": 1 }), "a newer agent's keys survive an older one's write");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn ancestors_follow_the_parent_chain_and_stop_at_a_cycle() {
+        let wt = worktree("ancestors");
+        for (id, parent) in [("wf_root", None), ("wf_mid", Some("wf_root")), ("wf_leaf", Some("wf_mid"))] {
+            write_entry(&wt, &entry_of(id, "spec", "running")).unwrap();
+            set_lineage(&wt, id, &Lineage { parent: parent.map(str::to_string), ..Lineage::default() }).unwrap();
+        }
+        assert_eq!(ancestors(&wt, Some("wf_leaf")), ["wf_leaf", "wf_mid", "wf_root"]);
+        assert_eq!(ancestors(&wt, Some("wf_gone")), ["wf_gone"], "an entry that is not there ends the chain");
+        assert!(ancestors(&wt, None).is_empty());
+        set_lineage(&wt, "wf_root", &Lineage { parent: Some("wf_leaf".into()), ..Lineage::default() }).unwrap();
+        assert_eq!(ancestors(&wt, Some("wf_leaf")).len(), 3, "a cycle is walked once");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn what_blocks_an_implementation_workflow_leaves_out_exceptions_other_workspaces_and_the_dead() {
+        let wt = worktree("blocking");
+        write_entry(&wt, &entry_of("wf_a", "implementation", "running")).unwrap();
+        assert_eq!(blocking_implementation(&wt, None, &[]).unwrap().workflow_id, "wf_a");
+        assert!(blocking_implementation(&wt, None, &["wf_a".to_string()]).is_none(), "the workflows that started this one wait for it");
+        assert!(blocking_implementation(&wt, Some("/somewhere/else"), &[]).is_none(), "another workspace has its own implementation workflow");
+        set_lineage(&wt, "wf_a", &Lineage { workspace: Some("/somewhere/else".into()), ..Lineage::default() }).unwrap();
+        assert!(blocking_implementation(&wt, None, &[]).is_none(), "and the manager's own worktree is not that one");
+        assert!(blocking_implementation(&wt, Some("/somewhere/else"), &[]).is_some());
+        set_lineage(&wt, "wf_a", &Lineage { pid: Some(std::process::id()), ..Lineage::default() }).unwrap();
+        assert!(blocking_implementation(&wt, None, &[]).is_some(), "a workflow run by a live process holds it");
+        #[cfg(unix)]
+        {
+            set_lineage(&wt, "wf_a", &Lineage { pid: Some(dead_pid()), ..Lineage::default() }).unwrap();
+            assert!(blocking_implementation(&wt, None, &[]).is_none(), "one whose process is gone does not");
+            assert!(!is_running(&wt, "wf_a"));
+        }
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_has_ended_is_told_from_one_that_has_not() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(dead_pid()));
+    }
+
+    #[test]
+    fn workspaces_are_compared_as_folders() {
+        let wt = worktree("same-workspace");
+        let here = wt.to_str().unwrap();
+        assert!(same_workspace(None, None));
+        assert!(!same_workspace(None, Some(here)) && !same_workspace(Some(here), None));
+        assert!(same_workspace(Some(here), Some(&format!("{here}/tasks/.."))), "two spellings of one folder");
+        assert!(!same_workspace(Some(here), Some(&format!("{here}/tasks"))));
+        assert!(same_workspace(Some("/not/there/a"), Some("/not/there/a")) && !same_workspace(Some("/not/there/a"), Some("/not/there/b")));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[test]
+    fn a_workflow_is_running_only_while_its_entry_says_so() {
+        let wt = worktree("is-running");
+        assert!(!is_running(&wt, "wf_none"));
+        write_entry(&wt, &entry_of("wf_r", "spec", "running")).unwrap();
+        assert!(is_running(&wt, "wf_r"));
+        set_state(&wt, "wf_r", "idle");
+        assert!(!is_running(&wt, "wf_r"));
         let _ = fs::remove_dir_all(wt);
     }
 }

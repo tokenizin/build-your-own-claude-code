@@ -1486,6 +1486,32 @@ fn workflow_worktree() -> PathBuf {
     nomad_tools::resolve_worktree()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REGISTRY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The folder whose `.codenomad/runtime/` holds the workflow registry and the workflow event log: the manager's worktree.
+/// A runner the host starts in another folder is told where it is (`NOMAD_WORKFLOW_REGISTRY`); without that, it is the
+/// process's own worktree, as it always was.
+fn registry_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_REGISTRY.with(|t| t.borrow().clone()) {
+        return path;
+    }
+    registry_root_from(env::var("NOMAD_WORKFLOW_REGISTRY").ok().as_deref()).unwrap_or_else(workflow_worktree)
+}
+
+fn registry_root_from(value: Option<&str>) -> Option<PathBuf> {
+    value.map(str::trim).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+tokio::task_local! {
+    /// The workflow whose run this code is part of (its runner, and the subagents and workflows under it): the
+    /// parent of a workflow started from here. Unset in the manager's own run.
+    static CURRENT_WORKFLOW: String;
+}
+
 /// One line per workflow event in `.codenomad/runtime/workflow-events.ndjson`
 /// (git-ignored runtime state). Best effort; the stream and the handover file are the record.
 fn log_workflow_event(worktree: &Path, event: Value) {
@@ -1700,8 +1726,9 @@ async fn run_prepared(
         nudge: Mutex::new(None),
     };
     let task_id = handover::task_id_of(task_path);
+    let registry = registry_root();
     log_workflow_event(
-        worktree,
+        &registry,
         json!({ "event": "workflow:started", "session_id": session_id, "task": task_path, "task_id": task_id, "resumed": resumed }),
     );
 
@@ -1710,28 +1737,32 @@ async fn run_prepared(
         "handover_path": meta_str("handover_path"),
         "revision": meta_str("revision"),
     });
-    let (outcome, messages) = run_delegated(
-        client,
-        cfg,
-        skills,
-        top,
-        depth,
-        Delegation {
-            skill: runner,
-            task_id: session_id.clone(),
-            messages: prepared.messages.clone(),
-            description: format!("Workflow {task_id}"),
-            mode: "orchestrator",
-            resumed: *resumed,
-            call_id,
-            meta: Some(base_meta),
-            workflow: Some(&scope),
-            lane: None,
-            model: None,
-            inline,
-        },
-    )
-    .await;
+    let (outcome, messages) = CURRENT_WORKFLOW
+        .scope(
+            session_id.clone(),
+            run_delegated(
+                client,
+                cfg,
+                skills,
+                top,
+                depth,
+                Delegation {
+                    skill: runner,
+                    task_id: session_id.clone(),
+                    messages: prepared.messages.clone(),
+                    description: format!("Workflow {task_id}"),
+                    mode: "orchestrator",
+                    resumed: *resumed,
+                    call_id,
+                    meta: Some(base_meta),
+                    workflow: Some(&scope),
+                    lane: None,
+                    model: None,
+                    inline,
+                },
+            ),
+        )
+        .await;
 
     let filed = scope.filed.lock().ok().and_then(|mut f| f.take());
     if let Some(filed) = &filed {
@@ -1750,7 +1781,7 @@ async fn run_prepared(
             },
         );
         log_workflow_event(
-            worktree,
+            &registry,
             json!({
                 "event": "handover:filed", "session_id": session_id, "task": task_path,
                 "outcome": filed.outcome.as_str(), "revision": filed.revision,
@@ -1759,8 +1790,8 @@ async fn run_prepared(
         );
     }
     match (&outcome, &filed) {
-        (Ok(_), Some(filed)) => log_workflow_event(worktree, json!({ "event": format!("workflow:{}", filed.outcome.as_str()), "session_id": session_id, "task": task_path })),
-        (Err(err), _) => log_workflow_event(worktree, json!({ "event": "workflow:errored", "session_id": session_id, "task": task_path, "error": err })),
+        (Ok(_), Some(filed)) => log_workflow_event(&registry, json!({ "event": format!("workflow:{}", filed.outcome.as_str()), "session_id": session_id, "task": task_path })),
+        (Err(err), _) => log_workflow_event(&registry, json!({ "event": "workflow:errored", "session_id": session_id, "task": task_path, "error": err })),
         _ => {}
     }
     Finished { outcome, filed }
@@ -1782,6 +1813,39 @@ fn headline_of(outcome: handover::Outcome) -> &'static str {
 /// instructions as a follow-up (a bounce-back), and records the reason in the handover's review log.
 /// By default this runs inside the call (the agent is one process per message, so a "background" session
 /// would end with it); with `NOMAD_WORKFLOW_MODE=async` the call only starts the workflow and the host runs it.
+/// Admits a workflow that runs inside its caller's process and records it as running there (the host's own
+/// supervised workflows go through `nomadflow_in_background`). Only one `implementation` workflow may own a workspace;
+/// the ones that started this one are waiting for it, so they do not count. Refusing is a result for the caller.
+fn admit_in_process(registry: &Path, prepared: &Prepared, parent: Option<&str>) -> Result<(), String> {
+    let id = workflows::workflow_id(&prepared.session_id);
+    let known = workflows::find(registry, &id);
+    // A run is going already, here or in another process: a second one would be two runners on one session.
+    if workflows::is_running(registry, &id) {
+        return Err(format!("FAIL: Workflow '{}' is already running; wait for its notification or send it a prompt with nomadflow_prompt_workflow.", prepared.session_id));
+    }
+    let track = match &known {
+        Some(entry) => entry.track.clone(),
+        None => workflows::task_meta(&prepared.worktree, &prepared.task_path).track_or_default(),
+    };
+    if track == "implementation" {
+        let mut except = workflows::ancestors(registry, parent);
+        except.push(id.clone());
+        if workflows::blocking_implementation(registry, None, &except).is_some() {
+            return Err(WORKTREE_BUSY.into());
+        }
+    }
+    let entry = match known {
+        Some(mut entry) => {
+            entry.state = "running".into();
+            entry
+        }
+        None => workflows::Entry { workflow_id: id.clone(), task_path: prepared.task_path.clone(), track, state: "running".into(), send_backs: 0 },
+    };
+    workflows::write_entry(registry, &entry).map_err(|err| format!("FAIL: Failed to initiate session: {err}"))?;
+    let lineage = workflows::Lineage { workspace: None, parent: parent.map(str::to_string), pid: Some(std::process::id()) };
+    workflows::set_lineage(registry, &id, &lineage).map_err(|err| format!("FAIL: Failed to initiate session: {err}"))
+}
+
 async fn handle_nomadflow(
     client: &Client<OpenAIConfig>,
     cfg: &LlmConfig,
@@ -1798,7 +1862,14 @@ async fn handle_nomadflow(
         Ok(prepared) => prepared,
         Err(message) => return message,
     };
+    // A workflow that runs inside its caller's process is on the registry like any other, and held to the same rule.
+    let registry = registry_root();
+    let parent = CURRENT_WORKFLOW.try_with(|id| id.clone()).ok();
+    if let Err(refused) = admit_in_process(&registry, &prepared, parent.as_deref()) {
+        return refused;
+    }
     let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, depth, &prepared, &call.id, false).await;
+    workflows::set_state(&registry, &workflows::workflow_id(&prepared.session_id), "idle");
 
     let session_id = &prepared.session_id;
     let task_path = &prepared.task_path;
@@ -1826,19 +1897,21 @@ async fn handle_nomadflow(
     }
 }
 
+const WORKTREE_BUSY: &str = "FAIL: A shared-worktree implementation workflow is already running. You may continue investigation or spec work separately, but only one implementation workflow can own the shared worktree at a time.";
+
 /// The asynchronous `nomadflow_*`: registers the workflow, tells the host to run it (a `workflow.start` /
 /// `workflow.prompt` event) and returns at once, in the words of NomadWorks' plugin.
 fn nomadflow_in_background(top: &TopLevel<'_>, call: &PreparedCall) -> String {
     let tool = call.name.as_str();
     let args = &call.args;
     let text_of = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
-    let worktree = workflow_worktree();
+    let worktree = registry_root();
     let asking = if tool == "nomadflow_run_workflow" { "run complex workflows" } else { "send workflow runner prompts" };
     if workflows::team_mode_blocks_workflows(&worktree) {
         return format!("FAIL: Workflow Runner is unavailable in the current team configuration. Switch to full team mode to {asking}.");
     }
     let manager = env::var("CODENOMAD_SESSION_KEY").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "this session".into());
-    const BUSY: &str = "FAIL: A shared-worktree implementation workflow is already running. You may continue investigation or spec work separately, but only one implementation workflow can own the shared worktree at a time.";
+    const BUSY: &str = WORKTREE_BUSY;
 
     // `nomadflow_run_workflow` with a session_id continues that session, as in the synchronous mode.
     let follow_up = if tool == "nomadflow_prompt_workflow" || text_of("session_id").is_some() { Some(text_of("session_id")) } else { None };
@@ -1934,9 +2007,8 @@ async fn run_workflow_session(
         ("nomadflow_run_workflow", json!({ "task_path": task_path, "instructions": text }))
     };
     let prepared = prepare_workflow(tool, &args, skills, Some(&id))?;
-    let worktree = prepared.worktree.clone();
     let Finished { outcome, filed } = run_prepared(client, cfg, skills, top, 0, &prepared, "", true).await;
-    workflows::set_state(&worktree, &id, "idle");
+    workflows::set_state(&registry_root(), &id, "idle");
     // The count is not reset here, not even by a `completed` handover: a manager that re-sends a finished
     // workflow after every completion would otherwise never reach the limit (D62). Only the user's message does.
     if let Some(top) = top {
@@ -2510,7 +2582,7 @@ async fn main() -> std::process::ExitCode {
     // The user wrote this message (a notification from a workflow begins `[NomadFlow`): the limit on
     // send-backs is lifted, since they are in the loop again.
     if workflow_async() {
-        lift_send_back_limit(args.prompt.as_deref().unwrap_or(""), &workflow_worktree());
+        lift_send_back_limit(args.prompt.as_deref().unwrap_or(""), &registry_root());
     }
 
     let initial = build_initial_run(&prompt, &skills);
@@ -4602,6 +4674,198 @@ mod tests {
         assert!(result.starts_with("SUCCESS: Workflow completed — handover filed"), "{result}");
         assert!(sink.lock().unwrap().iter().all(|e| e["type"] != "workflow.start"));
         let _ = fs::remove_dir_all(wt);
+    }
+
+    // ------------------------------------------------------------ a workflow that runs inside its caller's process is on the registry
+
+    /// What the registry says now: every workflow's entry and lineage.
+    fn registry_entries(wt: &Path) -> Vec<(workflows::Entry, workflows::Lineage)> {
+        let mut found: Vec<_> = fs::read_dir(workflows::registry_dir(wt))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string))
+            .filter_map(|id| workflows::find(wt, &id).map(|entry| (entry, workflows::lineage(wt, &id))))
+            .collect();
+        found.sort_by(|a, b| a.0.workflow_id.cmp(&b.0.workflow_id));
+        found
+    }
+
+    /// The Product Manager (depth 0, synchronous workflows) asks for one workflow, then reports "PMA DONE".
+    async fn manager_asks(base: &str, args: Value) -> Run {
+        let cfg = LlmConfig { base_url: base.into(), fallback_base_url: base.into(), api_key: "k".into(), model: "m".into(), max_tokens: 256 };
+        let client = make_client(base, "k");
+        let skills = vec![skill("workflow_runner", true)];
+        let (emitter, sink) = Emitter::capturing();
+        let top = TopLevel { emitter: &emitter, base_url: base.into(), stream: false, protocol2: true };
+        let mut messages = vec![json!({ "role": "system", "content": "you orchestrate" }), json!({ "role": "user", "content": "go" })];
+        let started = std::time::Instant::now();
+        let _ = args;
+        let answer = run_agent_loop(&client, &cfg, &mut messages, &skills, ToolMode::All, Some(&top), 0, None).await.map_err(|e| e.to_string());
+        let events = sink.lock().unwrap().clone();
+        Run { answer, messages, events, elapsed: started.elapsed() }
+    }
+
+    fn running_implementation_entry(id: &str) -> workflows::Entry {
+        workflows::Entry { workflow_id: id.into(), task_path: "tasks/todo/TASK-OTHER/TASK-OTHER.md".into(), track: "implementation".into(), state: "running".into(), send_backs: 0 }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_in_the_callers_process_is_on_the_registry_while_it_runs_and_idle_after() {
+        let wt = new_worktree("ip-registry");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (seen_by_runner, wt_for_runner) = (seen.clone(), wt.clone());
+        let base = scripted_model(move |req| {
+            let (system, last) = (system_text(req), last_message(req));
+            if system.contains("workflow_runner") {
+                if last["role"] == "tool" && last["content"].as_str().unwrap_or("").contains("Handover filed") {
+                    return text_message("closing note");
+                }
+                seen_by_runner.lock().unwrap().extend(registry_entries(&wt_for_runner));
+                return call_message("h1", "handover", valid_handover("shipped"));
+            }
+            if req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool")) { text_message("PMA DONE") } else {
+                call_message("w1", "nomadflow_run_workflow", json!({ "task_path": TASK, "instructions": "go" }))
+            }
+        })
+        .await;
+        let run = manager_asks(&base, json!({})).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        assert!(workflow_result(&run).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&run));
+
+        let during = seen.lock().unwrap().clone();
+        assert!(!during.is_empty(), "the runner saw its own entry");
+        let (entry, lineage) = &during[0];
+        assert!(entry.running() && entry.track == "implementation" && entry.task_path == TASK, "{entry:?}");
+        assert_eq!(lineage.pid, Some(std::process::id()), "its process is on record, so a crash does not hold the worktree for good");
+        assert_eq!((lineage.parent.as_deref(), lineage.workspace.as_deref()), (None, None), "the manager started it, in the manager's worktree");
+
+        let after = registry_entries(&wt);
+        assert_eq!(after.len(), 1);
+        assert!(!after[0].0.running(), "idle once its run is over");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_in_the_callers_process_is_refused_while_another_implementation_workflow_runs() {
+        let wt = new_worktree("ip-guard");
+        workflows::write_entry(&wt, &running_implementation_entry("wf_other")).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), requests.clone()).await;
+        assert_eq!(workflow_result(&run), WORKTREE_BUSY);
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "the runner never started");
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"), "a refusal is a result, not the end of the run");
+        assert_eq!(registry_entries(&wt).len(), 1, "and nothing was recorded for it");
+
+        // A spec workflow may run beside it.
+        let spec = add_task(&wt, "TASK-SPEC", "---\ntrack: spec\n---\n");
+        let beside = flow(&wt, Runner::Happy, run_call(json!({ "task_path": spec, "instructions": "write it up" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&beside).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&beside));
+        assert!(workflows::find(&wt, "wf_other").unwrap().running(), "the other one is untouched");
+
+        // Once it is done, the next implementation workflow may run.
+        workflows::set_state(&wt, "wf_other", "idle");
+        let after = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&after).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&after));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_whose_process_has_died_does_not_hold_the_worktree() {
+        let wt = new_worktree("ip-dead");
+        workflows::write_entry(&wt, &running_implementation_entry("wf_dead")).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        workflows::set_lineage(&wt, "wf_dead", &workflows::Lineage { pid: Some(pid), ..Default::default() }).unwrap();
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        assert!(workflow_result(&run).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&run));
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_started_by_a_running_workflow_is_admitted_and_records_its_parent() {
+        let wt = new_worktree("ip-nested");
+        let nested_task = add_task(&wt, "TASK-B", "---\ntrack: implementation\n---\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let nested_result = Arc::new(Mutex::new(String::new()));
+        let (seen_by_runner, result_seen, wt_for_runner, nested_for_runner) = (seen.clone(), nested_result.clone(), wt.clone(), nested_task.clone());
+        let base = scripted_model(move |req| {
+            let (system, last) = (system_text(req), last_message(req));
+            let content = last["content"].as_str().unwrap_or("").to_string();
+            if system.contains("workflow_runner") {
+                if last["role"] == "tool" && content.contains("Handover filed") {
+                    return text_message("closing note");
+                }
+                // Which runner this is: the one for TASK-B (the nested one) or the one for TASK-9.
+                let first_user = req["messages"].as_array().and_then(|m| m.iter().find(|x| x["role"] == "user")).map(|x| x["content"].to_string()).unwrap_or_default();
+                if first_user.contains("TASK-B") {
+                    seen_by_runner.lock().unwrap().extend(registry_entries(&wt_for_runner));
+                    return call_message("h2", "handover", valid_handover("nested shipped"));
+                }
+                if last["role"] == "tool" {
+                    *result_seen.lock().unwrap() = content;
+                    return call_message("h1", "handover", valid_handover("outer shipped"));
+                }
+                return call_message("n1", "nomadflow_run_workflow", json!({ "task_path": nested_for_runner, "instructions": "the nested part" }));
+            }
+            if req["messages"].as_array().is_some_and(|m| m.iter().any(|x| x["role"] == "tool")) { text_message("PMA DONE") } else {
+                call_message("w1", "nomadflow_run_workflow", json!({ "task_path": TASK, "instructions": "go" }))
+            }
+        })
+        .await;
+        let run = manager_asks(&base, json!({})).await;
+        assert_eq!(run.answer.as_deref(), Ok("PMA DONE"));
+        assert!(workflow_result(&run).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&run));
+        let nested = nested_result.lock().unwrap().clone();
+        assert!(nested.starts_with("SUCCESS: Workflow completed"), "the workflow that started it waits for it, so it is not a second writer: {nested}");
+
+        let during = seen.lock().unwrap().clone();
+        let outer = during.iter().find(|(e, _)| e.task_path == TASK).expect("the outer workflow is on record while the nested one runs");
+        let inner = during.iter().find(|(e, _)| e.task_path == nested_task).expect("and so is the nested one");
+        assert!(outer.0.running() && inner.0.running());
+        assert_eq!(outer.1.parent, None);
+        assert_eq!(inner.1.parent.as_deref(), Some(outer.0.workflow_id.as_str()), "it records which workflow started it");
+        assert!(registry_entries(&wt).iter().all(|(e, _)| !e.running()), "both are idle at the end");
+        let _ = fs::remove_dir_all(wt);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_workflow_whose_run_it_is_reaches_the_tasks_polled_under_it() {
+        // `run_task_batch` polls a turn's Task calls with `buffer_unordered`, inside the same task.
+        let seen: Vec<Option<String>> = CURRENT_WORKFLOW
+            .scope("wf_outer".to_string(), async {
+                futures_util::stream::iter(0..4).map(|_| async { CURRENT_WORKFLOW.try_with(|id| id.clone()).ok() }).buffer_unordered(2).collect::<Vec<_>>().await
+            })
+            .await;
+        assert_eq!(seen, vec![Some("wf_outer".to_string()); 4]);
+        assert!(CURRENT_WORKFLOW.try_with(|id| id.clone()).is_err(), "and nothing outside it");
+    }
+
+    #[test]
+    fn the_registry_is_where_the_host_says_and_otherwise_in_the_worktree() {
+        assert_eq!(registry_root_from(Some(" /manager/tree ")), Some(PathBuf::from("/manager/tree")));
+        assert_eq!(registry_root_from(Some("   ")), None);
+        assert_eq!(registry_root_from(Some("")), None);
+        assert_eq!(registry_root_from(None), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_workflow_is_recorded_in_the_registry_the_host_names_not_in_the_runners_own_worktree() {
+        let wt = new_worktree("ip-root");
+        let manager_tree = std::env::temp_dir().join(format!("wf-root-mgr-{}-{}", std::process::id(), delegation::new_task_id()));
+        fs::create_dir_all(&manager_tree).unwrap();
+        TEST_REGISTRY.with(|t| *t.borrow_mut() = Some(manager_tree.clone()));
+        let run = flow(&wt, Runner::Happy, run_call(json!({ "task_path": TASK, "instructions": "go" })), Arc::new(AtomicUsize::new(0))).await;
+        TEST_REGISTRY.with(|t| *t.borrow_mut() = None);
+        assert!(workflow_result(&run).starts_with("SUCCESS: Workflow completed"), "{}", workflow_result(&run));
+        assert_eq!(registry_entries(&manager_tree).len(), 1, "the entry is in the manager's worktree");
+        assert!(registry_entries(&wt).is_empty(), "and not in the folder the runner works in");
+        assert!(manager_tree.join(".codenomad/runtime/workflow-events.ndjson").is_file(), "the event log is there too");
+        assert!(!wt.join(".codenomad/runtime/workflow-events.ndjson").exists());
+        let _ = fs::remove_dir_all(wt);
+        let _ = fs::remove_dir_all(manager_tree);
     }
 
     /// The host's second process: this one is the Workflow Runner, and its events are the runner session's own.
