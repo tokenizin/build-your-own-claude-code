@@ -269,18 +269,20 @@ fn is_live(lineage: &Lineage) -> bool {
     lineage.pid.is_none_or(|pid| pid == std::process::id() || process_alive(pid))
 }
 
-/// Whether process `pid` exists. When that cannot be told (not a Unix system, no `kill`), it does: a guard that
-/// wrongly frees a worktree is worse than one that wrongly holds it.
+/// Whether process `pid` exists. A process that cannot be inspected (another user's) exists. When that cannot be told
+/// at all (not a Unix system, no `kill`), it does too: a guard that wrongly frees a worktree is worse than one that
+/// wrongly holds it.
 pub fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(true)
+        // Linux: the process table is a directory, and asking it needs no process of its own.
+        if Path::new("/proc/self").exists() {
+            return Path::new(&format!("/proc/{pid}")).exists();
+        }
+        match std::process::Command::new("kill").args(["-0", &pid.to_string()]).output() {
+            Ok(out) => out.status.success() || String::from_utf8_lossy(&out.stderr).to_lowercase().contains("not permitted"),
+            Err(_) => true,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -511,6 +513,7 @@ Please execute the full lifecycle (Sync -> Implementation -> Commit -> Archive) 
     #[test]
     fn a_process_that_has_ended_is_told_from_one_that_has_not() {
         assert!(process_alive(std::process::id()));
+        assert!(process_alive(1), "the first process is not ours to signal, and exists");
         assert!(!process_alive(dead_pid()));
     }
 
