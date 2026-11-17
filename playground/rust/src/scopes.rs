@@ -341,6 +341,27 @@ mod tests {
         workflows::set_lineage(registry, id, &lineage).unwrap();
     }
 
+    /// The copy the pre-flight check writes (`scripts/workflow/validate-scope-contract.ts` in the StarWorld repository, tested there against
+    /// this same document): it carries keys the agent does not use (`paths`, `lease_id`, `agent`), which must not matter.
+    #[test]
+    fn the_normalized_copy_the_preflight_check_writes_is_read() {
+        let written = r#"{
+          "scope_contract_version": 1,
+          "parent_task": "TASK-X",
+          "source": "tasks/todo/TASK-X/TASK-X.md",
+          "limits": { "max_concurrency": 2 },
+          "scopes": [
+            { "scope_id": "api", "track": "implementation", "task_path": "tasks/todo/TASK-X/api/TASK-X-api.md", "workspace": "/repo-wt-api", "spawn_depth": 0, "paths": ["src/api/**"], "lease_id": "lease-X-api", "agent": "developer" },
+            { "scope_id": "ui", "track": "implementation", "task_path": "tasks/todo/TASK-X/ui/TASK-X-ui.md", "workspace": "shared", "spawn_depth": 1, "paths": ["src/ui/**"], "lease_id": "lease-X-ui" }
+          ]
+        }"#;
+        let contract = parse_contract(written).unwrap();
+        assert_eq!((contract.id.as_str(), contract.source.as_str(), contract.max_concurrency), ("TASK-X", "tasks/todo/TASK-X/TASK-X.md", 2));
+        assert_eq!(contract.scopes[0].workspace.as_deref(), Some("/repo-wt-api"));
+        assert_eq!((contract.scopes[1].workspace.clone(), contract.scopes[1].spawn_depth), (None, 1));
+        assert_eq!(contract.scopes[0].task_path, "tasks/todo/TASK-X/api/TASK-X-api.md");
+    }
+
     #[test]
     fn a_task_file_names_its_contract_only_with_both_keys() {
         let both = "---\ntrack: implementation\nscope_contract: TASK-P\nscope_id: \"api\"\n---\n# T\nscope_id: ignored\n";
